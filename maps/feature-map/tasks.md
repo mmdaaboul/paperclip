@@ -145,6 +145,24 @@ Manual: Use authenticated mode with two ordinary operators, an eligible agent, a
 
 Sources: [Privacy actions](../../ui/src/components/IssuePrivacyActions.tsx), [share sheet](../../ui/src/components/IssueShareSheet.tsx), [issue routes](../../server/src/routes/issues.ts), and [authorization](../../server/src/services/authorization.ts).
 
+### Human execution stage decisions
+
+When a review or approval stage names the signed-in person, open the task's
+Properties and its Execution section. Enter a decision comment, then choose
+Approve or Request changes. Both actions submit the comment and status together;
+posting a comment first and changing status separately is not equivalent.
+The form is absent for another person, an agent participant or a settled stage.
+
+Automated: [human stage form](../../ui/src/components/IssueExecutionDecision.test.tsx)
+covers actor visibility, required comments, combined requests, stale reads,
+duplicate clicks, uncertain saves and navigation. API calls are mocked; this
+suite does not establish a live persisted decision or downstream agent wake.
+
+Manual: on separate disposable configured stages, approve one and request changes
+on another. Reload decisions/comments and check native next-stage routing or
+return to the original assignee. Repeat as a different person and after the stage
+changes in another tab. Keep ordinary stalled-review controls as a separate path.
+
 ## Gotchas
 
 - Private task sharing and private project membership are distinct read sources. Revoking a direct task grant does not revoke an independent ancestor/project grant; inspect the actual access source.

@@ -333,6 +333,21 @@ approval, checkout or company access. See the
 
 Review: `operation-reviewed`.
 
+### `decide-human-execution-stage`
+
+API: `present` — existing PATCH /api/issues/{id} with status and comment in the same request.
+
+Agent access: `restricted` — the new board form is for the authenticated current human stage participant; it grants no agent impersonation or additional endpoint. Existing agent stage decisions retain their native API/runtime policy.
+
+Policy: Company/task authorization and current-stage actor checks remain in the native route/service. The form requires a nonblank comment, rechecks the latest stage before writing, and stops automatic resubmission after an uncertain result. The UI preflight is not a server-side compare-and-swap guarantee.
+
+Evidence: `source-only` — native v2026.1106.0 requirements in [stage service](../../server/src/services/issue-execution-policy.ts); form implementation and [component tests](../../ui/src/components/IssueExecutionDecision.test.tsx). Component requests are mocked; no live API acceptance inferred.
+
+Verification: `not-run` — in a disposable instance record approve and changes-requested on separate stages, inspect saved comment/decision and next participant or returned assignee; reject another actor and stale stage. Component verification is reported separately in the fork change record.
+
+Gaps: Browser/HTTP/database persistence and downstream continuation remain unverified for this fork. Stalled-review buttons and ordinary comments are not equivalent to this configured-stage decision.
+
+
 Separate status/report acceptance, versioned start, follow-up, checkout/release and deletion; accepted provider report is not final task state.
 
 ### `transition-report-review`
