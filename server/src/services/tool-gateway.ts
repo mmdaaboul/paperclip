@@ -1,3 +1,4 @@
+import { reviewerActorRestricted } from "./reviewer-role.js";
 import { isNewHumanIntentAfterToolRejection } from "./tool-action-replay-intent.js";
 import { notifyChatRunMilestones } from "./chat-run-milestone-notifications.js";
 import { writeToolConnectionHealthChange } from "./tool-connection-health-notifications.js";
@@ -1255,6 +1256,12 @@ export function createToolGatewayService(
   });
   const pluginToolDispatcher = options.pluginToolDispatcher;
   const interactions = issueThreadInteractionService(db);
+  async function assertReviewerSessionBoundary(session: Pick<ToolGatewaySession, "companyId" | "agentId" | "runId">) {
+    if (session.agentId && await reviewerActorRestricted(db, { companyId: session.companyId, agentId: session.agentId, runId: session.runId })) {
+      throw new HttpError(403, "The Reviewer role uses only its assigned-PR discussion tools, not generic connector credentials");
+    }
+  }
+
   const basePolicyService = toolAccessPolicyService(db, { toolActionSigningSecret: options.toolActionSigningSecret });
   const issuerDecisionCaches = new WeakMap<ToolAccessDecisionCache, ToolAccessDecisionCache>();
   async function decideGatewayPolicy(
@@ -2985,6 +2992,7 @@ export function createToolGatewayService(
     session: ToolGatewaySession,
     toolName: string,
   ): Promise<ToolGatewayDescriptor> {
+    await assertReviewerSessionBoundary(session);
     const connectedTools = await connectedMcpToolsForCompany(session.companyId);
     const hasOnDemandTargets = connectedTools.some(isOnDemandRemoteTool);
     const virtualTools = hasOnDemandTargets ? VIRTUAL_TOOLS : [];
@@ -3194,6 +3202,7 @@ export function createToolGatewayService(
     session: ToolGatewaySession,
     signal?: AbortSignal,
   ): Promise<ToolGatewayDescriptor[]> {
+    await assertReviewerSessionBoundary(session);
     try {
       return await measureToolDiscovery(work => toolDiscoveryScheduler.run(work, signal), () => buildToolsForContext(session, signal));
     } catch (error) {
@@ -5727,6 +5736,7 @@ export function createToolGatewayService(
       protocolMethod: input.method,
       callerHeaders: input.callerHeaders,
     });
+    await assertReviewerSessionBoundary(session);
     await assertGatewayTokenAction(session, input.method);
     const connections = await fullyAssignedMcpConnections(session);
     if (input.method === "resources/list") {
@@ -9377,6 +9387,7 @@ export function createToolGatewayService(
       actorId?: string;
     }): Promise<ToolGatewaySession> {
       await assertAgentInCompany(input.companyId, input.agentId);
+      await assertReviewerSessionBoundary(input);
       const { issueId, projectId } = await resolveRunContext(input);
       const now = new Date();
       const sessionId = randomUUID();
@@ -9457,6 +9468,7 @@ export function createToolGatewayService(
       agentId: string;
     }): Promise<AgentToolDescriptor[]> {
       await assertAgentInCompany(input.companyId, input.agentId);
+      await assertReviewerSessionBoundary({ ...input, runId: null });
       const decisions = await decideToolsForListing(pluginTools(), (tool) =>
         policyInputForAgentTool({
           companyId: input.companyId,
@@ -10343,6 +10355,7 @@ export function createToolGatewayService(
         protocolMethod: "tools/call",
         callerHeaders: input.callerHeaders,
       });
+      await assertReviewerSessionBoundary(session);
       await assertGatewayTokenAction(session, "tools/call");
       let invocationId = String(randomUUID());
       const startedAt = Date.now();
@@ -11508,6 +11521,7 @@ export function createToolGatewayService(
         expiresAt: new Date(Date.now() + DEFAULT_SESSION_TTL_MS),
       };
 
+      await assertReviewerSessionBoundary(sessionLike);
       const tool = findStaticTool(input.tool);
 
       if (tool.providerType !== "paperclip_plugin") {

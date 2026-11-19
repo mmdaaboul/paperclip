@@ -4,7 +4,7 @@ import { resolveGrokDisableWebSearch, admittedGrokWebSearchPolicy } from "../dri
 import { PRP_COMPLETION_TOOL_NAME, PRP_COMPLETION_RESULT_BRIDGE_INPUT_SCHEMA } from "../contracts/completion-result.js";
 import { RunnerLaunchPreparationStore } from "./runner-launch-preparation-store.js";
 import type { PreparedRunnerProviderLaunch, RunnerProviderLaunchRequirements } from "./runner-provider-launch.js";
-import { preparedRunnerLaunchWorkingDirectory, validatePreparedRunnerLaunch, runnerLaunchSettingsMatch, runnerProviderLaunchRequirements, createRunnerProviderLaunch, createRunnerdCodexAppServerArgs, trustedRuntimeReadOnlyRoots } from "./runner-provider-launch.js";
+import { preparedRunnerLaunchWorkingDirectory, validatePreparedRunnerLaunch, runnerLaunchRequirementsDigest, runnerLaunchSettingsMatch, runnerProviderLaunchRequirements, createRunnerProviderLaunch, createRunnerdCodexAppServerArgs, trustedRuntimeReadOnlyRoots } from "./runner-provider-launch.js";
 export { createRunnerdCodexAppServerArgs, resolveRunnerdAcpxPermissionMode, trustedRuntimeReadOnlyRoots, withCodexCollaborationRuntimeInstructions } from "./runner-provider-launch.js";
 import { applyProviderObservabilityEnvironment, redactObservabilityDiagnostic } from "../drivers/agent-observability.js";
 import type { RunnerExecutionDriver } from "../control-plane/runner-execution-driver.js";
@@ -63,7 +63,7 @@ import type {
 } from "../contracts/durable-recovery.js";
 import type { NativeRunIdentity, NativeTurnControlCapabilities } from "../contracts/types.js";
 import type { PrpEvent } from "../protocol/replay-contract.js";
-import { NativeSessionCloseUnrecoverableError } from "../contracts/native-session-backend.js";
+import { NativeSessionCloseUnrecoverableError, NativeProviderStateIncompatibleError } from "../contracts/native-session-backend.js";
 import type {
   HarnessSession,
   HarnessRuntimeRequestResolution,
@@ -72,6 +72,7 @@ import type {
 import { NativeRunnerSourceReconciliationRequiredError } from "../contracts/harness-driver.js";
 import {
   DurablePrpControlPlane,
+  readPrivateFile,
   inspectStagedRunAttachment,
   SemanticToolNotDispatchedError,
   durableRecoveryInternals,
@@ -693,7 +694,7 @@ function latestProviderIdentityEventIndex(
   return -1;
 }
 
-function providerDrainStateFromSnapshot(state: Record<string, unknown>): {
+export function providerDrainStateFromSnapshot(state: Record<string, unknown>): {
   pendingEventCount: number;
   activeProviderTurnId: string | null;
   providerSettled: boolean;
@@ -1514,6 +1515,8 @@ export interface CapabilityRunnerdProcessEvidence {
 }
 
 export interface CapabilityRunnerdCodexTransportOptions extends RunnerExecutionDriver {
+  /** Trusted Core option, never provider/model configuration or process environment. */
+  workspaceAccess?: import("../contracts/workspace-access.js").WorkspaceAccessPolicy;
   observability?: import("../drivers/agent-observability.js").ProviderObservabilityLaunch;
   homeMode?: "isolated" | "preconfigured";
   provider?: "cursor_cloud" | "codex" | "opencode" | "claude_managed" | "aws_agentcore" | "acpx";
@@ -4033,6 +4036,16 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
   readonly #bridgedRuntimeInputs = new Map<string, { durableTurnId: string; permission?: boolean }>();
 
   constructor(readonly options: CapabilityRunnerdCodexTransportOptions) {
+
+    if (options.workspaceAccess && ((options.provider ?? "codex") !== "codex" || options.homeMode === "preconfigured"
+      || options.codexArgs !== undefined || options.externallySandboxed || options.prepareLaunch || options.recoveryLaunch
+      || options.runnerFilesystemRoot || options.runnerStateDirectory || options.readRunnerState)) {
+      throw new Error("runner_workspace_access_launch_unsupported");
+    }
+    if (options.recoveryLaunch && commandDigest(options.recoveryLaunch.requirements.workspaceAccess ?? null)
+      !== commandDigest(options.workspaceAccess ?? null)) {
+      throw new Error("runner_workspace_access_recovery_policy_mismatch");
+    }
     this.#authorityRunId = options.recoveryLaunch ? () => {
       const owner = options.authorityRunId;
       if (typeof owner !== "string" || !owner.trim()) throw new Error("native_runner_recovery_launch_requirements_invalid");
@@ -4856,6 +4869,8 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             currentRunGrant?.runtimeContext,
             currentRunGrant ? { text: currentRunGrant.instructions, context: currentRunGrant.runtimeContext } : undefined,
           );
+      this.#assertScopedLocalTemplate(runAttachTemplate, desired,
+        currentRunGrant?.runtimeContext ?? this.options.runnerRuntimeContext ?? this.options.runtimeContext ?? null);
       if (this.options.prepareLaunch && !staged) {
         const priorProvider = record(runAttachTemplate.provider);
         const sourceRequirements = this.options.recoveryLaunch?.requirements;
@@ -5616,6 +5631,46 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
       rmSync(this.#root, { recursive: true, force: true });
     }
     this.#publish();
+  }
+
+  /** Scoped local recovery uses the same native factory as first launch. The
+   * stored command, complete args, effective override and provider checkpoint
+   * are observations to compare, never inputs for expanding host authority. */
+  #assertScopedLocalTemplate(template: Record<string, unknown>, identity: DurableRecoveryIdentity,
+    context: NativeRuntimeContextSnapshot | null = this.options.runnerRuntimeContext ?? this.options.runtimeContext ?? null): void {
+    const policy = this.options.workspaceAccess;
+    if (!policy) return;
+    const reject = (): never => { throw new NativeProviderStateIncompatibleError("workspace_policy_saved_launch_changed"); };
+    const prior = record(template.provider), cwd = policy.workspaceDirectory;
+    if (prior.kind !== "codex" || prior.preconfiguredHome || prior.externallySandboxed || prior.cwd !== cwd ||
+        this.options.resumeWorkingDirectory && this.options.resumeWorkingDirectory !== cwd) reject();
+    const command = this.options.codexCommand ?? resolveCodexCommand(undefined, this.options.environment, cwd);
+    const codexHome = resolve(this.#root, "codex-home");
+    const requirements = runnerProviderLaunchRequirements(this.options, identity, {
+      model: prior.model, approvalPolicy: prior.approvalPolicy,
+      permissions: prior.readOnly === true || prior.collaborationMode === "plan" ? "paperclip-runner-workspace-read-only" : "paperclip-runner-workspace-only",
+      conversationMode: prior.conversationMode, config: { include_collaboration_mode_instructions: prior.includeCollaborationModeInstructions !== false },
+    }, context, String(prior.instructions ?? ""));
+    const environment = { options: this.options, root: this.#root, cwd, codexHome, codexCommand: command,
+      providerNodeCommand: this.options.providerNodeCommand ?? process.execPath, opencodeProxyPath: "", acpxSidecarPath: "" };
+    const effective = { ...prior, ...(template.runtimeLaunchArgs !== undefined ? { args: template.runtimeLaunchArgs } : {}) };
+    try {
+      validatePreparedRunnerLaunch(requirements, { configurationId: "native-local-scoped-recovery",
+        requirementsDigest: runnerLaunchRequirementsDigest(requirements), provider: effective }, environment);
+      const providerPath = resolve(this.#root, "runner", "codex-provider-state.json");
+      if (existsSync(providerPath)) {
+        const file = lstatSync(providerPath);
+        if (!file.isFile() || file.isSymbolicLink() || file.size > 64 * 1024 * 1024) reject();
+        const bytes = readPrivateFile(providerPath); if (bytes === null) reject();
+        const saved = record(JSON.parse(bytes!)), config = record(saved.config);
+        const expected = createRunnerProviderLaunch(requirements, environment);
+        if (saved.schema !== "paperclip.runner.codex-provider-state.v1" || config.provider !== "codex" ||
+            ["command", "args", "cwd"].some(key => JSON.stringify(config[key]) !== JSON.stringify(expected[key]))) reject();
+      }
+    } catch (error) {
+      if (error instanceof NativeProviderStateIncompatibleError) throw error;
+      reject();
+    }
   }
 
   async #prepareOwnedProvider(
@@ -6502,6 +6557,17 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
             opencodeExecutable!,
           )
         : undefined;
+    if (this.options.workspaceAccess) {
+      this.#assertScopedLocalTemplate(rotatedRunAttachPayload(controlPlaneState!, identity, this.#authorizedTools,
+        this.options.resumeCompletionContract), identity, runtimeContext);
+      if (staged) this.#assertScopedLocalTemplate(staged.runAttachTemplate, desiredIdentity, runtimeContext);
+      if (warmRecovery) {
+        const command = (Array.isArray(controlPlaneState!.commands) ? controlPlaneState!.commands : [])
+          .map(record).find(entry => entry.commandId === warmRecovery!.commandId);
+        if (!command) throw new NativeProviderStateIncompatibleError("workspace_policy_saved_launch_missing");
+        this.#assertScopedLocalTemplate(record(command.payload), desiredIdentity, runtimeContext);
+      }
+    }
     const authorityRunId = this.#authorityRunId;
     this.#captureRetainedSourceIdentity();
     const core = new DurablePrpControlPlane({
@@ -6623,6 +6689,7 @@ class DurablePrpCodexTransport implements CodexAppServerTransport {
         runAttachTemplate.runtimeLaunchArgs =
           createRunnerdCodexAppServerArgs({
             args: this.options.codexArgs,
+            workspaceAccess: this.options.workspaceAccess,
             disableWebSearch: this.options.disableCodexWebSearch,
             environment: this.options.environment,
             codexHome,

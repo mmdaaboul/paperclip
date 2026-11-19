@@ -1,3 +1,9 @@
+import { providerDrainStateFromSnapshot } from "../../vendor/paperclip-runner/index.js";
+import type { WorkspaceAccessSnapshot } from "../../vendor/paperclip-runner/index.js";
+import { proveReviewerRecordedOwnerStopped, reviewerRecordedProcessIds, type ReviewerProcessEvidence } from "./reviewer-policy-process-proof.js";
+import { resolveNativeWorkspacePolicy, resolveNativeWorkspacePolicyForClaimedStop } from "./workspace-policy-admission.js";
+import { prepareOptionalNativeReviewerDiscussion } from "./reviewer-github-native-actions.js";
+import { recordNativeReviewerProcessAdmission } from "./reviewer-runtime-admission.js";
 import { remoteRecoveryLeaseMismatch } from "./remote-recovery-lease-mismatch.js";
 import { isGovernancePauseStop } from "../governance-pause-stop.js";
 import { nativeLeaseHolder, notifyNativeTokenLeaseClaimed } from "./native-token-lease-settlement.js";
@@ -892,6 +898,36 @@ export async function closeWarmNativeSessionsForEnvironment(input: {
   return closeIdleWarmNativeSessions(input);
 }
 
+/** Inspect only the selected native agent's current in-process owners. This
+ * grants nothing and is not proof of durable/on-another-controller retirement. */
+export function inspectNativeAgentPolicyWarmOwners(input: { companyId: string; agentId: string }) {
+  const selected = (scope: string) => {
+    try { const identity = JSON.parse(scope); return identity.companyId === input.companyId && identity.agentId === input.agentId; }
+    catch { return true; } // Unrepresented native state must not become a grant.
+  };
+  const owners = [...warmNativeSessions.entries()].filter(([, entry]) => entry.companyId === input.companyId && entry.agentId === input.agentId)
+    .map(([scope, entry]) => ({ runId: entry.runId, environmentId: entry.environmentId,
+      busy: entry.busy || Boolean(entry.preparingRunId || entry.instructionPreparationRunId) || executingRunnerdSessionScopes.has(scope),
+      closing: closingWarmNativeSessions.has(scope) }));
+  const scopes = new Set([...initializingSessionToolAuthorities, ...executingRunnerdSessionScopes.keys(),
+    ...executingNativeOwnerScopes.keys(), ...executingNativeIngressAllocations.keys(),
+    ...settlingNativeSessionScopes.keys(), ...closingWarmNativeSessions.keys()]);
+  if ([...scopes].some(scope => selected(scope) && !warmNativeSessions.has(scope))) {
+    owners.push({ runId: "unrepresented-native-owner", environmentId: null, busy: true, closing: true });
+  }
+  return owners;
+}
+
+/** Reuse native close/credential-stop/instruction-collection ownership. Never
+ * close a shared environment or unrelated agent, reset history or kill by PID. */
+export async function closeWarmNativeSessionsForAgentPolicy(input: { companyId: string; agentId: string }) {
+  const before = inspectNativeAgentPolicyWarmOwners(input);
+  if (before.some(owner => owner.busy || owner.closing)) return { closed: 0, busy: before.length, failed: 0, retiredRunIds: [] as string[] };
+  const outcome = await closeIdleWarmNativeSessions({ ...input, reason: "operator Reviewer policy changed" });
+  const after = inspectNativeAgentPolicyWarmOwners(input);
+  return { ...outcome, retiredRunIds: outcome.busy || outcome.failed || after.length ? [] : before.map(owner => owner.runId) };
+}
+
 /** Suspend idle owners and persist their remote backup before a controller
  * exits. Active turns keep their separate authenticated restart handoff. */
 export async function closeIdleWarmNativeSessionsForRestart(): Promise<{
@@ -910,6 +946,8 @@ export async function prepareIdleWarmNativeSessionsForSleep(input: {
 }
 
 async function closeIdleWarmNativeSessions(input: {
+  companyId?: string;
+  agentId?: string;
   environmentId?: string;
   reason: string;
   closeBusyOnRelease?: boolean;
@@ -920,6 +958,8 @@ async function closeIdleWarmNativeSessions(input: {
   let failed = 0;
   for (const [sessionId, entry] of [...warmNativeSessions]) {
     if (input.canRetire && !input.canRetire()) break;
+    if ((input.companyId !== undefined && entry.companyId !== input.companyId)
+      || (input.agentId !== undefined && entry.agentId !== input.agentId)) continue;
     if (input.environmentId !== undefined && entry.environmentId !== input.environmentId) {
       continue;
     }
@@ -3139,6 +3179,111 @@ export function rebaseRetainedNativeCleanupProviderHome(
  * Retain the old durable root permanently; only the exact in-memory cleanup
  * owner is retired, and the successor must use a fresh normalized session.
  */
+/** Read-only permission-transition observation. The native close owner handles
+ * idle live sessions first; this verifies stopped retained local Codex owners.
+ * Historical runs keep independent process obligations, but a reused scope's
+ * current files belong to their actual latest run, never each earlier run.
+ * This does not resume, delete, quarantine, collect or rewrite any saved state.
+ */
+export async function inspectStoppedNativeReviewerOwners(input: {
+  runs: Array<typeof heartbeatRuns.$inferSelect>;
+  processEvidence: ReviewerProcessEvidence[];
+}) {
+  const refuse = (reason: string): never => { throw new Error(`reviewer_retirement_${reason}`); };
+  const deadline = Date.now() + 25_000;
+  const checkBudget = () => { if (Date.now() > deadline) refuse("time_budget"); };
+  const processProofs: Array<{ recheck: () => Promise<boolean>; current: () => boolean }> = [];
+  const scopes = new Map<string, NativeExecutionInput>();
+  for (const run of input.runs) {
+    checkBudget();
+    if (run.runtimeMode !== "native") refuse("non_native_retained_owner");
+    const original = record(run.runnerProfileJson).nativeExecutionInput;
+    if (!original) {
+      if (run.nativeSessionId || run.runnerInstanceId || run.processPid || run.processGroupId || input.processEvidence.some(row => row.runId === run.id)) refuse("native_input_missing");
+      continue;
+    }
+    const execution = parseNativeExecutionInput(original);
+    if (execution.provider.kind !== "codex" || execution.session.driverKind !== "codex_app_server" ||
+        execution.binding.companyId !== run.companyId || execution.binding.agentId !== run.agentId ||
+        execution.binding.runId !== run.id || execution.binding.issueId !== run.nativeIssueId ||
+        nativeSessionKey(execution) !== run.nativeSessionId) refuse("native_input_binding");
+    const scope = nativeSessionScopeKey(execution);
+    if (activeNativeSessions.has(run.id) || nativeSessionStartups.has(run.id) || executingRunnerdSessionScopes.has(scope) ||
+        initializingSessionToolAuthorities.has(scope) || warmNativeSessions.has(scope)) refuse("owner_active");
+    processProofs.push(await proveReviewerRecordedOwnerStopped(run, input.processEvidence));
+    scopes.set(scope, execution);
+  }
+  const snapshots: Array<{ root: string; providerFile: string; fingerprint: string; pids: number[] }> = [];
+  for (const [scope, execution] of scopes) {
+    checkBudget();
+    // Legacy projections/held copies have their own native reconciliation.
+    // A permission setter must never migrate or smooth them as a side effect.
+    if ([legacyCompanyRunnerdStateRoot(execution), legacyRunnerdStateRoot(execution)].some(path => existsSync(path))) refuse("legacy_scope_needs_native_reconciliation");
+    const root = scopedRunnerdStateRoot(execution);
+    const quarantine = resolve(runnerdStateBase(), "quarantine");
+    if (existsSync(quarantine) && (!isSafeNativeStateDirectory(quarantine) ||
+        readdirSync(quarantine).some(name => name.startsWith(`${basename(root)}.`)))) refuse("held_scope_needs_native_reconciliation");
+    if (!existsSync(root)) {
+      snapshots.push({ root, providerFile: "", fingerprint: "absent", pids: [] });
+      continue;
+    }
+    if (!isSafeNativeStateDirectory(root) || readdirSync(root).some(name => !isKnownNativeSessionRootEntry(name))) refuse("scope_entries_unsettled");
+    const providerFile = runnerProviderStateFilename(execution), snapshot = cleanupStateSnapshot(root, providerFile);
+    const identity = record(snapshot.control.identity);
+    const owner = input.runs.find(run => run.id === identity.runId);
+    if (!owner) return refuse("current_scope_owner_missing");
+    const ownerExecution = parseNativeExecutionInput(record(owner.runnerProfileJson).nativeExecutionInput);
+    if (nativeSessionScopeKey(ownerExecution) !== scope || ownerExecution.workspace.cwd !== execution.workspace.cwd ||
+        !durableIdentityMatchesExecution(identity, ownerExecution) || identity.runnerInstanceId !== owner.runnerInstanceId ||
+        !["runnerInstanceId", "environmentLeaseId", "runId", "normalizedSessionId", "turnId", "itemId"].every(key =>
+          typeof identity[key] === "string" && Boolean(identity[key]) && snapshot.runner[key] === identity[key])) refuse("current_scope_identity");
+    const projection = readSettledRunnerdProjection(root, identity as Record<string, string>, { localRunner: true, stoppedLocalOwner: true });
+    if (projection.refused !== undefined) refuse("current_scope_journal_unsettled");
+    let drain: ReturnType<typeof providerDrainStateFromSnapshot>;
+    try { drain = providerDrainStateFromSnapshot(snapshot.provider); }
+    catch { return refuse("current_scope_provider_unsettled"); }
+    const toolBridge = snapshot.provider.toolBridge;
+    const pendingTools = record(toolBridge).pending;
+    const invalidTools = toolBridge != null && (typeof toolBridge !== "object" || Array.isArray(toolBridge)) ||
+      pendingTools != null && (typeof pendingTools !== "object" || Array.isArray(pendingTools) || Object.keys(pendingTools).length > 0);
+    if (snapshot.runner.schema !== RUNNERD_STATE_SCHEMA || !["ready", "suspended", "stopped", "revoked", "unrecoverable"].includes(String(snapshot.runner.lifecycle)) ||
+        !Array.isArray(snapshot.runner.outbox) || snapshot.runner.outbox.length || snapshot.runner.pendingTerminalDelivery != null ||
+        snapshot.runner.pendingProviderCleanup != null || snapshot.runner.warmTransition != null ||
+        snapshot.provider.schema !== "paperclip.runner.codex-provider-state.v1" ||
+        !["prepared", "session_open", "closed"].includes(String(snapshot.provider.lifecycle)) ||
+        snapshot.provider.startupAttempt != null || !drain.providerSettled || drain.pendingEventCount !== 0 || invalidTools) refuse("current_scope_provider_unsettled");
+    const config = record(snapshot.provider.config);
+    const providerEvents = input.processEvidence.filter(row => row.runId === owner.id &&
+      ["session.started", "session.resumed", "session.reconciled"].includes(row.eventType));
+    const lastProvider = record(record(record(providerEvents.at(-1)?.payload).prpEvent).payload);
+    const providerSessionId = lastProvider.driverSessionId ?? lastProvider.providerSessionId;
+    // Command is diagnostic here; no executable is selected or run by a stop proof.
+    // Native resolved commands can be absolute paths; never hard-code the alias.
+    if (config.provider !== "codex" || config.cwd !== ownerExecution.workspace.cwd || typeof config.command !== "string" ||
+        !config.command || config.command.length > 4096 || /[\x00-\x1f\x7f]/.test(config.command) ||
+        typeof providerSessionId !== "string" || !providerSessionId || snapshot.provider.threadId !== providerSessionId) refuse("current_provider_scope_mismatch");
+    const pids = reviewerRecordedProcessIds([snapshot.provider, snapshot.runner, snapshot.control]);
+    if (!pids.every(cleanupProcessAbsent)) refuse("current_scope_recorded_process_alive");
+    snapshots.push({ root, providerFile, fingerprint: snapshot.fingerprint, pids });
+  }
+  const current = () => {
+    try {
+      checkBudget();
+      if (!processProofs.every(proof => proof.current())) return false;
+      for (const run of input.runs) if (activeNativeSessions.has(run.id) || nativeSessionStartups.has(run.id)) return false;
+      for (const scope of scopes.keys()) if (executingRunnerdSessionScopes.has(scope) || initializingSessionToolAuthorities.has(scope) || warmNativeSessions.has(scope)) return false;
+      return snapshots.every(snapshot => snapshot.fingerprint === "absent" ? !existsSync(snapshot.root) :
+        snapshot.pids.every(cleanupProcessAbsent) && cleanupStateSnapshot(snapshot.root, snapshot.providerFile).fingerprint === snapshot.fingerprint);
+    } catch { return false; }
+  };
+  const recheck = async () => {
+    for (const proof of processProofs) { checkBudget(); if (!await proof.recheck()) return false; }
+    return current();
+  };
+  if (!await recheck()) refuse("observation_changed");
+  return { recheck, current };
+}
+
 export async function verifyStoppedNativeSessionForContinuation(
   db: Db,
   run: Pick<typeof heartbeatRuns.$inferSelect, "id" | "companyId" | "agentId" | "runtimeMode" |
@@ -5429,12 +5574,12 @@ type SettledRunnerdProjection = { bytes: string; refused?: never } | { bytes?: n
 const LOCAL_RUNNER_LIFECYCLE_COMMANDS = new Set(["runner.suspend", "runner.drain", "runner.shutdown"]);
 
 function readSettledRunnerdProjection(root: string, identity: Record<string, string>,
-  options: { localRunner?: boolean; controlBytes?: string } = {}): SettledRunnerdProjection {
+  options: { localRunner?: boolean; controlBytes?: string; stoppedLocalOwner?: boolean } = {}): SettledRunnerdProjection {
   const refuse = (refused: string): SettledRunnerdProjection => ({ refused });
   try {
     if (!isSafeNativeStateDirectory(root)) return refuse("root_unsafe");
     const lifecycle = runnerdAuthorityLifecycle(root, identity as RunnerdDurableIdentity);
-    if (lifecycle !== "absent" && !(options.localRunner && lifecycle === "not_suspended")) {
+    if (lifecycle !== "absent" && !(options.localRunner && (lifecycle === "not_suspended" || options.stoppedLocalOwner && lifecycle === "suspended"))) {
       return refuse(`runner_lifecycle_${lifecycle}`);
     }
     // Every legitimate writer's entry is classified in native-session-root-entries.ts.
@@ -5449,7 +5594,7 @@ function readSettledRunnerdProjection(root: string, identity: Record<string, str
     const control = record(JSON.parse(bytes));
     const commands = (Array.isArray(control.commands) ? control.commands : []).map(record);
     // A stopped local Runner can no longer act on its own lifecycle commands.
-    const settledCommands = options.localRunner && lifecycle === "not_suspended" && Array.isArray(control.commands)
+    const settledCommands = options.localRunner && (lifecycle === "not_suspended" || options.stoppedLocalOwner) && Array.isArray(control.commands)
       ? commands.filter(command => !LOCAL_RUNNER_LIFECYCLE_COMMANDS.has(String(command.type)) || command.status === "completed")
       : commands;
     const settledControl = settledCommands === commands ? control : { ...control, commands: settledCommands };
@@ -9232,6 +9377,7 @@ export function resolveNativeCancellationStatus(input: {
 }
 
 export async function executePaperclipNativeSession(input: {
+  workspaceAccess?: WorkspaceAccessSnapshot;
   casesEnabled?: boolean;
   getFreshSessionHandoff?: () => Promise<string | null>;
   /** Retire a retained transport so recovery can replace provider tool declarations. */
@@ -9373,6 +9519,21 @@ export async function executePaperclipNativeSession(input: {
   const physicalIngressKey = physicalIngress ? nativeWarmIngressAllocation(physicalIngress) : undefined;
   let ownsPhysicalIngress = false;
   try {
+    let stopLease: string | undefined;
+    if (input.restartRecovery?.kind === "reattach_remote_runner" && input.restartRecovery.runId === runId
+      && input.restartRecovery.leaseOwner === input.leaseOwner) {
+      const [stoppingRun] = await input.db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, runId),
+        eq(heartbeatRuns.companyId, input.execution.binding.companyId), eq(heartbeatRuns.agentId, input.execution.binding.agentId)));
+      if (stoppingRun && await readClaimedNativeStopRecovery(input.db, stoppingRun, input.leaseOwner)) stopLease = input.leaseOwner;
+    }
+    const workspaceAccess = stopLease
+      ? await resolveNativeWorkspacePolicyForClaimedStop(input.db, input.execution, stopLease, input.workspaceAccess)
+      : await resolveNativeWorkspacePolicy(input.db, input.execution, input.workspaceAccess);
+    if (workspaceAccess && (!input.useRunnerd || input.backend || input.runnerExecutionTarget?.kind === "remote")) {
+      throw new NativeProviderStateIncompatibleError("workspace_policy_requires_isolated_local_runner");
+    }
+    input = { ...input, workspaceAccess, ...(stopLease || workspaceAccess?.policy.readOnlyWorkspace ? { managedGitHub: false } : {}) };
+    preparedInput = input;
     if (physicalIngressKey) {
       const retained = warmNativeSessions.get(nativeSessionScopeKey(input.execution));
       if (retained && retained.issueId !== input.execution.binding.issueId) throw new Error("native_session_supervisor_busy");
@@ -14216,6 +14377,7 @@ export function remoteCheckpointIncompleteFailure(
 
 /** Production runnerd backend seam, exported so provider wiring can be regression tested. */
 export async function createRunnerdBackend(input: {
+  workspaceAccess?: WorkspaceAccessSnapshot;
   executionContext?: NativeExecutionContext;
   casesEnabled?: boolean;
   db: Db;
@@ -14287,6 +14449,11 @@ export async function createRunnerdBackend(input: {
       throw new NativeCancellationPendingRecoveryError();
     }
   }
+  const workspaceAccess = input.recoveryPurpose === "stop_cleanup"
+    ? await resolveNativeWorkspacePolicyForClaimedStop(input.db, input.execution, input.restartRecovery!.leaseOwner, input.workspaceAccess)
+    : await resolveNativeWorkspacePolicy(input.db, input.execution, input.workspaceAccess);
+  if (workspaceAccess && input.runnerExecutionTarget?.kind === "remote") throw new NativeProviderStateIncompatibleError("workspace_policy_remote_target_unqualified");
+  input = { ...input, workspaceAccess };
   const sessionScopeId = nativeSessionScopeKey(input.execution);
   const scopeOwner = executingRunnerdSessionScopes.get(sessionScopeId);
   if (scopeOwner && scopeOwner !== input.execution.binding.runId) {
@@ -14498,15 +14665,18 @@ async function createRunnerdBackendWithinSessionClaim(
     input.db,
     input.execution.binding,
   ));
+  const protectedReviewer = input.workspaceAccess?.policy.readOnlyWorkspace === true;
+  const cleanupOnly = input.recoveryPurpose === "stop_cleanup";
+  const noExternalTools = protectedReviewer || cleanupOnly;
   const pinnedSkills = new Set("runtimeContext" in input.execution ? input.execution.runtimeContext.skills.map((skill) => skill.key) : []);
-  const connectorAssignments = input.execution.provider.kind !== "muse" ? connectorToolDefinitionsForSkills(pinnedSkills) : [];
+  const connectorAssignments = !noExternalTools && input.execution.provider.kind !== "muse" ? connectorToolDefinitionsForSkills(pinnedSkills) : [];
   const reviewRun = await input.db.select({ contextSnapshot: heartbeatRuns.contextSnapshot })
     .from(heartbeatRuns).where(and(
       eq(heartbeatRuns.id, input.execution.binding.runId),
       eq(heartbeatRuns.companyId, input.execution.binding.companyId),
     )).limit(1).then((rows) => rows[0]);
-  const nativeReview = readNativeReviewAssignmentContext(reviewRun?.contextSnapshot);
-  if (nativeReview && !await getNativeReviewAssignment(input.db, {
+  const nativeReview = cleanupOnly ? null : readNativeReviewAssignmentContext(reviewRun?.contextSnapshot);
+  if (!cleanupOnly && nativeReview && !await getNativeReviewAssignment(input.db, {
     ...input.execution.binding, contextSnapshot: nativeReview,
   })) throw new Error("native_review_assignment_no_longer_available");
   // Codex and OpenCode send dynamic tool calls over authenticated PRP. Keep
@@ -14534,7 +14704,7 @@ async function createRunnerdBackendWithinSessionClaim(
     : undefined;
   const [preparedEnvironment, preparedAssignedMcp, preparedPluginTaskOwner] = await Promise.allSettled([
     Promise.resolve().then(() => input.prepareRunnerEnvironment?.() ?? input.runnerEnvironment),
-    Promise.resolve().then(() => relayAssignedMcp && !nativeReview && assignedMcpUrl && assignedMcpToken
+    Promise.resolve().then(() => !noExternalTools && relayAssignedMcp && !nativeReview && assignedMcpUrl && assignedMcpToken
       ? timeController("assigned_mcp", () => createAssignedMcpTools({
         gateway: getAssignedMcpGateway(input.db),
         gatewayPublicId: assignedGatewayPublicId!,
@@ -14555,7 +14725,13 @@ async function createRunnerdBackendWithinSessionClaim(
         eq(agents.id, input.execution.binding.agentId), eq(agents.companyId, input.execution.binding.companyId),
       )).limit(1).then(rows => rows[0]) : undefined;
   input.executionContext?.signal.throwIfAborted();
+  const reviewerGitHubTools = protectedReviewer && !cleanupOnly ? await prepareOptionalNativeReviewerDiscussion(input.db, {
+    execution: input.execution, workspaceAccess: input.workspaceAccess!,
+    onUnavailable: message => input.onLog?.("stderr", `[paperclip] Reviewer PR discussion unavailable: ${message}\n`) ?? Promise.resolve(),
+  }) : undefined;
   const authority = new PaperclipRunnerToolAuthority(input.db, {
+    reviewerRole: protectedReviewer,
+    reviewerGitHubTools,
     apiUrl: resolveLocalRuntimeApiUrl(),
     casesEnabled: input.casesEnabled === true,
     ...(nativeReview ? { nativeReview } : {}),
@@ -16125,7 +16301,8 @@ async function createRunnerdBackendWithinSessionClaim(
     lifecycleMode: input.execution.session.lifecyclePolicy.mode,
   }) : null;
   if (antigravityCredential) effectiveRunnerEnvironmentBase = antigravityCredential.environment;
-  if (relayAssignedMcp) {
+  if (protectedReviewer) effectiveRunnerEnvironmentBase.TMPDIR = input.workspaceAccess!.policy.scratchDirectory!;
+  if (relayAssignedMcp || noExternalTools) {
     // The server-held tool authority owns this credential. Do not deliver a
     // duplicate HTTP MCP server or its bearer token to the remote provider.
     delete effectiveRunnerEnvironmentBase.PAPERCLIP_NATIVE_MCP_NAME;
@@ -16324,12 +16501,18 @@ async function createRunnerdBackendWithinSessionClaim(
     ),
     codexTransportFactory: (recoveryContext) => {
       const bundle = createRunnerdCodexTransport({
+        workspaceAccess: input.workspaceAccess?.policy,
         ...(input.recoveryPurpose === "stop_cleanup" ? { recoveryPurpose: "stop_cleanup" as const } : {}),
         measureOperation: process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim() ? measureRunnerOperation : undefined,
         recordTimingReceipt: process.env.OTEL_EXPORTER_OTLP_ENDPOINT?.trim() ? recordRunnerTimingReceipt : undefined,
         // Remote launchers record their own stage and launch spans.
         ...(remoteTarget ? {} : { onStartupStep: (step: Parameters<typeof recordNativeRunnerStartupStep>[1]) => recordNativeRunnerStartupStep(input.trace, step) }),
-        onSpawn: input.onSpawn,
+        onSpawn: async meta => {
+          await input.onSpawn?.(meta);
+          if (protectedReviewer && !cleanupOnly) await recordNativeReviewerProcessAdmission(input.db, {
+            execution: input.execution, workspaceAccess: input.workspaceAccess!, runnerInstanceId: effectiveRunnerInstanceId, process: meta,
+          });
+        },
         ...(input.execution.provider.kind === "codex" ? { disableCodexWebSearch: "webSearch" in input.execution.provider && input.execution.provider.webSearch === "disabled" } : {}),
         homeMode: preconfiguredHome ? "preconfigured" : "isolated",
         ...accountingTransportOptions,

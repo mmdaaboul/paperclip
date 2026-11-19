@@ -1,3 +1,5 @@
+import { reviewerActorRestricted, reviewerAllowsNativeRead } from "./reviewer-role.js";
+import { getNativeReviewAssignment } from "./native-runtime/native-review-participant.js";
 import { and, eq, inArray, isNull, or, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { withHumanDirectedWork } from "./human-directed-work.js";
@@ -5,6 +7,7 @@ import { hasOwnerChatInstructionAuthority } from "./owner-chat-instruction-autho
 import { canonicalExecutionUuid } from "./execution-identity.js";
 import {
   agents,
+  agentReviewerPolicies,
   approvals,
   issueApprovals,
   authUsers,
@@ -104,6 +107,7 @@ export type AuthorizationAction =
   | "decision_triage:manage"
   | "issue:comment"
   | "issue:mutate"
+  | "issue:resolve_assigned_review"
   | "issue:read"
   | "project:read"
   | "project:write_workspace"
@@ -121,6 +125,7 @@ export type AuthorizationResource =
       type: "issue";
       companyId: string;
       issueId?: string | null;
+      interactionId?: string | null;
       projectId?: string | null;
       parentIssueId?: string | null;
       assigneeAgentId?: string | null;
@@ -149,6 +154,7 @@ export type AuthorizationDecision = {
     | "allow_issue_mention_grant"
     | "allow_direct_parent_report"
     | "allow_visible_issue_write"
+    | "allow_assigned_review"
     | "allow_self"
     | "allow_company_agent"
     | "allow_company_member"
@@ -207,7 +213,7 @@ function permissionForAction(action: AuthorizationAction): PermissionKey | null 
   ) {
     return null;
   }
-  if (action === "issue:comment" || action === "issue:mutate") return null;
+  if (action === "issue:comment" || action === "issue:mutate" || action === "issue:resolve_assigned_review") return null;
   return action;
 }
 
@@ -2276,6 +2282,13 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
       });
     }
 
+    // Additive agent restriction before native connection, scoped-key, self,
+    // CEO and explicit-grant shortcuts. Reads retain native privacy/RBAC.
+    if (!reviewerAllowsNativeRead(input.action) && await reviewerActorRestricted(db, {
+      companyId, agentId: actorAgentId, runId: input.actor.runId,
+    })) return deny({ action: input.action, reason: "deny_policy_restricted",
+      explanation: "The Reviewer role permits native reads and only its current assigned review/discussion actions." });
+
     if (isConnectionManagementAction(input.action) &&
         (input.actor.keyScope?.kind === "skill_test" || input.actor.keyScope?.kind === "task_bridge")) {
       return deny({ action: input.action, reason: "deny_scope", explanation: "Scoped test and task bridge credentials cannot administer connections." });
@@ -2862,6 +2875,47 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
     resource: AuthorizationResource;
     scope?: Record<string, unknown> | null;
   }): Promise<AuthorizationDecision> {
+    if (input.action === "issue:resolve_assigned_review") {
+      const denied = () => deny({ action: input.action, reason: "deny_policy_restricted",
+        explanation: "Only the current protected native review may be resolved by this authenticated run." });
+      if (input.actor.type !== "agent" || !input.actor.agentId || !input.actor.runId
+        || input.actor.companyId !== input.resource.companyId || input.resource.type !== "issue"
+        || !input.resource.issueId || !input.resource.interactionId) return denied();
+      if (!await reviewerActorRestricted(db, { companyId: input.resource.companyId,
+        agentId: input.actor.agentId, runId: input.actor.runId })) return denied();
+      const visibility = await decide({ ...input, action: "issue:read" });
+      if (!visibility.allowed) return { ...visibility, action: input.action };
+      const [run] = await db.select({ contextSnapshot: heartbeatRuns.contextSnapshot, runnerProfileJson: heartbeatRuns.runnerProfileJson }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, input.actor.runId), eq(heartbeatRuns.companyId, input.resource.companyId), eq(heartbeatRuns.agentId, input.actor.agentId)));
+      const [role] = await db.select().from(agentReviewerPolicies).where(and(eq(agentReviewerPolicies.companyId, input.resource.companyId), eq(agentReviewerPolicies.agentId, input.actor.agentId)));
+      const admitted = isPlainRecord(run?.runnerProfileJson?.reviewerPolicy) ? run.runnerProfileJson.reviewerPolicy.revision : null;
+      if (!run || !role?.enabled || !Number.isSafeInteger(admitted) || admitted !== role.revision) return denied();
+      const reviewer = await loadAgent(input.actor.agentId);
+      if (!reviewer || (await resolveActorTrust({ actorAgent: reviewer, actor: input.actor,
+        companyId: input.resource.companyId, resource: input.resource })).kind !== "standard") return denied();
+      const [issue] = await db.select({ executionRunId: issues.executionRunId, status: issues.status, assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId, projectId: issues.projectId }).from(issues).where(and(eq(issues.id, input.resource.issueId), eq(issues.companyId, input.resource.companyId)));
+      if (!issue) return denied();
+      const assignment = await getNativeReviewAssignment(db as Db, { companyId: input.resource.companyId, issueId: input.resource.issueId,
+        agentId: input.actor.agentId, contextSnapshot: run.contextSnapshot, actingRunId: input.actor.runId,
+        issueExecutionRunId: issue.executionRunId, allowResolvedByRunId: input.actor.runId });
+      if (!assignment || assignment.interaction.id !== input.resource.interactionId) return denied();
+      try {
+        const { assertNativeReviewerProcessAdmissionCurrent } = await import("./native-runtime/reviewer-runtime-admission.js");
+        await assertNativeReviewerProcessAdmissionCurrent(db as Db, { companyId: input.resource.companyId,
+          agentId: input.actor.agentId, runId: input.actor.runId }, { allowResolvedReview: true });
+      } catch { return denied(); }
+      // Native interaction resolution still owns audience, source/version and
+      // atomic terminal state. This grants no generic confirmations or writes.
+      const assignedDecision = allow({ action: input.action, reason: "allow_assigned_review",
+        explanation: "This exact readable native review belongs to the qualified protected run." });
+      // The special grant narrows the agent's write authority; it never widens
+      // either human principal's native issue-mutation ceiling.
+      const mutation = { ...input, action: "issue:mutate" as const, resource: { ...input.resource,
+        status: issue.status, assigneeAgentId: issue.assigneeAgentId, assigneeUserId: issue.assigneeUserId, projectId: issue.projectId } };
+      const responsible = await applyResponsibleUserIntersection(mutation, assignedDecision);
+      const authorized = await applyAuthorizingUserIntersection(mutation, responsible);
+      return { ...authorized, action: input.action };
+    }
     const agentDecision = await measureWorkspaceAuthorization("authorization.base", () => decideBase(input));
     const responsibleDecision = await measureWorkspaceAuthorization("authorization.responsible_user", () => applyResponsibleUserIntersection(input, agentDecision));
     const intersectedDecision = await measureWorkspaceAuthorization("authorization.authorizing_user", () => applyAuthorizingUserIntersection(input, responsibleDecision));

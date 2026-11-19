@@ -1,3 +1,4 @@
+import type { WorkspaceAccessPolicy } from "../contracts/workspace-access.js";
 import { createHash } from "node:crypto";
 import { parseNativeRuntimeContext, retargetNativeSystemInstructions } from "../contracts/runtime-context.js";
 import { resolve } from "node:path";
@@ -30,6 +31,8 @@ export interface RunnerProviderLaunchRequirements {
     "piThinkingLevel" | "claudeEffort" | "grokEffort" | "grokDisableWebSearch" | "managedProfile" | "agentCoreProfile" | "opencodePermissionMode" | "disableCodexWebSearch" | "disableCodexProjectInstructions">;
   instructions: string;
   runtimeContext: NativeRuntimeContextSnapshot | null;
+  /** Controller-admitted, token-free policy bound into the launch digest. */
+  workspaceAccess?: WorkspaceAccessPolicy;
 }
 
 /** A prepared descriptor belongs to one exact request and contains no launch secrets. */
@@ -56,6 +59,7 @@ export function runnerProviderLaunchRequirements(
     identity, provider: options.provider ?? "codex",
     model: typeof params.model === "string" ? params.model : null,
     instructions, runtimeContext,
+    ...(options.workspaceAccess ? { workspaceAccess: structuredClone(options.workspaceAccess) } : {}),
     settings: {
       acpxAgent: options.acpxAgent, acpxMode: options.acpxMode,
       acpxPermissionMode: options.acpxPermissionMode,
@@ -101,7 +105,7 @@ export function runnerLaunchRequirementsDigest(requirements: RunnerProviderLaunc
 }
 
 function runnerLaunchPolicy(requirements: RunnerProviderLaunchRequirements): Record<string, unknown> {
-  return createRunnerProviderLaunch(requirements, {
+  return createRunnerProviderLaunch({ ...requirements, workspaceAccess: undefined }, {
     options: { codexArgs: [] }, root: "/", cwd: "/", codexHome: "/",
     providerNodeCommand: "", opencodeProxyPath: "", acpxSidecarPath: "", codexCommand: "",
   });
@@ -116,6 +120,7 @@ export function runnerLaunchSettingsMatch(requirements: RunnerProviderLaunchRequ
 export function validatePreparedRunnerLaunch(
   requirements: RunnerProviderLaunchRequirements,
   prepared: PreparedRunnerProviderLaunch,
+  trustedEnvironment?: RunnerProviderLaunchEnvironment,
 ): void {
   const reject = () => { throw new Error("runner_prepared_launch_requirements_mismatch"); };
   if (!prepared || typeof prepared.configurationId !== "string" || !prepared.configurationId.trim()
@@ -155,6 +160,21 @@ export function validatePreparedRunnerLaunch(
     "preconfiguredHome", "externallySandboxed", "runtimeContext", "instructions"]);
   for (const [key, value] of Object.entries(expected)) {
     if (!hostFields.has(key) && JSON.stringify(value) !== JSON.stringify(descriptor[key])) reject();
+  }
+
+  if (requirements.workspaceAccess) {
+    if (requirements.provider !== "codex" || descriptor.preconfiguredHome || descriptor.externallySandboxed
+      || descriptor.cwd !== requirements.workspaceAccess.workspaceDirectory) reject();
+    // Public digests and a syntactically readonly profile are not authority for
+    // additional host reads. Reuse the complete native factory under the actual
+    // environment owner, including executable roots and credential deny roots.
+    if (!trustedEnvironment) throw new Error("runner_workspace_access_prepared_environment_unqualified");
+    const trusted = createRunnerProviderLaunch(requirements, trustedEnvironment);
+    for (const key of ["command", "args", "cwd", "preconfiguredHome", "externallySandboxed"]) {
+      if (JSON.stringify(descriptor[key]) !== JSON.stringify(trusted[key])) {
+        throw new Error("runner_prepared_launch_workspace_access_mismatch");
+      }
+    }
   }
   if ("cwd" in expected) {
     try { validatePreparedLaunchWorkingDirectory(descriptor.cwd); }
@@ -203,6 +223,12 @@ export function createRunnerProviderLaunch(
   input: RunnerProviderLaunchEnvironment,
 ): Record<string, unknown> {
   const { identity, instructions: baseInstructions, runtimeContext, settings, provider } = requirements;
+  if (requirements.workspaceAccess && (provider !== "codex" || input.options.homeMode === "preconfigured"
+    || input.options.externallySandboxed || input.options.codexArgs !== undefined
+    || input.cwd !== requirements.workspaceAccess.workspaceDirectory)) {
+    throw new Error("runner_workspace_access_launch_unsupported");
+  }
+
   if (provider === "cursor_cloud") {
     if (input.options.runnerFilesystemRoot || !requirements.model || requirements.readOnly) {
       throw new Error("cursor_cloud_local_controller_required: experimental Cursor Cloud supports standard tasks with a local controller");
@@ -348,6 +374,7 @@ export function createRunnerProviderLaunch(
                       ? [opencodeProxyPath]
                       : createRunnerdCodexAppServerArgs({
                           args: input.options.codexArgs,
+                          workspaceAccess: requirements.workspaceAccess,
                           disableWebSearch: settings.disableCodexWebSearch,
                           environment: input.options.environment,
                           codexHome,
@@ -453,12 +480,18 @@ export function createRunnerdCodexAppServerArgs(input: {
   instructionWorkingCopyRoot?: string;
   disableProjectInstructions?: boolean;
   disableWebSearch?: boolean;
+  workspaceAccess?: WorkspaceAccessPolicy;
   args?: string[];
 }): string[] {
   // The filesystem policy denies HOME and CODEX_HOME to keep credentials and
   // runner state outside provider reach. Always bind those names to the actual
   // isolated runner home; a stale controller environment must never cause the
   // execution workspace itself to become an explicit deny root.
+
+  if (input.workspaceAccess && (input.args !== undefined || usesPreconfiguredHome(input.environment)
+    || input.workingDirectory !== input.workspaceAccess.workspaceDirectory)) {
+    throw new Error("runner_workspace_access_launch_unsupported");
+  }
   const args = input.args ? [...input.args] : [
     ...createIsolatedCodexAppServerArgs(
       {
@@ -469,6 +502,8 @@ export function createRunnerdCodexAppServerArgs(input: {
       [...(input.readOnlyRoots ?? []), ...codexExecutableReadOnlyRoots(input.environment ?? {}, input.codexCommand)],
       input.instructionWorkingCopyRoot,
       usesPreconfiguredHome(input.environment) && input.runtimeStateRoot ? [input.runtimeStateRoot] : [],
+      false,
+      input.workspaceAccess,
     ),
   ];
   if (!input.args && usesPreconfiguredHome(input.environment) && input.workingDirectory) {

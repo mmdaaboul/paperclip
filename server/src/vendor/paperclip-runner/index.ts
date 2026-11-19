@@ -10,6 +10,7 @@
 type RunnerModule = typeof import("@paperclipai/paperclip-runner");
 
 export type {
+  WorkspaceAccessSnapshot,
   NativeCursorCloudConfig,
   AcpxCandidateAdmission,
   DotHarnessDriver,
@@ -229,3 +230,11 @@ export const CursorCloudClient = runner.CursorCloudClient;
 export const parseNativeCursorCloudConfig = runner.parseNativeCursorCloudConfig;
 
 export const archiveCursorCloudSessionCheckpoint = runner.archiveCursorCloudSessionCheckpoint;
+
+// Optional server-owned Reviewer/reference admission through the native boundary.
+export const createWorkspaceAccessSnapshot = runner.createWorkspaceAccessSnapshot;
+export const parseWorkspaceAccessSnapshot = runner.parseWorkspaceAccessSnapshot;
+export const resolveCodexWorkspaceAccessPolicy = runner.resolveCodexWorkspaceAccessPolicy;
+export const validateCodexReferenceDirectory = runner.validateCodexReferenceDirectory;
+export const inspectReadonlyReviewerCandidate = runner.inspectReadonlyReviewerCandidate;
+export const providerDrainStateFromSnapshot = runner.providerDrainStateFromSnapshot;

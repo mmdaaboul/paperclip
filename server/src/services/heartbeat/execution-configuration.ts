@@ -1,3 +1,4 @@
+import { reviewerExecutionRestrictsCredentials } from "../reviewer-role.js";
 import { agentHarnessType } from "@paperclipai/shared";
 import { observabilitySecretValues } from "@paperclipai/adapter-utils/agent-observability";
 import { agentObservabilityService, unavailableAgentObservability, type ResolvedAgentObservability } from "../agent-observability.js";
@@ -175,7 +176,11 @@ export async function prepareHeartbeatExecutionConfiguration(db: Db, input: Hear
       ? [...runScopedMentionedSkillKeys, ACCEPTED_PLAN_CONVERSION_SKILL_KEY]
       : runScopedMentionedSkillKeys;
   const githubSelection = githubIdentity.value;
+  const reviewerRestricted = await reviewerExecutionRestrictsCredentials(db, {
+    companyId: agent.companyId, agentId: agent.id, runnerProfileJson: run.runnerProfileJson,
+  });
   const useHostGitHub =
+    !reviewerRestricted &&
     !githubSelection.configured &&
     trustPreset.kind === "standard" &&
     ["local", "ssh"].includes(

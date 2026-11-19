@@ -1,3 +1,5 @@
+import { AgentReferenceFoldersCard } from "./AgentReferenceFoldersCard";
+import { AgentReviewerPolicyCard } from "./AgentReviewerPolicyCard";
 import { useAdapterLoginCancellation } from "./useAdapterLoginCancellation";
 import { ACCOUNT_BOUND_MODEL_DISCOVERY_QUERY_OPTIONS, isAccountBoundAcpxAgent } from "@/lib/native-model-catalog";
 import { useConnectionModels } from "./ai-connections/useConnectionModels";
@@ -1645,6 +1647,18 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
         </div>
       ) : null}
     <ConfigSections order={props.sectionOrder} hidden={props.hiddenSections} className={cn("relative", panels ? "agent-config-panels" : cards && "space-y-6")}>
+      {!isCreate ? <div data-config-section="reviewer-policy" className={cn(!cards && "border-b border-border")}>
+        <div className={cn(cards ? "rounded-lg border border-border p-4" : "px-4 py-4")}>
+          <AgentReviewerPolicyCard key={props.agent.id} agentId={props.agent.id} companyId={props.agent.companyId}
+            hasPendingAgentChanges={isDirty} agentSaving={props.isSaving} savedAgentVersion={String(props.agent.updatedAt)} />
+        </div>
+      </div> : null}
+      {!isCreate ? <div data-config-section="reference-folders" className={cn(!cards && "border-b border-border")}>
+        <div className={cn(cards ? "rounded-lg border border-border p-4" : "px-4 py-4")}>
+          <AgentReferenceFoldersCard key={props.agent.id} agentId={props.agent.id} companyId={props.agent.companyId}
+            hasPendingAgentChanges={isDirty} agentSaving={props.isSaving} savedAgentVersion={String(props.agent.updatedAt)} />
+        </div>
+      </div> : null}
       {/* ---- Floating Save button (edit mode, when dirty) ---- */}
       {isDirty && !props.hideInlineSave && (
         <div className="sticky top-0 z-10 flex items-center justify-end px-4 py-2 bg-background/90 backdrop-blur-sm border-b border-primary/20">

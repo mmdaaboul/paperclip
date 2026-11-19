@@ -392,6 +392,8 @@ import {
   buildNativeHarnessBackupManifest,
   cancelNativeSession,
   closeWarmNativeSessionsForEnvironment,
+  closeWarmNativeSessionsForAgentPolicy,
+  inspectNativeAgentPolicyWarmOwners,
   claimWarmNativeInstructionCopy,
   warmSessionReleaseWait,
   nativeSessionWorkspaceScope,
@@ -10228,6 +10230,50 @@ describe("bounded stopped instruction collection", () => {
 });
 
 describe("native warm session supervision", () => {
+  describe("selected-agent Reviewer retirement", () => {
+    function warm(agentId: string) {
+      return { ...execution, binding: { ...execution.binding, agentId, runId: `run-${agentId}`, executionWorkspaceId: `workspace-${agentId}` },
+        session: { ...execution.session, normalizedSessionId: `session-${agentId}`, lifecyclePolicy: { mode: "warm" as const, idleTimeoutMs: 60_000 } } } as NativeExecutionInputV1;
+    }
+    async function admit(input: NativeExecutionInputV1, close: () => Promise<void>, during?: () => Promise<void>) {
+      state.execute.mockReset().mockImplementationOnce(async options => {
+        await options.onSession?.({ close }); await during?.();
+        return { result: { summary: "Completed" }, terminal: { runTerminalState: "succeeded" }, turnId: "turn",
+          normalizedSessionId: input.session.normalizedSessionId, providerSessionId: `provider-${input.binding.agentId}`,
+          driverKind: "test", driverVersion: "1", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+      });
+      await executePaperclipNativeSession({ db: leaseDb(input), execution: input, runnerInstanceId: "runner" });
+    }
+    it("reports busy ownership and closes only the selected agent", async () => {
+      await closeIdleWarmNativeSessionsForRestart();
+      const selected=warm("policy-selected"), unrelated=warm("policy-unrelated"), selectedClose=vi.fn(async()=>undefined), unrelatedClose=vi.fn(async()=>undefined);
+      const scope={companyId:selected.binding.companyId,agentId:selected.binding.agentId};
+      try {
+        await admit(unrelated,unrelatedClose);
+        await admit(selected,selectedClose,async()=>{
+          const outcome=await closeWarmNativeSessionsForAgentPolicy(scope);expect(outcome).toMatchObject({closed:0,failed:0});expect(outcome.busy).toBeGreaterThan(0);expect(selectedClose).not.toHaveBeenCalled();
+        });
+        expect(await closeWarmNativeSessionsForAgentPolicy(scope)).toMatchObject({closed:1,busy:0,failed:0,retiredRunIds:[selected.binding.runId]});
+        expect(selectedClose).toHaveBeenCalledOnce();expect(unrelatedClose).not.toHaveBeenCalled();
+        expect(inspectNativeAgentPolicyWarmOwners(scope)).toEqual([]);
+        expect(inspectNativeAgentPolicyWarmOwners({companyId:unrelated.binding.companyId,agentId:unrelated.binding.agentId})).toHaveLength(1);
+      } finally { await closeIdleWarmNativeSessionsForRestart(); }
+    });
+    it("retains a failed close and permits its later exact native retry", async () => {
+      await closeIdleWarmNativeSessionsForRestart();
+      const selected=warm("policy-retry"), close=vi.fn(async()=>undefined).mockRejectedValue(new Error("synthetic close refused"));
+      const scope={companyId:selected.binding.companyId,agentId:selected.binding.agentId};
+      try {
+        await admit(selected,close);
+        expect(await closeWarmNativeSessionsForAgentPolicy(scope)).toMatchObject({closed:0,failed:1,retiredRunIds:[]});
+        expect(inspectNativeAgentPolicyWarmOwners(scope)).toHaveLength(1);
+        close.mockResolvedValue(undefined);
+        expect(await closeWarmNativeSessionsForAgentPolicy(scope)).toMatchObject({closed:1,failed:0,retiredRunIds:[selected.binding.runId]});
+        expect(close).toHaveBeenCalledTimes(2);expect(inspectNativeAgentPolicyWarmOwners(scope)).toEqual([]);
+      } finally { close.mockResolvedValue(undefined);await closeIdleWarmNativeSessionsForRestart(); }
+    });
+  });
+
   it.each(["collect", "close-failure", "stopped", "destroyed", "missing-lease", "foreign-run", "foreign-environment", "deleted-environment", "claim-edit", "claim-add", "claim-remove", "claim-remove-entry", "claim-canonical", "claim-config", "claim-uncertain"])("composes remote warm ownership with real DB successor leases and current-run collection: %s", async ending => {
     const tables = await import("@paperclipai/db");
     const { eq, sql } = await import("drizzle-orm");

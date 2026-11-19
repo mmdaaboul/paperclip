@@ -127,7 +127,7 @@ export interface HeartbeatRuntimeExecutionInput {
     issueId: string | null;
     taskKey: string | null;
   };
-  runtime: Pick<Selected, "nativeExecution" | "nativeRunnerInstanceId" | "getNativeFreshSessionHandoff"> & {
+  runtime: Pick<Selected, "nativeExecution" | "nativeRunnerInstanceId" | "getNativeFreshSessionHandoff" | "referenceFolderAccess" | "reviewerWorkspaceAccess"> & {
     nativeRuntimeResolution: Selection["nativeRuntimeResolution"];
     adapter: ServerAdapterModule;
     runtimeForAdapter: AdapterExecutionContext["runtime"];
@@ -623,6 +623,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
         await dispatchWithTiming(
           (markDispatchStarted) => {
             return executePaperclipNativeSession({
+              workspaceAccess: input.runtime.reviewerWorkspaceAccess?.workspaceAccess ?? input.runtime.referenceFolderAccess?.workspaceAccess,
               casesEnabled: context.paperclipCasesEnabled === true,
               db,
               execution: nativeExecution,
@@ -698,6 +699,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
                   executionWorkspace.cwd,
                 ),
                 ...buildAgentIdentityEnv(agentIdentity),
+                ...(input.runtime.reviewerWorkspaceAccess ? { TMPDIR: input.runtime.reviewerWorkspaceAccess.tmpdir } : {}),
                 ...(input.instructions.instructionCopy && isAgentDirectoryCopy(input.instructions.instructionCopy) ? { AGENT_HOME: input.instructions.instructionCopy.executionRoot } : {}),
                 ...(nativeMcpServer
                   ? {

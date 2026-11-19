@@ -1,3 +1,8 @@
+import { reviewerActorRestricted } from "../reviewer-role.js";
+import { resolveNativeWorkspacePolicyForClaimedStop } from "../native-runtime/workspace-policy-admission.js";
+import { parseReviewerWorkspaceAdmission, reviewerAdmissionInstruction } from "../native-runtime/reviewer-workspace-admission.js";
+import { assertReferenceFoldersNativeTarget, prepareAgentReferenceFolderAdmission, type PreparedReferenceFolderAccess } from "../agent-reference-folder-admission.js";
+import { prepareNativeReviewerWorkspaceAdmission } from "../native-runtime/reviewer-workspace-admission.js";
 import { assertPaperclipRunnerBinaryConfiguration } from "../native-runtime/native-codex-runner.js";
 import { readNativeWorkspaceMigration, migratedNativeExecutionCwd } from "../native-runtime/native-workspace-migration.js";
 import { resolveProviderApiPlacement } from "../native-runtime/provider-api-placement.js";
@@ -159,6 +164,8 @@ export interface HeartbeatRuntimeSelectionInput {
 export type HeartbeatRuntimeSelectionResult = { selected: false } | {
   selected: true;
   nativeExecution: NativeExecutionInput | null;
+  referenceFolderAccess: PreparedReferenceFolderAccess | null;
+  reviewerWorkspaceAccess: Awaited<ReturnType<typeof prepareNativeReviewerWorkspaceAdmission>>;
   nativeRunnerInstanceId: string | null;
   getNativeFreshSessionHandoff: (() => Promise<string | null>) | undefined;
   nativeWorkspaceSync: Awaited<ReturnType<typeof prepareNativeWorkspaceSync>>;
@@ -301,8 +308,20 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
   const { runtimeConfig, runtimeSkillEntries, runScopedMentionedSkillKeys, instructionCopy, agentIdentity, issueAssigneeOverrides, resolvedConfig, managedAiRuntime } = input.config;
   const runOptions = input.recovery;
   const { providerTraceRequested, providerTraceCapture } = input.trace;
+  if (nativeRuntimeResolution.kind !== "native" && await reviewerActorRestricted(db, { companyId: agent.companyId, agentId: agent.id, runId: run.id })) {
+    throw new ConfigurationIncompleteFailure("Protected Reviewer requires the qualified isolated local native runner.", { reason: "reviewer_native_target_unavailable" });
+  }
+  try {
+    await assertReferenceFoldersNativeTarget(db, { companyId: agent.companyId, agentId: agent.id,
+      projectId: issueContext?.projectId ?? null, native: nativeRuntimeResolution.kind === "native" });
+  } catch (error) {
+    if (!(error instanceof Error) || error.message !== "reference_folders_require_qualified_native_runner") throw error;
+    throw new ConfigurationIncompleteFailure("Saved reference folders require the qualified native runner.", { reason: "reference_folder_native_target_unavailable" });
+  }
   if (!isDotRun) assertEphemeralNativeRuntime(nativeRuntimeResolution.kind === "native");
   let nativeExecution: NativeExecutionInput | null = null;
+  let referenceFolderAccess: PreparedReferenceFolderAccess | null = null;
+  let reviewerWorkspaceAccess: Awaited<ReturnType<typeof prepareNativeReviewerWorkspaceAdmission>> = null;
   let getNativeFreshSessionHandoff: (() => Promise<string | null>) | undefined;
   let nativeRunnerInstanceId: string | null = null;
   let nativeWorkspaceSync: Awaited<ReturnType<typeof prepareNativeWorkspaceSync>> = null;
@@ -549,6 +568,40 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
     ) {
       throw new Error("runner_warm_environment_requires_reusable_lease");
     }
+    let claimedPolicyStop = false;
+    if (persistedNativeExecutionInput && runOptions.nativeRestartRecovery?.kind === "reattach_remote_runner"
+      && runOptions.nativeRestartRecovery.runId === run.id && runOptions.nativeRestartRecovery.leaseOwner === runOptions.nativeLeaseOwner) {
+      // Stop may arrive after this preparation's run snapshot. The existing
+      // native final admission gate also reads the locked current row; do not
+      // let an old in-memory resultJson preempt its exact owned cleanup path.
+      const [currentStopRun] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, run.id),
+        eq(heartbeatRuns.companyId, agent.companyId), eq(heartbeatRuns.agentId, agent.id)));
+      claimedPolicyStop = !!currentStopRun && await readClaimedNativeStopRecovery(db, currentStopRun, runOptions.nativeLeaseOwner);
+    }
+    if (claimedPolicyStop) {
+      const access = await resolveNativeWorkspacePolicyForClaimedStop(db, persistedNativeExecutionInput!, runOptions.nativeLeaseOwner!);
+      if (access?.policy.readOnlyWorkspace) {
+        const record = parseReviewerWorkspaceAdmission(persistedRunnerProfile.reviewerPolicy);
+        reviewerWorkspaceAccess = { record, workspaceAccess: access, instructionFile: reviewerAdmissionInstruction(record),
+          tmpdir: access.policy.scratchDirectory!, requiresPolicyCompatibleProcess: true };
+      } else if (access) {
+        referenceFolderAccess = { record: null, workspaceAccess: access, prompt: null };
+      }
+    } else {
+      const preparedReferences = await prepareAgentReferenceFolderAdmission(db, {
+        agent, runId: run.id, issueId: issueRef.id, projectId: issueContext?.projectId ?? null,
+        workspaceId: nativeExecutionWorkspaceId, workspaceDirectory: executionWorkspace.cwd,
+        executionDriver: executionTarget?.kind === "remote" ? "remote" : "local",
+      });
+      if ("stopped" in preparedReferences) return { selected: false };
+      referenceFolderAccess = preparedReferences;
+      reviewerWorkspaceAccess = await prepareNativeReviewerWorkspaceAdmission(db, {
+        companyId: agent.companyId, agentId: agent.id, runId: run.id, issueId: issueRef.id,
+        workspaceId: nativeExecutionWorkspaceId, workspaceDirectory: executionWorkspace.cwd,
+        executionDriver: executionTarget?.kind === "remote" ? "remote" : "local",
+      });
+      if (reviewerWorkspaceAccess && instructionCopy) throw new Error("reviewer_mutable_instruction_copy_unqualified");
+    }
     const persistedProfile = persistedRunnerProfile;
     if (persistedNativeExecutionInput) {
       nativeExecution = persistedNativeExecutionInput;
@@ -739,6 +792,8 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         runId: run.id,
         runtimeConfig,
         runtimeSkillEntries,
+        referenceFolderInstruction: referenceFolderAccess?.instructionFile,
+        reviewerInstruction: reviewerWorkspaceAccess?.instructionFile,
         instructionWorkingCopy: instructionCopy ? { rootPath: instructionCopy.executionRoot, entryPath: instructionCopy.entryFile, ...(isAgentDirectoryCopy(instructionCopy) ? { kind: "agent_files" as const } : {}) } : undefined,
       }));
       getNativeFreshSessionHandoff = nativeReviewRequest ? undefined : getFreshSessionHandoff;
@@ -796,8 +851,10 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
                   }),
                 ) ??
                 `# ${issueRef.identifier ?? issueRef.id}: ${issueRef.title}`,
+                referenceFolderAccess?.prompt,
+                reviewerWorkspaceAccess ? "## Reviewer workspace\nCandidate files and Git metadata are read-only. Use $TMPDIR for temporary output. PR discussion is available only through the assigned-PR tools; report unavailable operations." : null,
                 !["openai_dot_mcp", "grok_bot_mcp", "muse_external", "cursor_cloud_api"].includes(nativeRuntimeResolution.profile.backend) && projectRepositoryPaths.length > 0
-                  ? `## Project repositories\nThe task workspace also contains these editable Git repositories:\n${projectRepositoryPaths.map((repo) => `- ${repo}`).join("\n")}`
+                  ? `## Project repositories\nThe task workspace also contains these ${reviewerWorkspaceAccess ? "read-only" : "editable"} Git repositories:\n${projectRepositoryPaths.map((repo) => `- ${repo}`).join("\n")}`
                   : null,
               ].filter(Boolean).join("\n\n"),
               initialCommunicationGuidance: nativeReviewRequest ? null : readNonEmptyString(context.paperclipTaskCommunicationGuidance),
@@ -1142,5 +1199,5 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
       })
       .where(eq(heartbeatRuns.id, run.id)));
   }
-  return { selected: true, nativeExecution, nativeRunnerInstanceId, getNativeFreshSessionHandoff, nativeWorkspaceSync };
+  return { selected: true, nativeExecution, nativeRunnerInstanceId, getNativeFreshSessionHandoff, nativeWorkspaceSync, referenceFolderAccess, reviewerWorkspaceAccess };
 }

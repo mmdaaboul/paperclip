@@ -1,3 +1,4 @@
+import { reviewerExecutionRestrictsCredentials } from "./reviewer-role.js";
 import { isDeepStrictEqual } from "node:util";
 import { and, eq } from "drizzle-orm";
 import { isUuidLike } from "@paperclipai/shared";
@@ -34,6 +35,9 @@ async function allowsGitHubCredentialExport(
   db: Db,
   run: typeof heartbeatRuns.$inferSelect,
 ) {
+  if (await reviewerExecutionRestrictsCredentials(db, { companyId: run.companyId,
+    agentId: run.agentId, runnerProfileJson: run.runnerProfileJson })) return false;
+
   const issueId =
     run.contextSnapshot?.issueId ??
     run.contextSnapshot?.taskId ??

@@ -1,3 +1,4 @@
+import { reviewerActorRestricted } from "../reviewer-role.js";
 import { createHash } from "node:crypto";
 import path from "node:path";
 import { and, eq, sql } from "drizzle-orm";
@@ -130,6 +131,12 @@ export function createHeartbeatInstructionWorkingCopy(input: InstructionWorkingC
     hasInstructionFilesystem: boolean;
     nativeLifecyclePolicy: NativeLifecyclePolicy | null;
   }) {
+    // Protected review runs use immutable native instructions; no writable
+    // copy is created, adopted or collected on their behalf.
+    if (await reviewerActorRestricted(db, { companyId: agent.companyId, agentId: agent.id, runId: readRun().id })) {
+      if (nativeRuntimeResolution.kind !== "native" || instructionCopy) throw new Error("reviewer_instruction_copy_target_unqualified");
+      return runtimeConfig;
+    }
     if (hasInstructionFilesystem && !task) {
       try {
         // Missing contract fields on a restored session mean the deployed

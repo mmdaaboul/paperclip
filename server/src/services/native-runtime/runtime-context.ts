@@ -163,12 +163,23 @@ export async function materializeAsset(files: AssetFile[]): Promise<NativeRuntim
   });
 }
 
-async function materializeInstructionBundle(db: Db, agent: RuntimeAgent, agentFiles = false) {
+async function materializeInstructionBundle(db: Db, agent: RuntimeAgent, agentFiles = false,
+  referenceFolderInstruction?: { path: string; content: string }, reviewerInstruction?: { path: string; content: string }) {
+  const withAdmissionContext = (files: AssetFile[]) => {
+    const result = [...files];
+    for (const instruction of [referenceFolderInstruction, reviewerInstruction]) {
+      if (!instruction) continue;
+      const path = safeRelativePath(instruction.path, "server admission context path");
+      if (result.some(file => file.path === path)) throw new Error("Server admission context conflicts with an existing instruction file");
+      result.push({ path, content: Buffer.from(instruction.content, "utf8"), mode: 0o444 });
+    }
+    return result;
+  };
   if (agentFiles) {
     const current = await agentInstructionRevisionService(db).readCommittedForRuntime({ companyId: agent.companyId, agentId: agent.id });
     if (!current) throw new Error("Configured instruction entry is missing");
     const entryPath = safeRelativePath(current.revision.entryFile, "instruction entry path");
-    return { entryPath, bundle: await materializeAsset([{ path: entryPath, content: Buffer.from(current.content, "utf8"), mode: 0o444 }]) };
+    return { entryPath, bundle: await materializeAsset(withAdmissionContext([{ path: entryPath, content: Buffer.from(current.content, "utf8"), mode: 0o444 }])) };
   }
   const exported = await agentInstructionsService(db).exportFiles(agent, { rejectSymlinks: true });
   if (agentInstructionsBundleMode(agent) === "managed") {
@@ -184,7 +195,7 @@ async function materializeInstructionBundle(db: Db, agent: RuntimeAgent, agentFi
   const entryPath = safeRelativePath(exported.entryFile, "instruction entry path");
   if (!(entryPath in exported.files)) throw new Error(`configured instruction entry is missing: ${entryPath}`);
   const files = Object.entries(exported.files).map(([relativePath, content]) => ({ path: safeRelativePath(relativePath, "instruction path"), content: Buffer.from(content, "utf8"), mode: 0o444 }));
-  return { entryPath, bundle: await materializeAsset(files) };
+  return { entryPath, bundle: await materializeAsset(withAdmissionContext(files)) };
 }
 
 async function materializeSkillAsset(source: string) {
@@ -318,13 +329,13 @@ export async function resolveNativeRuntimeMcpSnapshot(input: { db: Db; agent: Pi
   return { assignmentSetId: `sha256:${assignmentDigest}`, digest: assignmentDigest, bindingId: assignment.connections.length ? `native-mcp:${input.runId}` : null };
 }
 
-export async function buildNativeRuntimeContext(input: { db: Db; agent: RuntimeAgent; runId: string; runtimeConfig: Record<string, unknown>; runtimeSkillEntries: PaperclipSkillEntry[]; instructionWorkingCopy?: { rootPath: string; entryPath: string; kind?: "agent_files" } }): Promise<NativeRuntimeContextSnapshot> {
+export async function buildNativeRuntimeContext(input: { db: Db; agent: RuntimeAgent; runId: string; runtimeConfig: Record<string, unknown>; runtimeSkillEntries: PaperclipSkillEntry[]; instructionWorkingCopy?: { rootPath: string; entryPath: string; kind?: "agent_files" }; referenceFolderInstruction?: { path: string; content: string }; reviewerInstruction?: { path: string; content: string } }): Promise<NativeRuntimeContextSnapshot> {
   const preconfigured = input.runtimeConfig.homeMode === "preconfigured";
-  const emptyMcpDigest = sha256("preconfigured");
+  const emptyMcpDigest = sha256(input.reviewerInstruction ? "protected-reviewer" : "preconfigured");
   const [instructions, skills, mcp] = await Promise.all([
-    measureRunPhase("runtime_context.instructions", () => materializeInstructionBundle(input.db, input.agent, input.instructionWorkingCopy?.kind === "agent_files")),
+    measureRunPhase("runtime_context.instructions", () => materializeInstructionBundle(input.db, input.agent, input.instructionWorkingCopy?.kind === "agent_files", input.referenceFolderInstruction, input.reviewerInstruction)),
     measureRunPhase("runtime_context.skills", () => preconfigured ? [] : materializeSelectedSkills(input.runtimeConfig, input.runtimeSkillEntries, input.agent.adapterType === "paperclip_runner")),
-    measureRunPhase("runtime_context.mcp", () => preconfigured ? { assignmentSetId: `sha256:${emptyMcpDigest}`, digest: emptyMcpDigest, bindingId: null } : resolveNativeRuntimeMcpSnapshot({ db: input.db, agent: input.agent, runId: input.runId })),
+    measureRunPhase("runtime_context.mcp", () => preconfigured || input.reviewerInstruction ? { assignmentSetId: `sha256:${emptyMcpDigest}`, digest: emptyMcpDigest, bindingId: null } : resolveNativeRuntimeMcpSnapshot({ db: input.db, agent: input.agent, runId: input.runId })),
   ]);
   const snapshot = {
     prompt: { revision: PAPERCLIP_EXECUTION_PROMPT_REVISION, text: PAPERCLIP_EXECUTION_PROMPT, digest: nativeRuntimePromptDigest() },

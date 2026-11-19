@@ -93,7 +93,7 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     const input: HeartbeatRuntimeExecutionInput = {
       run, agent, options: {},
       task: { issueRef: issue, issueContext: null, context: {}, issueId: issue.id, taskKey: issue.id, executionContinuation: null },
-      runtime: { nativeExecution, nativeRunnerInstanceId: native ? randomUUID() : null, getNativeFreshSessionHandoff: undefined,
+      runtime: { nativeExecution, referenceFolderAccess: null, reviewerWorkspaceAccess: null, nativeRunnerInstanceId: native ? randomUUID() : null, getNativeFreshSessionHandoff: undefined,
         nativeRuntimeResolution: resolveHeartbeatNativeRuntimeMode({ persisted: run, enabled: native, grokEnabled: true, dotEnabled: true, runtimeConfig: {}, adapterConfig: agent.adapterConfig, agent, issue, target: null, workspaceId: null }),
         adapter, runtimeForAdapter: { taskKey: issue.id, sessionId: null, sessionParams: null, sessionDisplayId: null }, getFreshSessionHandoff: undefined, runOptions: {},
       },

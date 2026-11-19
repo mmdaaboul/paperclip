@@ -1,3 +1,5 @@
+import type { WorkspaceAccessPolicy } from "../../contracts/workspace-access.js";
+import { resolveCodexWorkspaceAccessPolicy, codexWorkspaceAccessRules, codexWorkspaceTemporaryDirectory } from "./workspace-access-policy.js";
 import { usesPreconfiguredHome } from "../preconfigured-home.js";
 import { configuredEnvironmentKeys } from "../../configured-environment.js";
 import { resolve, isAbsolute, join, dirname, delimiter, relative, sep } from "node:path";
@@ -260,6 +262,7 @@ export function createIsolatedCodexAppServerArgs(
   instructionWorkingCopyRoot?: string,
   protectedPaths: string[] = [],
   disableWebSearch = false,
+  workspaceAccess?: WorkspaceAccessPolicy,
 ): string[] {
   const explicitSource = source;
   source ??= process.env;
@@ -267,7 +270,22 @@ export function createIsolatedCodexAppServerArgs(
   readOnlyRoots = [...new Set([...readOnlyRoots, ...codexNetworkReadOnlyRoots(source)])];
   const networkAccess = codexNetworkAccess(source);
   const externalRunnerSandbox = usesExternalRunnerSandbox(source);
-  const inheritedGitHubKeys = [
+  if (workspaceAccess && (externalRunnerSandbox || usesPreconfiguredHome(source))) {
+    throw new Error("workspace_access_requires_isolated_local_codex");
+  }
+  const scopedAccess = workspaceAccess ? resolveCodexWorkspaceAccessPolicy(workspaceAccess,
+    [...protectedPaths, ...(instructionWorkingCopyRoot ? [instructionWorkingCopyRoot] : []),
+      ...[source.HOME, source.CODEX_HOME, source.GH_CONFIG_DIR, source.PAPERCLIP_GITHUB_LAUNCHER_DIR, source.PAPERCLIP_GITHUB_HOST_HOME]
+        .filter((value): value is string => typeof value === "string" && value.length > 0)]) : undefined;
+  const reviewerReadOnly = scopedAccess?.readOnlyWorkspace === true;
+  const readOnlyPath = (path: string) => reviewerReadOnly || scopedAccess?.referenceDirectories.some(root =>
+    resolve(path) === root || resolve(path).startsWith(`${root}/`)) === true;
+
+  if (reviewerReadOnly && source.PAPERCLIP_GITHUB_AUTH_MODE === "host") {
+    throw new Error("reviewer_host_github_credentials_forbidden");
+  }
+  const scopedTemp = scopedAccess ? codexWorkspaceTemporaryDirectory(scopedAccess, source.TMPDIR) : undefined;
+  const inheritedGitHubKeys = reviewerReadOnly ? [] : [
     ...githubCredentialEnvironmentKeys(source),
     ...configuredEnvironmentKeys(explicitSource),
     ...["PAPERCLIP_AGENT_KEY_ID", "PAPERCLIP_AGENT_PUBLIC_KEY", "PAPERCLIP_AGENT_PRIVATE_KEY"].filter(key => source[key] !== undefined),
@@ -276,8 +294,14 @@ export function createIsolatedCodexAppServerArgs(
   // Codex filters the configured `set` values through include_only as well.
   // Retain the explicit command PATH/HOME/locale settings, not ambient secrets.
   const commandEnvironment = codexCommandEnvironment(source);
+  if (reviewerReadOnly) {
+    delete commandEnvironment.HOME;
+    delete commandEnvironment.ZDOTDIR;
+    delete commandEnvironment.BASH_ENV;
+  }
   // Selected task values are inherited, never serialized into configuration argv.
   for (const key of configuredEnvironmentKeys(explicitSource)) delete commandEnvironment[key];
+  if (scopedTemp) commandEnvironment.TMPDIR = scopedTemp;
   if (instructionWorkingCopyRoot && source.AGENT_HOME === instructionWorkingCopyRoot) commandEnvironment.AGENT_HOME = instructionWorkingCopyRoot;
   const shellEnvironmentKeys = [...new Set([...inheritedGitHubKeys, ...Object.keys(commandEnvironment)])].sort();
   if (source.PAPERCLIP_GITHUB_LAUNCHER_DIR) readOnlyRoots = [...readOnlyRoots, source.PAPERCLIP_GITHUB_LAUNCHER_DIR];
@@ -304,18 +328,19 @@ export function createIsolatedCodexAppServerArgs(
   const filesystemRules = [
     `":root"="none"`,
     `":minimal"="read"`,
-    `":tmpdir"="none"`,
+    `":tmpdir"=${tomlString(scopedTemp ? "write" : "none")}`,
     ...deniedHostRoots.map((path) => `${tomlString(path)}="none"`),
     ...protectedPaths.map((path) => `${tomlString(resolve(path))}="none"`),
     ...(usesPreconfiguredHome(source) && source.HOME ? [`${tomlString(source.HOME)}="write"`] : []),
     ...readOnlyRoots.map((path) => `${tomlString(resolve(path))}="read"`),
     ...generatedImageRoots.map((path) => `${tomlString(path)}="read"`),
     ...gitRoots.read.map((path) => `${tomlString(path)}="read"`),
-    ...gitRoots.write.map((path) => `${tomlString(path)}="write"`),
-    ...(instructionWorkingCopyRoot ? [`${tomlString(resolve(instructionWorkingCopyRoot))}="write"`] : []),
+    ...gitRoots.write.map((path) => `${tomlString(path)}=${tomlString(readOnlyPath(path) ? "read" : "write")}`),
+    ...(instructionWorkingCopyRoot ? [`${tomlString(resolve(instructionWorkingCopyRoot))}=${tomlString(reviewerReadOnly ? "read" : "write")}`] : []),
     ...(source.PAPERCLIP_GITHUB_BROKER_TOKEN && source.GH_CONFIG_DIR
-      ? [`${tomlString(resolve(source.GH_CONFIG_DIR))}="write"`] : []),
-    `":workspace_roots"={"."="write"}`,
+      ? [`${tomlString(resolve(source.GH_CONFIG_DIR))}=${tomlString(reviewerReadOnly ? "read" : "write")}`] : []),
+    `":workspace_roots"={"."=${tomlString(reviewerReadOnly ? "read" : "write")}}`,
+    ...(scopedAccess ? codexWorkspaceAccessRules(scopedAccess, false) : []),
   ].join(",");
   const planningFilesystemRules = [
     `":root"="none"`,
@@ -329,8 +354,9 @@ export function createIsolatedCodexAppServerArgs(
     ...[...gitRoots.read, ...gitRoots.write].map((path) => `${tomlString(path)}="read"`),
     ...(instructionWorkingCopyRoot ? [`${tomlString(resolve(instructionWorkingCopyRoot))}="read"`] : []),
     ...(source.PAPERCLIP_GITHUB_BROKER_TOKEN && source.GH_CONFIG_DIR
-      ? [`${tomlString(resolve(source.GH_CONFIG_DIR))}="write"`] : []),
+      ? [`${tomlString(resolve(source.GH_CONFIG_DIR))}=${tomlString(reviewerReadOnly ? "read" : "write")}`] : []),
     `":workspace_roots"={"."="read"}`,
+    ...(scopedAccess ? codexWorkspaceAccessRules(scopedAccess, true) : []),
   ].join(",");
   const commandEnv = Object.entries(commandEnvironment)
     .map(([key, value]) => `${key}=${tomlString(value)}`)

@@ -1,3 +1,6 @@
+export { inspectReadonlyReviewerCandidate } from "./drivers/codex/reviewer-candidate-inspection.js";
+export * from "./contracts/workspace-access.js";
+export { validateCodexReferenceDirectory, resolveCodexWorkspaceAccessPolicy } from "./drivers/codex/workspace-access-policy.js";
 export * from "./configured-environment.js";
 export * from "./catalog/index.js";
 export { taskDocumentKeySchema } from "./protocol-actions/task-document-key-schema.js";
@@ -136,3 +139,5 @@ export { archiveCursorCloudSessionCheckpoint } from "./drivers/cursor-cloud/chec
 
 export { readProviderFailure, type ProviderFailure } from "./contracts/provider-failure.generated.js";
 export { providerFailureFromError } from "./drivers/provider-failure.js";
+
+export { providerDrainStateFromSnapshot } from "./live/runnerd-codex-transport.js";

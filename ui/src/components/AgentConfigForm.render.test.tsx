@@ -24,6 +24,12 @@ import { DEFAULT_CODEX_LOCAL_MODEL } from "@paperclipai/adapter-codex-local";
 import { ConfigurationTab } from "../pages/AgentDetail";
 import { ConfigurationTab as ClassicConfigurationTab } from "../pages/AgentDetail.production";
 
+const optionalPolicyApi = vi.hoisted(() => ({
+  references: vi.fn(), saveReferences: vi.fn(), reviewer: vi.fn(), saveReviewer: vi.fn(), projects: vi.fn(async()=>[]),
+}));
+vi.mock("../api/agent-reference-folders", async original=>({...await original<object>(),agentReferenceFoldersApi:{get:optionalPolicyApi.references,update:optionalPolicyApi.saveReferences}}));
+vi.mock("../api/agent-reviewer-policy", async original=>({...await original<object>(),agentReviewerPolicyApi:{get:optionalPolicyApi.reviewer,update:optionalPolicyApi.saveReviewer,resolveRepository:vi.fn()}}));
+vi.mock("../api/projects",()=>({projectsApi:{list:optionalPolicyApi.projects}}));
 const mockAgentsApi = vi.hoisted(() => ({
   get: vi.fn(),
   adapterModels: vi.fn(),
@@ -1109,6 +1115,9 @@ describe("AgentConfigForm environment selector", () => {
   });
 
   beforeEach(() => {
+    optionalPolicyApi.references.mockResolvedValue({revision:0,entries:[],updatedAt:null,activeRuns:[],supported:true,canGrantHostPaths:true});
+    optionalPolicyApi.reviewer.mockResolvedValue({revision:0,enabled:false,scopes:[],updatedAt:null,supported:true,activeRunCount:0});
+
     mockEnvironmentsApi.probe.mockReset();
     mockAgentsApi.qualifyRunner.mockReset();
     mockAdaptersApi.list.mockReset().mockResolvedValue([{ type: "codex_local", supportedRunners: ["legacy", "paperclip"], defaultRunner: "legacy" }]);
@@ -1201,6 +1210,35 @@ describe("AgentConfigForm environment selector", () => {
     vi.clearAllMocks();
   });
 
+
+  it("optional reference save preserves the actual parent form draft and footer actions",async()=>{
+    const entry={projectId:"a3333333-3333-4333-8333-333333333333",path:"/reference/saved"};
+    optionalPolicyApi.references.mockResolvedValue({revision:1,entries:[entry],updatedAt:null,activeRuns:[],supported:true,canGrantHostPaths:true});
+    optionalPolicyApi.saveReferences.mockResolvedValue({revision:2,entries:[],updatedAt:null});
+    let parentSave:(()=>void)|null=null;const dirty=vi.fn();
+    const result=await renderForm([],{}, {onDirtyChange:dirty,onSaveActionChange:save=>{parentSave=save;}});roots.push(result.root);
+    await flushUntil(()=>!!result.container.querySelector('[aria-label="Remove reference folder 1"]'));
+    const name=result.container.querySelector<HTMLInputElement>('input[placeholder="Agent name"]')!;
+    await act(async()=>setInputValue(name,"Keep unsaved parent name"));await flushReact();
+    await clickElement(result.container.querySelector('[aria-label="Remove reference folder 1"]'));
+    await clickByText(result.container,"Save reference folders");await flushUntil(()=>optionalPolicyApi.saveReferences.mock.calls.length>0);
+    expect(optionalPolicyApi.saveReferences).toHaveBeenCalledWith("agent-1","company-1",{expectedRevision:1,entries:[]});
+    expect(name.value).toBe("Keep unsaved parent name");expect(result.onSave).not.toHaveBeenCalled();expect(dirty).toHaveBeenLastCalledWith(true);expect(parentSave).not.toBeNull();
+  });
+  it("optional Reviewer revocation preserves the actual parent draft",async()=>{
+    optionalPolicyApi.reviewer.mockResolvedValue({revision:1,enabled:true,scopes:[],hiddenScopeCount:1,updatedAt:null,supported:true,activeRunCount:0});
+    optionalPolicyApi.saveReviewer.mockResolvedValue({revision:2,enabled:false,scopes:[],updatedAt:null});
+    const result=await renderForm([]);roots.push(result.root);await flushUntil(()=>!!findButton(result.container,"Disable Reviewer and clear all scopes"));
+    const name=result.container.querySelector<HTMLInputElement>('input[placeholder="Agent name"]')!;
+    await act(async()=>setInputValue(name,"Other unsaved name"));await flushReact();
+    await clickByText(result.container,"Disable Reviewer and clear all scopes");await flushUntil(()=>optionalPolicyApi.saveReviewer.mock.calls.length>0);
+    expect(optionalPolicyApi.saveReviewer).toHaveBeenCalledWith("agent-1","company-1",{expectedRevision:1,enabled:false,scopes:[]});expect(name.value).toBe("Other unsaved name");expect(result.onSave).not.toHaveBeenCalled();
+  });
+  it("optional policy cards are absent on create and Secrets",async()=>{
+    const created=await renderCreateForm([]),secrets=await renderForm([],{}, {content:"secrets"});roots.push(created.root,secrets.root);
+    for(const result of [created,secrets]){expect(result.container.querySelector('[data-config-section="reviewer-policy"]')).toBeNull();expect(result.container.querySelector('[data-config-section="reference-folders"]')).toBeNull();}
+    expect(optionalPolicyApi.saveReviewer).not.toHaveBeenCalled();expect(optionalPolicyApi.saveReferences).not.toHaveBeenCalled();
+  });
   it.each([false, true])("uses Grok connection verification without native controls (compact: %s)", async compactTestFeedback => {
     const result = await renderForm([], {
       adapterType: "paperclip_runner",

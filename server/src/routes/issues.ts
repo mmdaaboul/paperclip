@@ -1,3 +1,4 @@
+import { reviewerActorRestricted } from "../services/reviewer-role.js";
 import { listStalledDependencies } from "../services/recovery/blocker-stall-wakeups.js";
 import { confirmMcpAttachmentCleanup, recordMcpAttachmentCleanup, type McpAttachmentCleanup } from "../services/public-mcp/upload-cleanup.js";
 import { notifyDeferredExecutionWork } from "../services/deferred-execution-notifications.js";
@@ -346,6 +347,7 @@ import {
 } from "../services/issue-hierarchy.js";
 import {
   authorizationDeniedDetails,
+  authorizationService,
   issueReadSqlCondition,
   projectReadSqlCondition,
 } from "../services/authorization.js";
@@ -6082,6 +6084,7 @@ export function issueRoutes(
     req: Request,
     res: Response,
     issue: Parameters<typeof assertAgentIssueMutationAllowed>[2],
+    interactionId?: string,
   ) {
     if (req.actor.type !== "agent") return true;
     if (await actorIsLowTrustReview(req, issue.companyId, issue)) {
@@ -6093,6 +6096,16 @@ export function issueRoutes(
       });
     }
 
+    const restrictedReviewer = !!req.actor.agentId && await reviewerActorRestricted(db, {
+      companyId: issue.companyId, agentId: req.actor.agentId, runId: req.actor.runId,
+    });
+    if (restrictedReviewer) {
+      const decision = await authorizationService(db).decide({ actor: req.actor, action: "issue:resolve_assigned_review",
+        resource: { type: "issue", companyId: issue.companyId, issueId: issue.id, interactionId } });
+      if (!decision.allowed) return denyIssueThreadInteractionResolution(res, {
+        status: 403, code: "interaction_scope_denied", message: decision.explanation,
+      });
+    }
     const watchdogScope = await resolveTaskWatchdogMutationScope(db, req.actor);
     if (watchdogScope.kind === "invalid") {
       return denyIssueThreadInteractionResolution(res, {
@@ -6126,6 +6139,8 @@ export function issueRoutes(
       }
       return true;
     }
+
+    if (restrictedReviewer) return true; // Native low-trust/watchdog gates above remain authoritative.
 
     const boundaryDecision = await decideIssueAccess(
       req,
@@ -6250,7 +6265,7 @@ export function issueRoutes(
     const runId = await assertAgentInteractionRunAttribution(req, res, issue);
     if (runId === false) return false;
     if (
-      !(await assertIssueThreadInteractionContainmentAllowed(req, res, issue))
+      !(await assertIssueThreadInteractionContainmentAllowed(req, res, issue, interactionId))
     )
       return false;
     if (req.actor.type !== "agent") assertBoard(req);

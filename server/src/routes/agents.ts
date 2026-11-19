@@ -1,3 +1,7 @@
+import { registerAgentReferenceFolderRoutes } from "./agent-reference-folders.js";
+import { registerAgentReviewerPolicyRoutes } from "./agent-reviewer-policies.js";
+import { resolveReviewerRepositoryScope } from "../services/reviewer-repository-scope.js";
+import { assertReviewerAgentSupported } from "../services/reviewer-agent-qualification.js";
 import { assertProviderApiPlacementPolicy, managedCursorApiDefaultEnabled, resolveProviderApiPlacement } from "../services/native-runtime/provider-api-placement.js";
 import { isObjectJournalBusyError } from "../services/object-byte-journal.js";
 import { readTaskPanelActivations } from "../services/plugin-task-panels.js";
@@ -7961,6 +7965,41 @@ export function agentRoutes(
       adapterType: agent.adapterType,
       outputSilence: await heartbeat.buildRunOutputSilence({ ...run, companyId: issue.companyId }),
     });
+  });
+
+  registerAgentReviewerPolicyRoutes(router, {
+    db,
+    resolveAgent: async (req, res) => {
+      const accessible = await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found");
+      if (!accessible) return null;
+      const [row] = await db.select().from(agentsTable).where(and(eq(agentsTable.id, accessible.id), eq(agentsTable.companyId, accessible.companyId)));
+      return row ?? null;
+    },
+    assertCanConfigure: assertCanUpdateAgent,
+    assertProjectReadable: async (req, companyId, projectId, executor = db) => {
+      const decision = await accessService(executor).decide({ actor: req.actor, action: "project:read", resource: { type: "project", companyId, projectId } });
+      if (!decision.allowed) throw notFound("Project not found");
+    },
+    assertSupportedAgent: (_req, agent) => assertReviewerAgentSupported(db, agent),
+    assertRepositoryAccessible: async (req, companyId, selected) => {
+      const resolved = await resolveReviewerRepositoryScope(db, { actor: req.actor, companyId,
+        agentId: req.params.id as string, selection: { projectId: selected.projectId, repository: selected.repository } });
+      if (resolved.repositoryId !== selected.repositoryId) throw conflict("The repository identity changed; verify it again before saving");
+    },
+    resolveRepository: (req, agent, selection) => resolveReviewerRepositoryScope(db, {
+      actor: req.actor, companyId: agent.companyId, agentId: agent.id, selection,
+    }),
+  });
+
+  registerAgentReferenceFolderRoutes(router, {
+    db,
+    resolveAgent: async (req, res) => (await getAccessibleResource(req, res, svc.getById(req.params.id as string), "Agent not found")) ?? null,
+    assertCanConfigure: assertCanUpdateAgent,
+    assertProjectReadable: async (req, companyId, projectId, executor = db) => {
+      const decision = await accessService(executor).decide({ actor: req.actor, action: "project:read", resource: { type: "project", companyId, projectId } });
+      if (!decision.allowed) throw notFound("Project not found");
+    },
+    canReadRun: actorCanReadRun,
   });
 
   return router;

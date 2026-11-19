@@ -105,6 +105,23 @@ afterEach(async () => {
 });
 
 describe("buildNativeRuntimeContext", () => {
+  it("adds server reference admission to the native immutable digest without replacing instructions",async()=>{
+    serviceMocks.exportFiles.mockResolvedValue({entryFile:"AGENTS.md",files:{"AGENTS.md":"Saved native instructions\n"}});
+    const input={db:{} as Db,agent:{id:"agent-1",companyId:"company-1",name:"Builder",adapterConfig:{}},runId:"run-1",runtimeConfig:{},runtimeSkillEntries:[]};
+    const plain=await buildNativeRuntimeContext(input),scoped=await buildNativeRuntimeContext({...input,referenceFolderInstruction:{path:".paperclip/reference-folders.json",content:'{"paths":["/reference"]}'}});
+    expect(scoped.aggregateDigest).not.toBe(plain.aggregateDigest);expect(await readFile(path.join(scoped.instructions.bundle.rootPath,"AGENTS.md"),"utf8")).toBe("Saved native instructions\n");
+    expect(await readFile(path.join(scoped.instructions.bundle.rootPath,".paperclip/reference-folders.json"),"utf8")).toContain("/reference");
+  });
+  it("protected context never mints the generic native MCP assignment",async()=>{
+    serviceMocks.exportFiles.mockResolvedValue({entryFile:"AGENTS.md",files:{"AGENTS.md":"Native Reviewer"}});
+    const context=await buildNativeRuntimeContext({db:{} as Db,agent:{id:"agent-1",companyId:"company-1",name:"Reviewer",adapterConfig:{}},runId:"run-1",runtimeConfig:{},runtimeSkillEntries:[],reviewerInstruction:{path:".paperclip/reviewer-admission.json",content:"server-owned fixture"}});
+    expect(context.mcp.bindingId).toBeNull();expect(serviceMocks.getEffectiveToolAssignmentsForAgent).not.toHaveBeenCalled();expect(serviceMocks.githubBotConnectionIdsForRun).not.toHaveBeenCalled();
+  });
+  it("refuses an instruction collision without overwriting a saved file",async()=>{
+    serviceMocks.exportFiles.mockResolvedValue({entryFile:"AGENTS.md",files:{"AGENTS.md":"Native canonical content"}});
+    await expect(buildNativeRuntimeContext({db:{} as Db,agent:{id:"agent-1",companyId:"company-1",name:"Reviewer",adapterConfig:{}},runId:"run-1",runtimeConfig:{},runtimeSkillEntries:[],reviewerInstruction:{path:"AGENTS.md",content:"override"}})).rejects.toThrow("conflicts with an existing instruction file");
+  });
+
   it("uses committed instructions when the disk projection is stale", async () => {
     serviceMocks.exportFiles.mockResolvedValue({
       entryFile: "AGENTS.md",

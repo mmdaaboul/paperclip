@@ -1,3 +1,5 @@
+import { assertReviewerNativeToolBoundary } from "./reviewer-native-tool-boundary.js";
+import type { ReviewerGitHubToolAdapter } from "./reviewer-github-tools.js";
 import { budgetServiceInTransaction } from "../budgets.js";
 import { resolveTaskWatchdogMutationScope, taskWatchdogScopeAllowsIssueMutation } from "../task-watchdog-scope.js";
 import { resolveNewTaskParent } from "../issue-hierarchy.js";
@@ -193,6 +195,9 @@ type NativeDocumentContent = { id: string | null; documentId: string; body: stri
 const UNKNOWN_DOCUMENT_REVISION_BODY = "[Document revision content omitted: historical source trust could not be established.]";
 
 type Binding = {
+  /** Controller-admitted optional role, not model/adapter configuration. */
+  reviewerRole?: boolean;
+  reviewerGitHubTools?: ReviewerGitHubToolAdapter;
   /** Server-derived scope for one addressed native completion review. */
   nativeReview?: NativeReviewAssignmentContext;
   companyId: string;
@@ -333,10 +338,16 @@ export class PaperclipRunnerToolAuthority {
   constructor(readonly db: Db, readonly binding: Binding) {}
 
   definitions(): Array<Record<string, unknown>> {
+    if (!this.binding.nativeReview && (this.binding.reviewerRole || this.binding.reviewerGitHubTools)) return [
+      ...(!this.binding.firstPartyOnly && !this.binding.museRuntime ? this.binding.reviewerGitHubTools?.definitions() ?? [] : []),
+      ...CAPABILITY_SEMANTIC_TOOL_CATALOG.filter(tool => NATIVE_REVIEW_READ_TOOLS.has(tool.operationId))
+        .map(tool => ({ name: tool.operationId, description: tool.description, inputSchema: tool.inputSchema })),
+    ];
     if (this.binding.nativeReview) {
       // Scope Paperclip control-plane actions. Provider file and shell access
       // still follow the configured agent/environment policy, including tests.
       return [
+        ...(!this.binding.firstPartyOnly && !this.binding.museRuntime ? this.binding.reviewerGitHubTools?.definitions() ?? [] : []),
         ...CAPABILITY_SEMANTIC_TOOL_CATALOG
           .filter((tool) => NATIVE_REVIEW_READ_TOOLS.has(tool.operationId))
           .map((tool) => ({ name: tool.operationId, description: tool.description, inputSchema: tool.inputSchema })),
@@ -428,6 +439,8 @@ export class PaperclipRunnerToolAuthority {
   }
 
   async recover(call: Parameters<PaperclipRunnerToolAuthority["execute"]>[0]): Promise<{ result: unknown; isError?: boolean } | null> {
+    await this.#assertReviewerBoundary(call.tool);
+    if (this.binding.reviewerGitHubTools?.has(call.tool)) return null; // Closed action ledger owns retry/uncertainty.
     await this.#assertToolScope(call.tool);
     if (!this.binding.museRuntime) await this.binding.assertBridgeAuthority?.();
     const context = await this.#boundContext({ tool: call.tool });
@@ -568,13 +581,20 @@ export class PaperclipRunnerToolAuthority {
     return JSON.parse(text);
   }
 
+  async #assertReviewerBoundary(tool: string): Promise<void> {
+    await assertReviewerNativeToolBoundary(this.db, { ...this.binding, tool,
+      nativeReview: !!this.binding.nativeReview, nativeReadTool: NATIVE_REVIEW_READ_TOOLS.has(tool),
+      closedDiscussionTool: !!this.binding.reviewerGitHubTools?.has(tool),
+    });
+  }
+
   async #assertToolScope(tool: string): Promise<void> {
     if (this.binding.museRuntime) {
       await this.binding.assertBridgeAuthority?.();
       if (!MUSE_NATIVE_OPERATIONS.has(tool)) throw forbidden("This operation is outside the Muse first-party runtime profile");
     }
     if (this.binding.firstPartyOnly && (EXTERNAL_WORKSPACE_OPERATIONS.has(tool) || tool.startsWith("workspace_"))) throw forbidden("Paperclip workspace access is unavailable to this Grok Bot session.");
-    if (this.binding.nativeReview && tool !== "resolve_review" && !NATIVE_REVIEW_READ_TOOLS.has(tool)) {
+    if (this.binding.nativeReview && tool !== "resolve_review" && !NATIVE_REVIEW_READ_TOOLS.has(tool) && !this.binding.reviewerGitHubTools?.has(tool)) {
       throw forbidden("This review run may only inspect the assigned task and resolve its review.");
     }
   }
@@ -584,6 +604,7 @@ export class PaperclipRunnerToolAuthority {
     callId: string;
     arguments: unknown;
   }): Promise<unknown> {
+    await this.#assertReviewerBoundary(call.tool); // Before native early mutation shortcuts.
     if ((call.tool === "handoff_case" || call.tool === "create_case") && !this.binding.nativeReview) {
       if (this.binding.workMode && this.binding.workMode !== "standard") throw forbidden("Case tools require standard work mode");
       const create = call.tool === "create_case" ? createNativeCaseSchema.parse(call.arguments) : null;
@@ -612,6 +633,11 @@ export class PaperclipRunnerToolAuthority {
       });
     }
     await this.#assertToolScope(call.tool);
+    if (this.binding.reviewerGitHubTools?.has(call.tool)) {
+      if (this.binding.firstPartyOnly || this.binding.museRuntime) throw forbidden("Reviewer discussion is unavailable to this external runtime");
+      await this.#boundContext({ tool: call.tool });
+      return this.binding.reviewerGitHubTools.execute(call);
+    }
     if (this.binding.nativeReview && call.tool === "resolve_review") return this.#resolveReview(call.arguments);
     if (Object.hasOwn(TASK_ATTACHMENT_SCHEMAS, call.tool)) {
       const authorize = async () => {

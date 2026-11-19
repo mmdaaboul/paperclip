@@ -3469,7 +3469,7 @@ export function heartbeatService(
           },
         });
         if (!runtimeSelection.selected) return;
-        const { nativeExecution, nativeRunnerInstanceId, getNativeFreshSessionHandoff } = runtimeSelection;
+        const { nativeExecution, nativeRunnerInstanceId, getNativeFreshSessionHandoff, referenceFolderAccess, reviewerWorkspaceAccess } = runtimeSelection;
         nativeWorkspaceSync = runtimeSelection.nativeWorkspaceSync;
         const execution = await measureRunPhase("execution.runtime", () => executeHeartbeatRuntime(db, {
           run, agent, options,
@@ -3484,6 +3484,8 @@ export function heartbeatService(
           runtime: {
             nativeRuntimeResolution,
             nativeExecution,
+            referenceFolderAccess,
+            reviewerWorkspaceAccess,
             nativeRunnerInstanceId,
             adapter,
             runtimeForAdapter,
