@@ -338,8 +338,8 @@ function hireAgentResult(value: unknown, provider: unknown) {
 export class PaperclipRunnerToolAuthority {
   #taskAttachmentCache = new TaskAttachmentReadCache();
   #skillLibraryCache = new SkillLibraryReadCache();
-  close() { this.binding.controllerGitActions?.abort();this.#taskAttachmentCache.close(); this.#skillLibraryCache.close(); }
-  async settle(){await this.binding.controllerGitActions?.retire();}
+  close() { this.binding.reviewerGitHubTools?.close?.();this.binding.controllerGitActions?.abort();this.#taskAttachmentCache.close(); this.#skillLibraryCache.close(); }
+  async settle(){const results=await Promise.allSettled([this.binding.controllerGitActions?.retire(),this.binding.reviewerGitHubTools?.settle?.()]);const failure=results.find(r=>r.status==="rejected");if(failure?.status==="rejected")throw failure.reason;}
   constructor(readonly db: Db, readonly binding: Binding) {}
 
   definitions(): Array<Record<string, unknown>> {

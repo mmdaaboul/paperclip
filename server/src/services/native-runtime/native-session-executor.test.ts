@@ -250,6 +250,7 @@ const state = vi.hoisted(() => ({
     async (_binding: Record<string, unknown>) => [],
   ),
   toolAuthorityExecute: vi.fn(),
+  toolAuthoritySettle: vi.fn(async()=>{}),
   persistActivity: vi.fn(async (_db: unknown, input: { action: string }) => ({
     activity: {
       id:
@@ -335,7 +336,7 @@ vi.mock("@paperclipai/adapter-codex-local/server", async (importOriginal) => ({
 vi.mock("./paperclip-runner-tool-authority.js", () => ({
   PaperclipRunnerToolAuthority: class {
     close() {}
-    async settle() {}
+    async settle() {await state.toolAuthoritySettle();}
     readonly binding: Record<string, unknown>;
 
     constructor(_db: unknown, binding: Record<string, unknown>) {
@@ -471,6 +472,10 @@ import {
 import { onNativeRunnerEvidence } from "./native-runner-evidence-signal.js";
 
 beforeEach(() => {
+  state.toolAuthoritySettle.mockReset().mockResolvedValue(undefined);
+  // Partial native transport fixtures have no agent/Git-policy database.
+  // Actual policy, identity and credential rejection are covered by PG tests.
+  vi.spyOn(controllerGitPolicy,"nativeControllerGitState").mockResolvedValue({restrictExport:false,admitted:false});
   state.localRuntimeApiUrl.mockReset().mockReturnValue("http://127.0.0.1:43219");
   // These transport-wiring fixtures use a partial Db double and synthetic IDs.
   // The real selector/bootstrap proof is exercised with Postgres by the durable
@@ -20731,4 +20736,47 @@ describe("HTTP Stop during remote runner staging", () => {
       expect(dispatches).toBe(0);
     } finally { release(); await outcome; await stopping; await bundle.transport.detachControllerForRestart?.().catch(() => {}); await temporary.cleanup(); await rm(root, { recursive: true, force: true }); }
   }, 120000);
+});
+
+describe("native non-Git tool authority retirement",()=>{
+ it.each(["close","interrupt","detach","cancel"] as const)("%s fences and joins the actual epoch before successor ownership",async control=>{
+  const current={...execution,binding:{...execution.binding,runId:`f08-${control}-${randomUUID()}`},session:{...execution.session,normalizedSessionId:`f08-${control}-${randomUUID()}`}} as NativeExecutionInputV1;
+  const backend=await createRunnerdBackend({db:leaseDb(current),execution:current,runnerInstanceId:"f08-native-epoch"});
+  const handler=state.createBackend.mock.calls.at(-1)![1].dynamicToolHandler!;
+  let release!:()=>void,entered!:()=>void;const ready=new Promise<void>(r=>{entered=r;}),gate=new Promise<void>(r=>{release=r;});
+  state.toolAuthorityExecute.mockImplementationOnce(async()=>{entered();await gate;return {fixture:"completed old operation"};});
+  const session={close:async()=>{},interrupt:async()=>{},detachControllerForRestart:async()=>{},cancel:()=>({cleanup:Promise.resolve()})} as unknown as import("../../vendor/paperclip-runner/index.js").NativeSession;
+  backend.bindControllerSession!(session);
+  state.toolAuthoritySettle.mockImplementationOnce(()=>gate);
+  const work=handler({tool:"read_task",callId:randomUUID(),arguments:{}});await ready;
+  let settled=false;const finish=(control==="cancel"?session.cancel!({reason:"Synthetic Stop"} as never).cleanup:control==="detach"?session.detachControllerForRestart!():control==="interrupt"?session.interrupt!({reason:"Synthetic interrupt"} as never):session.close({reason:"Synthetic retirement"})).then(()=>{settled=true;});
+  await Promise.resolve();expect(settled).toBe(false);await expect(handler({tool:"read_task",callId:randomUUID(),arguments:{}})).rejects.toThrow("native_tool_authority_epoch_revoked");
+  release();await expect(work).resolves.toEqual({fixture:"completed old operation"});await finish;expect(settled).toBe(true);
+ });
+});
+
+describe("native Stop semantic revocation and terminal accounting",()=>{
+ it("drains exact native usage during cancel while semantic callbacks refuse",async()=>{
+  const current={...execution,binding:{...execution.binding,runId:`f08-accounting-${randomUUID()}`},session:{...execution.session,normalizedSessionId:`f08-accounting-${randomUUID()}`}} as NativeExecutionInputV1;
+  const capture=vi.fn(async(_event:PrpEvent)=>{});
+  const backend=await createRunnerdBackend({db:leaseDb(current),execution:current,runnerInstanceId:"f08-accounting",onAccountingEvent:capture});
+  state.createBackend.mock.calls.at(-1)![1].codexTransportFactory!();
+  const accounting=state.createTransport.mock.calls.at(-1)![0].onAccountingEvent!;
+  const handler=state.createBackend.mock.calls.at(-1)![1].dynamicToolHandler!;
+  const usage={eventType:"usage.reported",runId:current.binding.runId,sourceInstanceId:"f08-accounting"} as PrpEvent;
+  const session={close:async()=>{},cancel:()=>({cleanup:accounting(usage)})} as unknown as import("../../vendor/paperclip-runner/index.js").NativeSession;
+  backend.bindControllerSession!(session);await session.cancel!({reason:"Synthetic Stop"} as never).cleanup;
+  expect(capture).toHaveBeenCalledExactlyOnceWith(usage);
+  await expect(handler({tool:"read_task",callId:randomUUID(),arguments:{}})).rejects.toThrow("native_tool_authority_epoch_revoked");
+  await expect(accounting({...usage,runId:"foreign-run"})).rejects.toThrow("native_usage_run_binding_mismatch");
+  await accounting({...usage,eventType:"run.attached"});expect(capture).toHaveBeenCalledTimes(1);
+ });
+ it("does not make an intentional native self-interruption wait for its own API response",async()=>{
+  const current={...execution,binding:{...execution.binding,runId:`f08-self-stop-${randomUUID()}`},session:{...execution.session,normalizedSessionId:`f08-self-stop-${randomUUID()}`}} as NativeExecutionInputV1;
+  const backend=await createRunnerdBackend({db:leaseDb(current),execution:current,runnerInstanceId:"f08-self-stop"});
+  const session={close:async()=>{},cancel:()=>({cleanup:Promise.resolve()})} as unknown as import("../../vendor/paperclip-runner/index.js").NativeSession;
+  backend.bindControllerSession!(session);
+  state.toolAuthorityExecute.mockImplementationOnce(async()=>{await session.cancel!({reason:"Native owned handoff"} as never).cleanup;return {handoff:"committed"};});
+  await expect(state.createBackend.mock.calls.at(-1)![1].dynamicToolHandler!({tool:"call_api",callId:randomUUID(),arguments:{}})).resolves.toEqual({handoff:"committed"});
+ });
 });

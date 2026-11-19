@@ -1987,6 +1987,7 @@ class SessionAuthorityEpoch {
   readonly runId: string;
   #authority: PaperclipRunnerToolAuthority;
   #revoked = false;
+  #accountingRevoked = false;
   readonly #drainingRun?: { runId: string; capture?: (event: PrpEvent) => Promise<void> };
 
   constructor(runId: string, authority: PaperclipRunnerToolAuthority, private readonly toolTrace?: NativeToolTrace,
@@ -1999,12 +2000,17 @@ class SessionAuthorityEpoch {
     }
   }
 
-  revoke(): void {
+  revoke(options?:{drainAccounting?:true}): void {
     this.#revoked = true;
+    if(!options?.drainAccounting)this.#accountingRevoked=true;
     this.#authority.close();
   }
 
   async settle(){await this.#authority.settle();}
+
+  #assertAccountingCurrent():void{
+    if(this.#accountingRevoked)throw new Error("native_tool_authority_epoch_revoked");
+  }
 
   #assertCurrent(): void {
     if (this.#revoked) {
@@ -2014,22 +2020,22 @@ class SessionAuthorityEpoch {
 
   async acceptAccountingEvent(event: PrpEvent) {
     if (!isNativeUsageAccountingEvent(event)) return;
-    this.#assertCurrent();
+    this.#assertAccountingCurrent();
     if (event.runId !== this.runId && event.runId !== this.#drainingRun?.runId) throw new Error("native_usage_run_binding_mismatch");
     await (event.runId === this.runId ? this.onAccountingEvent : this.#drainingRun?.capture)?.(event);
-    this.#assertCurrent();
+    this.#assertAccountingCurrent();
   }
 
   async acceptRecoveryAccountingEvent(event: PrpEvent, capture: () => Promise<void>) {
     if (!isNativeUsageAccountingEvent(event)) return;
-    this.#assertCurrent();
+    this.#assertAccountingCurrent();
     if (event.runId === this.runId) throw new Error("native_recovery_usage_source_unproven");
     if (event.runId === this.#drainingRun?.runId) {
       await this.acceptAccountingEvent(event);
       return;
     }
     await capture();
-    this.#assertCurrent();
+    this.#assertAccountingCurrent();
   }
 
   definitions() {
@@ -2046,6 +2052,9 @@ class SessionAuthorityEpoch {
 
   async execute(call: Parameters<PaperclipRunnerToolAuthority["execute"]>[0]) {
     this.#assertCurrent();
+    // Native API tools may intentionally interrupt their own run. Their
+    // transaction/receipt owner controls that handoff; never join a call to
+    // its own cancellation. Closed external actions own separate scopes.
     return this.toolTrace
       ? await this.toolTrace.execute(call, () => this.#authority.execute(call))
       : await this.#authority.execute(call);
@@ -16979,7 +16988,7 @@ async function createRunnerdBackendWithinSessionClaim(
   };
   return {
     bindManagedSession: wrapManagedSession,
-    bindControllerSession:controllerGit?session=>bindNativeControllerGitSession(session,()=>sessionToolAuthorityEpochs.get(sessionScopeId)):undefined,
+    bindControllerSession:session=>bindNativeControllerGitSession(session,()=>sessionToolAuthorityEpochs.get(sessionScopeId)),
     providerAdmissionRequired: () => Boolean(artifactStorage
       && (providerArtifacts || !legacyProviderContinuity && !liveProviderRecovery)),
     providerAdmissionPersisted: artifactStorage ? async () => {
@@ -17020,7 +17029,7 @@ async function createRunnerdBackendWithinSessionClaim(
       cursorCloudRuntime?.register();
       try {
         const session = await backend.openSession(sessionInput);
-        if(controllerGit)bindNativeControllerGitSession(session,()=>sessionToolAuthorityEpochs.get(sessionScopeId));
+        bindNativeControllerGitSession(session,()=>sessionToolAuthorityEpochs.get(sessionScopeId));
         const managed = wrapManagedSession(session);
         await recordAdmittedProviderPack(managed, sessionInput.identity, Boolean(adoptedProcess));
         return managed;
@@ -17030,7 +17039,7 @@ async function createRunnerdBackendWithinSessionClaim(
       cursorCloudRuntime?.register({ cleanupOnly: true });
       try {
         const result = backend.recoverSession ? await backend.recoverSession(snapshot, options) : { recovered: false, reason: "driver does not support recovery" };
-        if(result.session && controllerGit)bindNativeControllerGitSession(result.session,()=>sessionToolAuthorityEpochs.get(sessionScopeId));
+        if(result.session)bindNativeControllerGitSession(result.session,()=>sessionToolAuthorityEpochs.get(sessionScopeId));
         const session = result.session ? wrapManagedSession(result.session) : undefined;
         if (result.recovered && session) await recordAdmittedProviderPack(session, snapshot.identity, Boolean(adoptedProcess));
         if (!result.recovered || !session) cursorCloudRuntime?.unregister();
@@ -17047,7 +17056,7 @@ async function createRunnerdBackendWithinSessionClaim(
       cursorCloudRuntime?.register();
       try {
         const session = await backend.openSession(sessionInput);
-        if(controllerGit)bindNativeControllerGitSession(session,()=>sessionToolAuthorityEpochs.get(sessionScopeId));
+        bindNativeControllerGitSession(session,()=>sessionToolAuthorityEpochs.get(sessionScopeId));
         const managed = wrapManagedSession(session);
         await recordAdmittedProviderPack(managed, sessionInput.identity, false);
         return managed;

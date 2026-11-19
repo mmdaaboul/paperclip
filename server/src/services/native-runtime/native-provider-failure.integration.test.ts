@@ -135,12 +135,20 @@ describe("native completed failure diagnostics", () => {
         await options.controlPlane.completeRun({ result, terminal, turnId });
         return { result, terminal, turnId, normalizedSessionId: native.normalizedSessionId, providerSessionId: "fixture-provider-session", driverKind: execution.session.driverKind, driverVersion: "fixture", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
       });
+      if (scenario === "superseded-review" || scenario === "resolved-review") {
+        const before=await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,runId));
+        await expect(executePaperclipNativeSession({db,execution,runnerInstanceId:native.runnerInstanceId})).rejects.toThrow("native_review_assignment_no_longer_available");
+        expect(provider.execute).not.toHaveBeenCalled();
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,runId))).toEqual(before);
+        expect(await db.select().from(nativeRunResults).where(eq(nativeRunResults.runId,runId))).toHaveLength(0);
+        expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId,runId))).toHaveLength(0);
+        return;
+      }
       const adapter = await executePaperclipNativeSession({ db, execution, runnerInstanceId: native.runnerInstanceId, backend: {
         descriptor: async () => { throw new Error("Unexpected provider call"); },
         openSession: async () => { throw new Error("Unexpected provider call"); },
       } });
       const classified = scenario === "committed" || scenario === "duplicate" || scenario.endsWith("-review") || scenario === "reassigned" || scenario === "successor-race";
-      const reviewAuthorityEnded = scenario === "superseded-review" || scenario === "resolved-review";
       const ownerChanged = scenario === "reassigned" || scenario === "successor-race";
       expect(adapter.errorCode).toBe(classified ? "native_provider_model_rejected" : undefined);
       expect(adapter.errorMessage).toBe(classified ? NATIVE_MODEL_REJECTION_MESSAGE : scenario === "succeeded" ? null : `Native session ${terminal.runTerminalState}`);
@@ -217,7 +225,7 @@ describe("native completed failure diagnostics", () => {
         expect(finalIssue.status).toBe(scenario.endsWith("-review") ? "in_review" : ownerChanged ? "in_progress" : "blocked");
         const decisions = await db.select().from(statusDecisions).where(eq(statusDecisions.runId, runId));
         expect(decisions).toHaveLength(1);
-        expect(decisions[0].reasonCode).toBe(reviewAuthorityEnded ? "native_review_action_finished" : ownerChanged ? "run_failed_partial_evidence_preserved" : "native_provider_model_rejected");
+        expect(decisions[0].reasonCode).toBe(ownerChanged ? "run_failed_partial_evidence_preserved" : "native_provider_model_rejected");
         const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId));
         expect(wakes.filter(wake => wake.payload?.issueId === issueId)).toHaveLength(ownerChanged ? 1 : 0);
         if (!ownerChanged) expect(await heartbeatService(db).dispatchPendingNativeStatusWakeups({ companyId })).toEqual({ scanned: 0, dispatched: 0, recovered: 0, deferred: 0 });

@@ -1,5 +1,6 @@
+import { createNativeAttributedGitScope } from "./native-attributed-git-scope.js";
 import type { Db } from "@paperclipai/db";
-import { createReviewerGitHubActions } from "../reviewer-github-actions.js";
+import { createReviewerGitHubActions, type ReviewerGitHubBinding } from "../reviewer-github-actions.js";
 import type { ReviewerGitHubStore } from "../reviewer-github-store.js";
 import { createNativeReviewerGitHubStore } from "../reviewer-github-native-store.js";
 import { nativeReviewerGitHubAuthorization, type NativeReviewerAuthorizationOptions } from "./reviewer-github-authorization.js";
@@ -20,7 +21,7 @@ export async function prepareOptionalNativeReviewerDiscussion(db: Db, input: {
  await validateNativeReviewerExecution(db,input.execution,input.workspaceAccess);
  try {
   const scope=await prepareNativeReviewerGitHubScope(db,input.execution,input.fetchImpl);
-  return createReviewerGitHubToolAdapter(scope.binding,createNativeReviewerGitHubActions(db,{fetchImpl:input.fetchImpl}));
+  return bindNativeReviewerDiscussionLifetime(db,scope.binding,input.fetchImpl);
  } catch(error) {
   const details=error instanceof HttpError && error.details && typeof error.details==='object' ? error.details as {code?:unknown;providerStatus?:unknown} : null;
   const providerUnavailable=error instanceof HttpError && error.status===422 && (
@@ -36,9 +37,26 @@ export async function prepareOptionalNativeReviewerDiscussion(db: Db, input: {
 /** Production factory always binds the actual protected native runtime/context
  * predicate and immutable native fix-evidence owner. Neither can be replaced by
  * a controller caller's success boolean or an environment/model argument. */
-export function createNativeReviewerGitHubActions(db:Db,options:Omit<NativeReviewerAuthorizationOptions,'assertRuntimeQualified'>&{store?:ReviewerGitHubStore;fetchImpl?:typeof fetch}={}){
- const authorize=nativeReviewerGitHubAuthorization(db,{...options,assertRuntimeQualified:nativeReviewerRuntimeQualification(db)}),store=options.store??createNativeReviewerGitHubStore(db);
+export function createNativeReviewerGitHubActions(db:Db,options:Omit<NativeReviewerAuthorizationOptions,'assertRuntimeQualified'>&{store?:ReviewerGitHubStore;fetchImpl?:typeof fetch;assertCurrent?:()=>void}={}){
+ const nativeAuthorize=nativeReviewerGitHubAuthorization(db,{...options,assertRuntimeQualified:nativeReviewerRuntimeQualification(db)}),store=options.store??createNativeReviewerGitHubStore(db);
+ const authorize:typeof nativeAuthorize=async binding=>{options.assertCurrent?.();const scope=await nativeAuthorize(binding);options.assertCurrent?.();return scope;};
  const resolvePrivateToken=async(scope:Awaited<ReturnType<typeof authorize>>)=>{await authorize(scope.binding);return nativeReviewerPrivateToken(db,scope.binding);};
  const actions=createReviewerGitHubActions({store,authorize,resolvePrivateToken,loadVerifiedFix:(binding,id)=>loadNativeReviewerFixVerification(db,binding,id),fetchImpl:options.fetchImpl});
  return {...actions,recordFixVerification:createReviewerFixVerificationProducer(db,{store,authorize,resolvePrivateToken,fetchImpl:options.fetchImpl})};
+}
+
+/** One native tool-authority lifetime. Reuses the existing operation scope;
+ * no timer, recovery producer or provider/session owner is introduced. */
+export function bindNativeReviewerDiscussionLifetime(db:Db,binding:ReviewerGitHubBinding,fetchImpl:typeof fetch=fetch){
+ const lifetime=createNativeAttributedGitScope();
+ const assertCurrent=()=>lifetime.signal.throwIfAborted();
+ const scopedFetch:typeof fetch=async(input,init)=>{
+  assertCurrent();
+  const incoming=init?.signal??(input instanceof Request?input.signal:undefined);
+  const response=await fetchImpl(input,{...init,signal:incoming?AbortSignal.any([lifetime.signal,incoming]):lifetime.signal});
+  assertCurrent();return response;
+ };
+ const adapter=createReviewerGitHubToolAdapter(binding,createNativeReviewerGitHubActions(db,{fetchImpl:scopedFetch,assertCurrent}));
+ return {...adapter,execute:(call:Parameters<typeof adapter.execute>[0])=>lifetime.track(()=>adapter.execute(call)),
+  close:()=>lifetime.abort("native Reviewer authority retired"),settle:()=>lifetime.retire()};
 }

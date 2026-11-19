@@ -39,4 +39,4 @@ export function createReviewerGitHubToolAdapter(binding: ReviewerGitHubBinding, 
   };
 }
 
-export type ReviewerGitHubToolAdapter = ReturnType<typeof createReviewerGitHubToolAdapter>;
+export type ReviewerGitHubToolAdapter = ReturnType<typeof createReviewerGitHubToolAdapter> & {close?:()=>void;settle?:()=>Promise<void>};

@@ -264,3 +264,20 @@ describe("native provider failure observation", () => {
     },
   );
 });
+
+describe("selected native Claude typed capacity admission",()=>{
+ const typed=(overrides:Record<string,unknown>={})=>({...event,payload:{status:"failed",error:{providerFailure:{schema:"paperclip.provider-failure.v1",provider:"anthropic",phase:"turn",category:"overloaded",message:"Diagnostic may quote Please run /login",retryability:"transient",...overrides}}}});
+ it("routes only trusted typed overload into the existing failed-terminal lane",()=>{
+  const observed=createNativeProviderFailureObservation({kind:"acpx",agent:"claude"});
+  observed.observe({...typed(),sourceKind:"control_plane"});expect(observed.forTerminal("turn",terminal)).toBeNull();
+  observed.observe(typed());expect(observed.forTerminal("turn",terminal)).toMatchObject({errorCode:"native_provider_overloaded",diagnostic:{provider:"anthropic",category:"server_overloaded"}});
+  expect(observed.forTerminal("other",terminal)).toBeNull();expect(observed.forTerminal("turn",{...terminal,runTerminalState:"succeeded"})).toBeNull();
+ });
+ it.each([{category:"quota_exhausted"},{category:"authentication"},{category:"rate_limit"},{category:"permission"},{retryability:"requires_action"},{retryability:"unknown"},{provider:"other"},{phase:"startup"}])("does not upgrade unrelated typed failure %j",overrides=>{
+  const observed=createNativeProviderFailureObservation({kind:"acpx",agent:"claude"});observed.observe(typed(overrides));expect(observed.forTerminal("turn",terminal)).toBeNull();
+ });
+ it("does not claim another ACP provider or untyped prose",()=>{
+  const other=createNativeProviderFailureObservation({kind:"acpx",agent:"cursor"});other.observe(typed());expect(other.forTerminal("turn",terminal)).toBeNull();
+  const native=createNativeProviderFailureObservation({kind:"acpx",agent:"claude"});native.observe({...event,payload:{status:"failed",error:{message:"overloaded Please run /login"}}});expect(native.forTerminal("turn",terminal)).toBeNull();
+ });
+});

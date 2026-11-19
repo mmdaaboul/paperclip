@@ -14,6 +14,7 @@ vi.mock("../../sentry.js", async (importOriginal) => ({
 vi.mock("../../vendor/paperclip-runner/index.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../../vendor/paperclip-runner/index.js")>()), executeNativeSession: provider.execute,
 }));
+import { parseNativeExecutionInput,resolveQualifiedAcpxProfile } from "../../vendor/paperclip-runner/index.js";
 import { executePaperclipNativeSession } from "./native-session-executor.js";
 import { buildNativeCompletionContract } from "./completion-contracts.js";
 import { prepareNativeHeartbeatRun } from "./prepare-native-run.js";
@@ -44,30 +45,33 @@ describe("durable native provider capacity retry", () => {
   });
   afterAll(async () => { vi.unstubAllEnvs(); await temporary?.cleanup(); });
 
-  async function acceptCapacityFailure(runId: string, issueId: string, mutateOwner = false) {
+  async function acceptCapacityFailure(runId: string, issueId: string, mutateOwner = false, selectedProvider:"codex"|"claude"="codex") {
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
     const [run] = await db.update(heartbeatRuns).set({ status: "running", runtimeMode: "native", nativeIssueId: issueId, error: null, errorCode: null }).where(eq(heartbeatRuns.id, runId)).returning();
     await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+    const selectedConfig={provider:selectedProvider,model:selectedProvider==="claude"?"claude-sonnet-4-6":"test-model"};
+    await db.update(agents).set({adapterConfig:selectedConfig}).where(eq(agents.id,agentId));
     const native = await prepareNativeHeartbeatRun({ db, run, issue, environmentLeaseId: randomUUID() });
     const [contract] = await db.select().from(completionContracts).where(eq(completionContracts.issueId, issueId));
     const contractInput = buildNativeCompletionContract(issue, { revision: contract.revision });
     await db.insert(nativeRunFinalizations).values({ runId, companyId, issueId, phase: "observed" });
     const execution: NativeExecutionInputV1 = {
       schema: "paperclip.native-execution-input.v1", binding: { companyId, runId, issueId, agentId, executionWorkspaceId: runId },
-      provider: { kind: "codex", model: "test-model" },
+      provider: selectedProvider==="claude"?{kind:"acpx",agent:"claude",permissionPolicy:"interactive",model:"claude-sonnet-4-6",profile:claudeProfile()}:{ kind: "codex", model: "test-model" },
       task: { identifier: issueId, title: issue.title, description: null, prompt: "Continue the task using its history.", workMode: "standard" },
       workspace: { cwd: "/tmp", repoUrl: null, repoRef: null, branchName: null },
-      session: { normalizedSessionId: native.normalizedSessionId, driverKind: "codex_app_server", protocolVersion: 1, lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } },
+      session: { normalizedSessionId: native.normalizedSessionId, driverKind: selectedProvider==="claude"?"acpx_runtime":"codex_app_server", protocolVersion: 1, lifecyclePolicy: { mode: "per_turn", idleTimeoutMs: null } },
       completionContract: { id: contract.id, sha256: contract.canonicalSha256, schemaVersion: "paperclip.completion-contract.v1", contract: contractInput },
       interactionResponses: [], credentialBindings: [],
     };
+    parseNativeExecutionInput(execution);
     await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeExecutionInput: execution } }).where(eq(heartbeatRuns.id, runId));
-    const providerFailure = { schema: "paperclip.provider-failure.v1", provider: "openai", phase: "turn",
+    const providerFailure = { schema: "paperclip.provider-failure.v1", provider: selectedProvider==="claude"?"anthropic":"openai", phase: "turn",
       category: "overloaded", message: providerDisplayMessage, retryability: "transient" };
     const event: PrpEvent = {
       schema: "paperclip.prp.event.v1", runId, normalizedSessionId: native.normalizedSessionId, turnId: native.turnId,
       sourceInstanceId: native.runnerInstanceId, sourceEventId: "overload", sourceSeq: 1, sourceKind: "runner", eventType: "turn.failed", schemaVersion: 1, priority: 0, emittedAt: new Date().toISOString(),
-      payload: { status: "failed", error: { codexErrorInfo: "serverOverloaded", message: NATIVE_PROVIDER_OVERLOADED_MESSAGE, providerFailure } },
+      payload: { status: "failed", error: { ...(selectedProvider==="codex"?{codexErrorInfo:"serverOverloaded"}:{}), message: NATIVE_PROVIDER_OVERLOADED_MESSAGE, providerFailure } },
     };
     const terminal: PrpTerminalState = { schema: "paperclip.prp.terminal.v1", turnTerminalState: "failed", runTerminalState: "failed", reportedWorkDisposition: "needs_review" };
     const result = { ...CONTROL_PLANE_CONFORMANCE_RESULT, reportedWorkDisposition: "needs_review" as const,
@@ -76,7 +80,7 @@ describe("durable native provider capacity retry", () => {
       await options.controlPlane.openRun({ identity: { companyId, issueId, runId, agentId, sessionId: native.normalizedSessionId }, backendKind: "mock", sourceInstanceId: native.runnerInstanceId });
       await options.controlPlane.appendEvent(event);
       await options.controlPlane.completeRun({ result, terminal, turnId: native.turnId });
-      return { result, terminal, turnId: native.turnId, normalizedSessionId: native.normalizedSessionId, providerSessionId: "fixture-session", driverKind: "codex_app_server", driverVersion: "fixture", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
+      return { result, terminal, turnId: native.turnId, normalizedSessionId: native.normalizedSessionId, providerSessionId: "fixture-session", driverKind: execution.session.driverKind, driverVersion: "fixture", nativeEventCount: 1, highestContiguousSourceSeq: 1, usage: null };
     });
     const unexpected = async () => { throw new Error("Unexpected provider call"); };
     const adapter = await executePaperclipNativeSession({ db, execution, runnerInstanceId: native.runnerInstanceId, backend: { descriptor: unexpected, openSession: unexpected } });
@@ -89,6 +93,7 @@ describe("durable native provider capacity retry", () => {
     if (mutateOwner) await db.update(issues).set({ assigneeAgentId: otherAgentId, executionRunId: null }).where(eq(issues.id, issueId));
     for (let replay = 0; replay < 2; replay++) await finalizeNativeRun({ db, runId, workspaceFinalizeStatus: "succeeded", projectRunStatus: true });
     expect(provider.execute).toHaveBeenCalledTimes(1);
+    expect((await db.select().from(agents).where(eq(agents.id,agentId)))[0].adapterConfig).toEqual(selectedConfig);
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0]).toMatchObject({ status: "failed", error: NATIVE_PROVIDER_OVERLOADED_MESSAGE, errorCode: "native_provider_overloaded" });
     const [recoveredRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
     expect(recoveredRun.resultJson).toMatchObject({ providerFailure });
@@ -97,7 +102,7 @@ describe("durable native provider capacity retry", () => {
     expect(await db.select().from(statusDecisions).where(eq(statusDecisions.runId, runId))).toHaveLength(1);
   }
 
-  it("retries after one and two minutes across restart/replay, then stops", async () => {
+  it.each(["codex","claude"] as const)("retries after one and two minutes across restart/replay, then stops (%s)", async selectedProvider => {
     const issueId = randomUUID(), originalRunId = randomUUID();
     await db.insert(issues).values({ id: issueId, companyId, title: "Capacity task", status: "in_progress", assigneeAgentId: agentId, responsibleUserId: "capacity-owner" });
     await db.insert(heartbeatRuns).values({ id: originalRunId, companyId, agentId, responsibleUserId: "capacity-owner", contextSnapshot: { issueId, wakeCommentId: "original-message" } });
@@ -110,7 +115,7 @@ describe("durable native provider capacity retry", () => {
     for (let failure = 0; failure <= 2; failure++) {
       const before = Date.now();
       sentry.captureRunFailure.mockClear();
-      await acceptCapacityFailure(runId, issueId);
+      await acceptCapacityFailure(runId, issueId,false,selectedProvider);
       await waitForPendingRunFailureReports();
       const successors = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.retryOfRunId, runId)));
       if (failure === 2) {
@@ -188,12 +193,12 @@ describe("durable native provider capacity retry", () => {
     await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, retry.id));
   });
 
-  it("does not retry or change the task after reassignment", async () => {
+  it.each(["codex","claude"] as const)("does not retry or change the task after reassignment (%s)", async selectedProvider => {
     const issueId = randomUUID(), runId = randomUUID();
     await db.insert(issues).values({ id: issueId, companyId, title: "Reassigned capacity task", status: "in_progress", assigneeAgentId: agentId, responsibleUserId: "capacity-owner" });
     await db.insert(heartbeatRuns).values({ id: runId, companyId, agentId, responsibleUserId: "capacity-owner", contextSnapshot: { issueId } });
     sentry.captureRunFailure.mockClear();
-    await acceptCapacityFailure(runId, issueId, true);
+    await acceptCapacityFailure(runId, issueId, true,selectedProvider);
     await waitForPendingRunFailureReports();
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
     // No retry owns this failure, so it remains reportable.
@@ -202,3 +207,8 @@ describe("durable native provider capacity retry", () => {
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))).filter(wake => wake.payload?.issueId === issueId)).toHaveLength(0);
   });
 });
+
+function claudeProfile(){
+ const p=resolveQualifiedAcpxProfile("claude","claude-sonnet-4-6");
+ return {driverKind:p.driverKind,protocolVersion:p.protocolVersion,acpxVersion:p.acpxVersion,agent:p.agent,agentProfileVersion:p.agentProfileVersion,agentServerPackage:p.agentServerPackage,agentServerVersion:p.agentServerVersion,agentRuntimePackage:p.agentRuntimePackage,agentRuntimeVersion:p.agentRuntimeVersion,commandDigest:p.commandDigest};
+}

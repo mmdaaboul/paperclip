@@ -1,5 +1,5 @@
 diff --git a/dist/acp-agent.js b/dist/acp-agent.js
-index 0214a50..73f0c16 100644
+index 0214a50..e315984 100644
 --- a/dist/acp-agent.js
 +++ b/dist/acp-agent.js
 @@ -2490,11 +2490,88 @@ export class ClaudeAcpAgent {
@@ -140,7 +140,18 @@ index 0214a50..73f0c16 100644
                                      },
                                  });
                              }
-@@ -4506,6 +4596,48 @@ export class ClaudeAcpAgent {
+@@ -3081,7 +3171,9 @@ export class ClaudeAcpAgent {
+                             }
+                             switch (message.subtype) {
+                                 case "success": {
+-                                    if (message.result.includes("Please run /login")) {
++                                    // Successful prose cannot grant an authentication failure.
++                                    // Preserve typed quota/rate/capacity terminals and native usage.
++                                    if (message.is_error && (lastAssistantError === "authentication_failed" || lastAssistantError === "oauth_org_not_allowed")) {
+                                         await failActiveWithSessionFailure("auth_required", RequestError.authRequired(), message.result);
+                                         break;
+                                     }
+@@ -4506,6 +4598,48 @@ export class ClaudeAcpAgent {
       *  `$/cancel_request`, and our local abort race settles even if the client
       *  ignores it. A `cancelled` outcome, request rejection, and local abort all
       *  surface the same "Tool use aborted" the callers already expect. */
@@ -189,7 +200,7 @@ index 0214a50..73f0c16 100644
      async requestPermissionFromClient(params, toolName, signal, parentToolUseId, ownerSessionId = params.sessionId) {
          if (signal.aborted)
              throw new Error("Tool use aborted");
-@@ -5311,14 +5443,24 @@ export class ClaudeAcpAgent {
+@@ -5311,14 +5445,24 @@ export class ClaudeAcpAgent {
              settingSources: ["user", "project", "local"],
              ...(thinking !== undefined && { thinking }),
              ...userProvidedOptions,
@@ -215,7 +226,7 @@ index 0214a50..73f0c16 100644
                  ...mcpServers,
                  ...(fileChangeAuditSupport
                      ? { [FILE_CHANGE_AUDIT_SERVER_NAME]: fileChangeAuditSupport.mcpServer }
-@@ -5329,6 +5471,16 @@ export class ClaudeAcpAgent {
+@@ -5329,6 +5473,16 @@ export class ClaudeAcpAgent {
              allowDangerouslySkipPermissions: ALLOW_BYPASS,
              permissionMode: initialPermissionMode,
              canUseTool: this.canUseTool(sessionId),

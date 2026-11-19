@@ -211,7 +211,7 @@ export function readNativeTurnFailureDiagnostic(value: unknown): NativeTurnFailu
 }
 
 /** Observe only events accepted by the bound control-plane persistence port. */
-export function createNativeProviderFailureObservation(provider: { kind: string; model?: string | null }) {
+export function createNativeProviderFailureObservation(provider: { kind: string; model?: string | null; agent?:string }) {
   let rejectedTurnId: string | null = null;
   let overloadedTurnId: string | null = null;
   const failedTurns = new Map<string, NativeTurnFailureDiagnostic>();
@@ -227,6 +227,10 @@ export function createNativeProviderFailureObservation(provider: { kind: string;
         && event.payload.status === "failed") {
         const failure = readProviderFailure(record(event.payload.error).providerFailure);
         if (failure && !providerFailures.has(event.turnId)) providerFailures.set(event.turnId, failure);
+        // Reuse the native bounded capacity lane for the selected Claude ACP
+        // producer's typed failed terminal, never assistant prose or auth/quota.
+        if(provider.kind==="acpx" && provider.agent==="claude" && failure?.provider==="anthropic"
+          && failure.phase==="turn" && failure.category==="overloaded" && failure.retryability==="transient")overloadedTurnId=event.turnId;
       }
       if ((provider.kind !== "codex" && provider.kind !== "opencode") ||
           event.sourceKind !== "runner" || event.eventType !== "turn.failed" || !event.turnId) return;
@@ -270,7 +274,7 @@ export function createNativeProviderFailureObservation(provider: { kind: string;
       if (turnId === overloadedTurnId) return {
         errorCode: NATIVE_PROVIDER_OVERLOADED_CODE,
         errorMessage: NATIVE_PROVIDER_OVERLOADED_MESSAGE,
-        diagnostic: { ...NATIVE_PROVIDER_OVERLOADED_DIAGNOSTIC },
+        diagnostic: provider.kind==="acpx" ? {provider:"anthropic" as const,category:"server_overloaded" as const} : { ...NATIVE_PROVIDER_OVERLOADED_DIAGNOSTIC },
       };
       if (turnId !== rejectedTurnId) {
         // A driver's closed category marks a rejected model for any provider. Only an

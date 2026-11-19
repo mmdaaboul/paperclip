@@ -29,7 +29,8 @@ describePostgres("heartbeat provider usage limit wait", () => {
 
   beforeAll(async () => {
     temporary = await startRecoveryPostgres("heartbeat-provider-limit-");
-    db = createDb(temporary.connectionString);
+    // Keep this sequential fixture below small shared local PG connection limits.
+    db = createDb(temporary.connectionString,{maxConnections:2});
     home = await mkdtemp(path.join(tmpdir(), "paperclip-provider-limit-"));
     process.env.PAPERCLIP_HOME = home;
     heartbeat = heartbeatService(db);
@@ -179,12 +180,15 @@ describePostgres("heartbeat provider usage limit wait", () => {
 
   it("still dispatches a manual run, and work after a later success or an expired reset", async () => {
     const manual = await seed([rateLimited(16)]);
-    expect(dispatched.has((await wake(manual, true)).id)).toBe(true);
+    const manualFinished=await wake(manual,true);
+    expect(dispatched.has(manualFinished.id),JSON.stringify({status:manualFinished.status,errorCode:manualFinished.errorCode,error:manualFinished.error,resultJson:manualFinished.resultJson})).toBe(true);
 
     const recovered = await seed([rateLimited(30), {
       status: "succeeded", startedAt: new Date(Date.now() - 10 * 60_000), finishedAt: new Date(Date.now() - 9 * 60_000),
     }]);
-    expect(dispatched.has((await wake(recovered)).id)).toBe(true);
+    expect(await (await import("../services/native-runtime/native-startup-retry.js")).agentProviderLimitCooldown(db,{companyId:recovered.companyId,agentId:recovered.agentId,now:new Date()})).toBeNull();
+    const recoveredFinished=await wake(recovered);
+    expect(dispatched.has(recoveredFinished.id),JSON.stringify({status:recoveredFinished.status,errorCode:recoveredFinished.errorCode,error:recoveredFinished.error,resultJson:recoveredFinished.resultJson})).toBe(true);
 
     const expired = await seed([rateLimited(90)]);
     expect(dispatched.has((await wake(expired)).id)).toBe(true);
