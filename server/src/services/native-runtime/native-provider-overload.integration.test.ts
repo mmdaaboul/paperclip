@@ -1,3 +1,4 @@
+import {resolvePaperclipRunnerProviderProfile} from "./provider-profile.js";
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
@@ -49,7 +50,8 @@ describe("durable native provider capacity retry", () => {
     const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
     const [run] = await db.update(heartbeatRuns).set({ status: "running", runtimeMode: "native", nativeIssueId: issueId, error: null, errorCode: null }).where(eq(heartbeatRuns.id, runId)).returning();
     await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
-    const selectedConfig={provider:selectedProvider,model:selectedProvider==="claude"?"claude-sonnet-4-6":"test-model"};
+    const selectedConfig=selectedProvider==="claude"?{provider:"acpx",acpxAgent:"claude",model:"claude-sonnet-4-6"}:{provider:"codex",model:"test-model"};
+    if(selectedProvider==="claude")expect(resolvePaperclipRunnerProviderProfile(selectedConfig)).toMatchObject({provider:"acpx",acpxAgent:"claude",model:selectedConfig.model});
     await db.update(agents).set({adapterConfig:selectedConfig}).where(eq(agents.id,agentId));
     const native = await prepareNativeHeartbeatRun({ db, run, issue, environmentLeaseId: randomUUID() });
     const [contract] = await db.select().from(completionContracts).where(eq(completionContracts.issueId, issueId));
