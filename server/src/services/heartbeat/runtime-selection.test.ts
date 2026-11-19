@@ -914,4 +914,13 @@ describe.skipIf(!support.supported)("heartbeat runtime selection boundary", () =
     expect(f.input.stopControllerLease).toHaveBeenCalledOnce();
   });
 
+  it.each(["selected","retained","malformed"])("refuses %s recorded GitHub restriction before legacy profile rewrite or dispatch",async kind=>{
+    const f=await fixture("process");expect(f.input.nativeRuntimeResolution.kind).toBe("legacy");
+    if(kind==="selected")await db.update(agents).set({adapterConfig:{githubWriteMode:"native_controller"}}).where(eq(agents.id,f.agent.id));
+    else await db.update(heartbeatRuns).set({runnerProfileJson:{nativeGithubWriteAdmission:kind==="malformed"?null:{schema:"paperclip.native-github-write-admission.v1",mode:"native_controller",companyId:f.agent.companyId,agentId:f.agent.id,runId:f.run.id}}}).where(eq(heartbeatRuns.id,f.run.id));
+    const before=await read(f.run.id);
+    await expect(selectHeartbeatRuntime(db,f.input)).rejects.toMatchObject({code:"configuration_incomplete",resultJson:{configurationIncomplete:{reason:kind==="malformed"?"native_github_write_admission_incompatible":"native_github_write_runtime_unsupported"}}});
+    expect(await read(f.run.id)).toEqual(before);expect(prepareNativeWorkspaceSync).not.toHaveBeenCalled();
+  });
+
 });

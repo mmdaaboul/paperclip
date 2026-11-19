@@ -1,3 +1,4 @@
+import { legacyControllerGitRefusal } from "../github-controller-policy.js";
 import { assertScopedRunAdmission } from "../scoped-review-admission.js";
 import { readClaimedNativeStopRecovery } from "../native-runtime/native-cancellation-request.js";
 import { readContextCompactionRequest } from "../context-compaction.js";
@@ -19,6 +20,7 @@ import { drainRunPreparationPhases, measureRunPhase } from "../execution-prepara
 import { parseNativeSessionGoalControl } from "./scheduling.js";
 import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
 import {
+  ConfigurationIncompleteFailure,
   PAPERCLIP_WAKE_PAYLOAD_KEY,
   configuredPaperclipApiBaseUrl,
   buildPaperclipRuntimeMcpServers,
@@ -856,7 +858,9 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
       }
       const guardedDispatch =
         await dispatchWithTiming(
-          (markDispatchStarted) => {
+          async (markDispatchStarted) => {
+            const reason=await legacyControllerGitRefusal(db,{companyId:run.companyId,agentId:run.agentId,runId:run.id});
+            if(reason)throw new ConfigurationIncompleteFailure(reason,{configurationIncomplete:{reason,agentId:agent.id,actionUrl:`/agents/${agent.id}/runtime`}});
             input.effects.onLegacyAdapterEntered();
             return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
               getFreshSessionHandoff,

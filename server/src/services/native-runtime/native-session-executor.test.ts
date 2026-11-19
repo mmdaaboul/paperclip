@@ -1,3 +1,4 @@
+import * as controllerGitPolicy from "../github-controller-policy.js";
 import { activeNativeExecutionRunIds } from "./native-active-runs.js";
 import { onRetainedNativeSessionCleanupRelease } from "../retained-native-session-cleanup-notifications.js";
 import { readIdleLocalWork, markIdleStartupComplete, markIdleIngressTracked } from "../idle-local-work.js";
@@ -334,6 +335,7 @@ vi.mock("@paperclipai/adapter-codex-local/server", async (importOriginal) => ({
 vi.mock("./paperclip-runner-tool-authority.js", () => ({
   PaperclipRunnerToolAuthority: class {
     close() {}
+    async settle() {}
     readonly binding: Record<string, unknown>;
 
     constructor(_db: unknown, binding: Record<string, unknown>) {
@@ -11660,6 +11662,10 @@ describe("native warm session supervision", () => {
 
     it.each([false, true])("keeps warm owners and attachment staging untouched during exact Stop cleanup (invalidated=%s)", async invalidated => {
       const { base, next, run } = fixture("identity-native-stop-cleanup");
+      // This fixture owns native Stop, not Git policy. A malformed retained Git
+      // marker must never prevent verified cleanup or restore provider tokens.
+      const gitState=vi.spyOn(controllerGitPolicy,"nativeControllerGitState").mockResolvedValue({restrictExport:false,admitted:false});
+      onTestFinished(()=>gitState.mockRestore());
       const close = vi.fn<() => Promise<void>>(async () => { throw new Error("Stop cleanup must not retire another warm owner"); });
       const cancel = vi.fn(() => ({ cleanup: Promise.resolve() }));
       const originalStaging = state.stageNativeRunnerWakeAttachments.getMockImplementation()!;
@@ -11686,6 +11692,7 @@ describe("native warm session supervision", () => {
         controllerBootId: controller.bootId, controllerPid: controller.pid, controllerGeneration: 2, attempt: 1,
         recoveryState: "awaiting_runner_reattach", recoveryHistory: [{ disposition: "reattach_remote_runner", controllerGeneration: 2, providerAttempt: 1 }],
       }, resultJson);
+      gitState.mockClear().mockRejectedValue(new Error("native_github_write_admission_incompatible"));
       state.stageNativeRunnerWakeAttachments.mockClear().mockImplementation(async () => { throw new Error("Stop cleanup must not stage attachments"); });
       const submit = vi.fn(() => { throw new Error("Stop cleanup cannot submit a turn"); });
       state.execute.mockImplementationOnce(async options => {
@@ -11710,6 +11717,7 @@ describe("native warm session supervision", () => {
         expect(close).not.toHaveBeenCalled();
         expect(state.stageNativeRunnerWakeAttachments).not.toHaveBeenCalled();
         expect(cancel).toHaveBeenCalledTimes(invalidated ? 0 : 1);
+        expect(gitState).not.toHaveBeenCalled();
         expect(submit).not.toHaveBeenCalled();
       } finally {
         state.stageNativeRunnerWakeAttachments.mockReset().mockImplementation(originalStaging);

@@ -760,4 +760,15 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     expect(await executeHeartbeatRuntime(db, input)).toMatchObject({ dispatched: true });
     expectCleanup(input);
   });
+  it.each(["selected","retained"])("refuses %s recorded GitHub mode changed after selection at the final legacy dispatch boundary",async kind=>{
+    const {input,adapter,run}=await fixture();
+    input.control.dispatchResolvedInteractionContinuationWithAtomicGate=async dispatch=>{
+      if(kind==="selected")await db.update(agents).set({adapterConfig:{githubWriteMode:"native_controller"}}).where(eq(agents.id,run.agentId));
+      else await db.update(heartbeatRuns).set({runnerProfileJson:{nativeGithubWriteAdmission:{schema:"paperclip.native-github-write-admission.v1",mode:"native_controller",companyId:run.companyId,agentId:run.agentId,runId:run.id}}}).where(eq(heartbeatRuns.id,run.id));
+      return {dispatched:true,resultPromise:dispatch(vi.fn())};
+    };
+    await expect(executeHeartbeatRuntime(db,input)).rejects.toMatchObject({code:"configuration_incomplete",resultJson:{configurationIncomplete:{reason:"native_github_write_runtime_unsupported"}}});
+    expect(adapter.execute).not.toHaveBeenCalled();expect(input.effects.onLegacyAdapterEntered).not.toHaveBeenCalled();
+  });
+
 });

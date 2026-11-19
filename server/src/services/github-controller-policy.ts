@@ -4,15 +4,18 @@ import { agents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { forbidden } from "../errors.js";
 
 export const NATIVE_CONTROLLER_GITHUB_MODE = "native_controller";
+class NativeControllerGitStateIncompatibleError extends NativeProviderStateIncompatibleError {
+  constructor(readonly reason:string){super(reason);}
+}
 type Binding = { companyId: string; agentId: string; runId: string };
 const object = (x: unknown): Record<string, unknown> => x !== null && typeof x === "object" && !Array.isArray(x) ? x as Record<string, unknown> : {};
-export function controllerGitConfigured(config: unknown) { const mode=object(config).githubWriteMode; if(mode!==undefined&&mode!=="native"&&mode!==NATIVE_CONTROLLER_GITHUB_MODE)throw new NativeProviderStateIncompatibleError("native_github_write_mode_incompatible"); return mode === NATIVE_CONTROLLER_GITHUB_MODE; }
+export function controllerGitConfigured(config: unknown) { const mode=object(config).githubWriteMode; if(mode!==undefined&&mode!=="native"&&mode!==NATIVE_CONTROLLER_GITHUB_MODE)throw new NativeControllerGitStateIncompatibleError("native_github_write_mode_incompatible"); return mode === NATIVE_CONTROLLER_GITHUB_MODE; }
 function retainedMode(profile: unknown, binding: Binding) {
   if(!Object.hasOwn(object(profile),"nativeGithubWriteAdmission"))return false;
   const value = object(object(profile).nativeGithubWriteAdmission);
   if (value.schema !== "paperclip.native-github-write-admission.v1" || (typeof value.mode!=="string"||!["native", NATIVE_CONTROLLER_GITHUB_MODE].includes(value.mode))
     || Object.keys(value).some(k => !["schema", "mode", "companyId", "agentId", "runId"].includes(k))
-    || value.companyId !== binding.companyId || value.agentId !== binding.agentId || value.runId !== binding.runId) throw new NativeProviderStateIncompatibleError("native_github_write_admission_incompatible");
+    || value.companyId !== binding.companyId || value.agentId !== binding.agentId || value.runId !== binding.runId) throw new NativeControllerGitStateIncompatibleError("native_github_write_admission_incompatible");
   return value.mode === NATIVE_CONTROLLER_GITHUB_MODE;
 }
 
@@ -37,14 +40,14 @@ export async function prepareNativeControllerGitAdmission(db: Db, binding: Bindi
     const [run] = await tx.select({ profile: heartbeatRuns.runnerProfileJson, status: heartbeatRuns.status }).from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.id,binding.runId),eq(heartbeatRuns.agentId,binding.agentId),eq(heartbeatRuns.companyId,binding.companyId))).for("update");
     if (!agent || !run || run.status !== "running") throw forbidden("GitHub admission requires current running agent");
-    if (object(run.profile).nativeGithubWriteAdmission !== undefined) { retainedMode(run.profile,binding); if(controllerGitConfigured(agent.config) && !supported)throw new NativeProviderStateIncompatibleError("native_github_write_runtime_unsupported");return object(run.profile).nativeGithubWriteAdmission; }
+    if (object(run.profile).nativeGithubWriteAdmission !== undefined) { retainedMode(run.profile,binding); if(controllerGitConfigured(agent.config) && !supported)throw new NativeControllerGitStateIncompatibleError("native_github_write_runtime_unsupported");return object(run.profile).nativeGithubWriteAdmission; }
     if (object(run.profile).nativeExecutionInput !== undefined) {
-      if (controllerGitConfigured(agent.config)) throw new NativeProviderStateIncompatibleError("native_github_write_new_run_required");
+      if (controllerGitConfigured(agent.config)) throw new NativeControllerGitStateIncompatibleError("native_github_write_new_run_required");
       return;
     }
     const selected = controllerGitConfigured(agent.config);
     if(!selected)return;
-    if (selected && !supported) throw new NativeProviderStateIncompatibleError("native_github_write_runtime_unsupported");
+    if (selected && !supported) throw new NativeControllerGitStateIncompatibleError("native_github_write_runtime_unsupported");
     const marker = { schema: "paperclip.native-github-write-admission.v1", mode: selected ? NATIVE_CONTROLLER_GITHUB_MODE : "native", companyId:binding.companyId,agentId:binding.agentId,runId:binding.runId };
     await tx.update(heartbeatRuns).set({ runnerProfileJson: sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb) || ${JSON.stringify({nativeGithubWriteAdmission:marker})}::jsonb` }).where(eq(heartbeatRuns.id,binding.runId));
     return marker;
@@ -65,4 +68,11 @@ export function controllerGitProviderEnvironment(source: NodeJS.ProcessEnv): Nod
  const env={...source};
  for(const key of Object.keys(env))if(/^(GH_TOKEN|GITHUB_TOKEN|GH_ENTERPRISE_TOKEN|GITHUB_ENTERPRISE_TOKEN|PAPERCLIP_GIT_TOKEN|GIT_ASKPASS|SSH_ASKPASS|SSH_AUTH_SOCK|GIT_SSH.*|GIT_CONFIG_.*|PAPERCLIP_GITHUB_HOST_HOME)$/.test(key))env[key]="";
  return {...env,PAPERCLIP_GITHUB_AUTH_MODE:"managed",GIT_CONFIG_GLOBAL:"/dev/null",GIT_CONFIG_SYSTEM:"/dev/null",GIT_CONFIG_NOSYSTEM:"1",GIT_TERMINAL_PROMPT:"0",GH_CONFIG_DIR:""};
+}
+
+/** Legacy dispatch uses its existing configuration-failure owner, while native
+ * recovery keeps the native permanent incompatible-state class. */
+export async function legacyControllerGitRefusal(db:Pick<Db,"select">,binding:Binding):Promise<string|null>{
+ try{return (await nativeControllerGitState(db,binding)).restrictExport?"native_github_write_runtime_unsupported":null;}
+ catch(error){if(error instanceof NativeControllerGitStateIncompatibleError)return error.reason;throw error;}
 }

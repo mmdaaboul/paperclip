@@ -1,4 +1,4 @@
-import { prepareNativeControllerGitAdmission } from "../github-controller-policy.js";
+import { prepareNativeControllerGitAdmission,legacyControllerGitRefusal } from "../github-controller-policy.js";
 import { getNativeStageReviewAssignment, readNativeStageReviewContext } from "../native-runtime/native-stage-review.js";
 import { buildNativeStageReviewRequest } from "../native-runtime/native-review-prompt.js";
 import { reviewerActorRestricted } from "../reviewer-role.js";
@@ -311,6 +311,12 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
   const { runtimeConfig, runtimeSkillEntries, runScopedMentionedSkillKeys, instructionCopy, agentIdentity, issueAssigneeOverrides, resolvedConfig, managedAiRuntime } = input.config;
   const runOptions = input.recovery;
   const { providerTraceRequested, providerTraceCapture } = input.trace;
+  // Unsupported legacy dispatch must not bypass native credential isolation
+  // or erase a retained restriction marker in its profile rewrite.
+  if(nativeRuntimeResolution.kind!=="native") {
+    const reason=await legacyControllerGitRefusal(db,{companyId:run.companyId,agentId:run.agentId,runId:run.id});
+    if(reason)throw new ConfigurationIncompleteFailure(reason,{configurationIncomplete:{reason,agentId:agent.id,actionUrl:`/agents/${agent.id}/runtime`}});
+  }
   if (nativeRuntimeResolution.kind !== "native" && await reviewerActorRestricted(db, { companyId: agent.companyId, agentId: agent.id, runId: run.id })) {
     throw new ConfigurationIncompleteFailure("Protected Reviewer requires the qualified isolated local native runner.", { reason: "reviewer_native_target_unavailable" });
   }

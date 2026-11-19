@@ -9551,7 +9551,7 @@ export async function executePaperclipNativeSession(input: {
       throw new NativeProviderStateIncompatibleError("workspace_policy_requires_isolated_local_runner");
     }
     input = { ...input, workspaceAccess, ...(stopLease || workspaceAccess?.policy.readOnlyWorkspace ? { managedGitHub: false } : {}) };
-    if((await nativeControllerGitState(input.db,input.execution.binding)).restrictExport)input={...input,
+    if(stopLease || (await nativeControllerGitState(input.db,input.execution.binding)).restrictExport)input={...input,
       runnerEnvironment:controllerGitProviderEnvironment(resolveNativeProviderEnvironment(input.execution.provider,input.runnerEnvironment))};
     preparedInput = input;
     if (physicalIngressKey) {
@@ -16341,7 +16341,7 @@ async function createRunnerdBackendWithinSessionClaim(
     lifecycleMode: input.execution.session.lifecyclePolicy.mode,
   }) : null;
   if (antigravityCredential) effectiveRunnerEnvironmentBase = antigravityCredential.environment;
-  if((await nativeControllerGitState(input.db,input.execution.binding)).restrictExport)effectiveRunnerEnvironmentBase=controllerGitProviderEnvironment(effectiveRunnerEnvironmentBase);
+  if(cleanupOnly || (await nativeControllerGitState(input.db,input.execution.binding)).restrictExport)effectiveRunnerEnvironmentBase=controllerGitProviderEnvironment(effectiveRunnerEnvironmentBase);
   if (protectedReviewer) effectiveRunnerEnvironmentBase.TMPDIR = input.workspaceAccess!.policy.scratchDirectory!;
   if (relayAssignedMcp || noExternalTools) {
     // The server-held tool authority owns this credential. Do not deliver a
