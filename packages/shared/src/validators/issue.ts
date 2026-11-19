@@ -1,3 +1,4 @@
+import { reviewCycleAllowanceRequestSchema } from "../review-cycle-budget.js";
 import { CHAT_PROVIDERS } from "../types/chat-channels.js";
 import { taskWorkspaceSelectionSchema } from "./task-workspace.js";
 import { z } from "zod";
@@ -459,6 +460,7 @@ export const requiredQualityReviewSchema = z.object({
 });
 
 export const issueExecutionPolicySchema = z.object({
+  totalReviewCycles: z.literal(5).optional(),
   requiredQualityReview: requiredQualityReviewSchema.optional(),
   mode: z.enum(ISSUE_EXECUTION_POLICY_MODES).optional().default("normal"),
   commentRequired: z.boolean().optional().default(true),
@@ -529,6 +531,9 @@ export const issueReviewRequestSchema = z
   .strict();
 
 export const issueExecutionStateSchema = z.object({
+  totalReviewBudgetHold: z.boolean().optional(),
+  totalReviewCyclesUsed: z.number().int().nonnegative().optional(),
+  totalReviewCycleAllowance: z.number().int().nonnegative().optional(),
   status: z.enum(ISSUE_EXECUTION_STATE_STATUSES),
   currentStageId: z.string().guid().nullable(),
   currentStageIndex: z.number().int().nonnegative().nullable(),
@@ -973,6 +978,8 @@ export const updateIssueSchema = objectWithoutDefaults(
   .partial()
   .extend({
     expectedStatusVersion: z.number().int().nonnegative().optional(),
+    reviewCycleSubmissionId: z.string().guid().optional(),
+    reviewCycleAllowance: reviewCycleAllowanceRequestSchema.optional(),
     /** Reject a policy write if the policy changed after the caller read it. */
     expectedExecutionPolicy: z.record(z.string(), z.unknown()).optional().nullable(),
     /** Opt-in human decision snapshot, rechecked under the issue lock with its comment. */

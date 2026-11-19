@@ -27,6 +27,7 @@ import { notifyDecisionTargetWork, notifyDecisionTargetIssueRemoval } from "./de
 import { assertOnboardingFirstTaskCreationAllowed, assertOnboardingFirstTaskDependenciesAllowed } from "./onboarding-first-task-admission.js";
 import { readPersistedConfirmationDecision } from "./confirmation-decision.js";
 import { resolveConnectionIntentContinuationSource, resolveItemVerdictContinuationWake } from "./chat-interaction-continuation.js";
+import { assertReviewBudgetMutationTransaction, withInheritedReviewBudgetMutationTransaction } from "./review-cycle-budget-store.js";
 import { insertIssueComment } from "./issue-comment-writes.js";
 import { measureRunTransaction } from "./execution-transaction-timing.js";
 import { readNativeMonitorSource } from "./native-runtime/native-monitor-delivery.js";
@@ -11589,6 +11590,7 @@ export function issueService(db: Db) {
             (receiptExisting.status !== "done" || issueData.executionPolicy !== undefined)) {
           await assertRequiredQualityReviewComplete(tx as Db, { ...receiptExisting, executionPolicy: issueData.executionPolicy === undefined ? receiptExisting.executionPolicy : issueData.executionPolicy }, true);
         }
+        assertReviewBudgetMutationTransaction(tx, receiptExisting, issueData);
         if (actorRunId) await assertNoCaseHandoffMutation(tx, actorRunId, id);
         if (expectedStatusVersion !== undefined && (
           receiptExisting.statusVersion !== expectedStatusVersion || receiptExisting.status !== "backlog"
@@ -12169,7 +12171,7 @@ export function issueService(db: Db) {
       };
 
       const result = await (dbOrTx === db
-        ? db.transaction(runUpdate)
+        ? db.transaction(tx=>withInheritedReviewBudgetMutationTransaction(dbOrTx,tx,{companyId:existing.companyId,issueId:id},()=>runUpdate(tx)))
         : runUpdate(dbOrTx));
       if (dbOrTx === db && !postCommitActivityPublications) {
         for (const publication of ownedActivityPublications)
@@ -12407,6 +12409,15 @@ export function issueService(db: Db) {
             and(
               eq(issues.id, id),
               inArray(issues.status, expectedStatuses),
+            // Cleanup/checkout cannot steal the selected-human budget hold or
+            // the currently configured Reviewer. Recheck atomically at claim.
+            or(sql`coalesce(${issues.executionPolicy}->>'totalReviewCycles', '') <> '5'`, and(
+              sql`coalesce(${issues.executionState}->>'totalReviewBudgetHold', 'false') <> 'true'`,
+              sql`not exists (select 1 from issue_scoped_reviews scoped where scoped.issue_id=${issues.id} and scoped.company_id=${issues.companyId} and scoped.state in ('draft','pending','cancelling'))`,
+              or(sql`coalesce(${issues.executionState}->>'status', '') <> 'pending'`, and(
+                eq(issues.assigneeAgentId, agentId), isNull(issues.assigneeUserId),
+              )),
+            )),
               or(isNull(issues.assigneeAgentId), sameRunAssigneeCondition),
               executionLockCondition,
             ),
@@ -12783,7 +12794,12 @@ export function issueService(db: Db) {
         // Terminal assignment records who owned the work, not a live execution
         // claim. Cleanup must preserve it; unfinished release still relinquishes it.
         const isTerminal = existing.status === "done" || existing.status === "cancelled";
-        const releaseStatus =
+        const scopedPending=(existing.executionPolicy as {totalReviewCycles?:unknown}|null)?.totalReviewCycles===5
+          ? (await tx.execute(sql`select state from issue_scoped_reviews where issue_id=${id} and company_id=${existing.companyId} and state in ('draft','pending','cancelling') limit 1`))[0] as {state:string}|undefined : undefined;
+        const pendingTotalReview = (existing.executionPolicy as { totalReviewCycles?: unknown } | null)?.totalReviewCycles === 5
+          && ((existing.executionState as { status?: unknown } | null)?.status === "pending" || scopedPending?.state==="pending");
+        const preserveScopedDraftOwner=scopedPending?.state==="draft";
+        const releaseStatus = pendingTotalReview ? "in_review" :
           existing.status === "in_progress" ? "todo" : existing.status;
         await notifyTerminalWorkspaceWork(tx, `issue:${id}`);
         await notifyNativeStatusReassessment(tx, { companyId: existing.companyId, issueId: id });
@@ -12797,7 +12813,7 @@ export function issueService(db: Db) {
           .update(issues)
           .set({
             status: releaseStatus,
-            assigneeAgentId: isTerminal ? existing.assigneeAgentId : null,
+            assigneeAgentId: isTerminal || pendingTotalReview || preserveScopedDraftOwner ? existing.assigneeAgentId : null,
             checkoutRunId: null,
             executionRunId: null,
             executionAgentNameKey: null,

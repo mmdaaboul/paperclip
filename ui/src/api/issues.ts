@@ -1,3 +1,5 @@
+import type { ScopedReview, ScopedReviewList, CancelScopedReview } from "@paperclipai/shared";
+import { createUuid } from "../lib/uuid";
 import type { SetIssueTitle } from "@paperclipai/shared";
 import { ISSUE_SUMMARIES_MAX_IDS } from "@paperclipai/shared";
 import type { IssueSummary } from "@paperclipai/shared";
@@ -284,6 +286,8 @@ function issueListSearchParams(filters?: IssueListFilters) {
 }
 
 export const issuesApi = {
+  scopedReviews: (id:string) => api.get<ScopedReviewList>(`/issues/${id}/scoped-reviews`),
+  cancelScopedReview: (id:string,scopeId:string,body:CancelScopedReview) => api.post<ScopedReview>(`/issues/${id}/scoped-reviews/${scopeId}/cancel`,body),
   inboxMine: (companyId: string, options?: RequestOptions) => {
     const path = `/companies/${companyId}/inbox/mine`;
     detachInflightGet(path);
@@ -408,7 +412,9 @@ export const issuesApi = {
   create: (companyId: string, data: Record<string, unknown>) =>
     api.post<Issue>(`/companies/${companyId}/issues`, data),
   update: (id: string, data: Record<string, unknown>) => {
-    const response = api.patch<IssueUpdateResponse>(`/issues/${id}`, data);
+    const body=(data.status==="done" || data.status==="in_review") && data.reviewCycleSubmissionId===undefined && data.expectedExecutionDecision===undefined
+      ? {...data,reviewCycleSubmissionId:createUuid()}:data;
+    const response = api.patch<IssueUpdateResponse>(`/issues/${id}`, body);
     return typeof data.comment === "string"
       ? confirmedCommentResponse(response, (value) =>
           hasCommentReceipt(value?.comment),

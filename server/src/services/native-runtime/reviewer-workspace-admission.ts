@@ -110,7 +110,7 @@ export async function prepareNativeReviewerWorkspaceAdmission(db: Db, input: {
     }
     const assignment = await resolveNativeReviewerAssignment(tx as unknown as Db, { ...binding, contextSnapshot: run.contextSnapshot,
       ...(run.nativeIssueId ? { actingRunId: run.id } : {}), issueExecutionRunId: issue.executionRunId });
-    if (!assignment) throw forbidden("This run has no actual current native completion-review assignment; scoped/stage authority remains unavailable until its qualified owner is integrated");
+    if (!assignment) throw forbidden("This run has no actual current native completion, scoped or execution-stage Reviewer assignment");
     if (run.contextSnapshot?.sourceRunId !== undefined && run.contextSnapshot.sourceRunId !== assignment.sourceRun.id) throw forbidden("Reviewer source run context does not match the native review");
     const profile = object(run.runnerProfileJson);
     const reference = referenceFolderAdmissionSchema.parse(profile.referenceFolderAdmission);

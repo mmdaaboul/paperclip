@@ -1,0 +1,753 @@
+import { spawn } from "node:child_process";
+import { once } from "node:events";
+import { reviewerNativeTestDatabase } from "./helpers/reviewer-native-database.js";
+import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
+import fs from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import express from "express";
+import request from "supertest";
+import { and, eq, sql } from "drizzle-orm";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+import { activityLog, agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns,
+  issueExecutionDecisions, issueReviewCycleBudgets, issues, completionContracts, nativeRunResults, nativeRunFinalizations, workAssessments, statusDecisions, statusDecisionEffects, agentWakeupRequests, issueRecoveryActions, projects, projectWorkspaces, executionWorkspaces, documents, documentRevisions, issueDocuments, issueScopedReviews, issueThreadInteractions } from "@paperclipai/db";
+
+// Provider dispatch and executor-stop confirmation are stubbed; native authorization,
+// run rows, task state, ledger, decisions and audit use the real migrated database.
+const executionFixture = vi.hoisted(() => ({ rejectStop:false,suppressStopProof:false,loseStopReply:false }));
+vi.mock("../services/issue-assignment-wakeup.js", () => ({ queueIssueAssignmentWakeup: vi.fn() }));
+vi.mock("../services/heartbeat.js", async (loadActual) => {
+  const actual = await loadActual<typeof import("../services/heartbeat.js")>();
+  return { ...actual, heartbeatService: (...args: Parameters<typeof actual.heartbeatService>) => {
+    const service = actual.heartbeatService(...args);
+    return { ...service, wakeup: vi.fn(async () => null), cancelRun: vi.fn(async (runId: string, _reason: unknown, options: any) => {
+      if (executionFixture.rejectStop) throw new Error("Unconfirmed executor stop in budget fixture");
+      const database=args[0];
+      const [stopped]=await database.update(heartbeatRuns).set({status:"cancelled",resultJson:options?.resultJson??{},finishedAt:new Date()}).where(eq(heartbeatRuns.id,runId)).returning();
+      if(executionFixture.loseStopReply)throw new Error("Synthetic lost Stop reply before termination proof");
+      if(!executionFixture.suppressStopProof) {
+        if(stopped.runtimeMode==="native") {
+          // Harmless local process + native physical receipt; no actual Runner,
+          // provider, account or model runs. Stop remains a controlled seam.
+          const child=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{stdio:"ignore",detached:true});await once(child,"spawn");
+          const started=await (await import("../services/hot-restart.js")).readProcessStartedAt(child.pid!);
+          child.kill("SIGTERM");await once(child,"exit");
+          await database.transaction(async tx=>{
+            const [withIdentity]=await tx.update(heartbeatRuns).set({processPid:child.pid!,processGroupId:child.pid!,processStartedAt:new Date(started!)}).where(eq(heartbeatRuns.id,runId)).returning();
+            expect(await (await import("../services/native-local-process-stop.js")).recordNativeLocalProcessStop(tx as unknown as Db,withIdentity)).toBe(true);
+            await tx.update(heartbeatRuns).set({processPid:null,processGroupId:null,processStartedAt:null}).where(eq(heartbeatRuns.id,runId));
+          });
+        }
+        await database.update(issues).set({executionRunId:null,checkoutRunId:null,executionAgentNameKey:null,executionLockedAt:null}).where(eq(issues.executionRunId,runId));
+      }
+      return (await database.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,runId)))[0];
+    }) };
+  } };
+});
+type Db = ReturnType<typeof createDb>;
+let db: Db;
+let fixture: Awaited<ReturnType<typeof reviewerNativeTestDatabase>>;
+async function appFor(actor: Express.Request["actor"], enforceReviewerBoundary=false) {
+  const { issueRoutes } = await import("../routes/issues.js");
+  const app = express(); app.use(express.json());
+  app.use((req, _res, next) => { req.actor = actor; next(); });
+  if(enforceReviewerBoundary)app.use((await import("../middleware/reviewer-role-boundary.js")).reviewerRoleBoundary(db));
+  app.use("/api", issueRoutes(db, {} as never));
+  app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) =>
+    res.status(err.status ?? 500).json({ error: err.message, details: err.details }));
+  return app;
+}
+async function seed() {
+  const userId = `budget-owner-${randomUUID()}`, now = new Date();
+  await db.insert(authUsers).values({ id: userId, name: "Synthetic human", email: `${userId}@example.test`, createdAt: now, updatedAt: now });
+  const [company] = await db.insert(companies).values({ name: "Synthetic total-budget fixture", issuePrefix: `TB${randomUUID().replaceAll("-", "").slice(0,8)}` }).returning();
+  await db.insert(companyMemberships).values({ companyId: company.id, principalType: "user", principalId: userId, status: "active", membershipRole: "owner" });
+  const [builder, reviewer] = await db.insert(agents).values(["Builder", "Only Reviewer"].map(name => ({ companyId: company.id, name, role: "engineer", status: "active", adapterType: "process", adapterConfig: {}, runtimeConfig: { heartbeat: { enabled: false } } }))).returning();
+  const policy = { totalReviewCycles: 5, stages: [
+    { id: randomUUID(), type: "review", participants: [{ id: randomUUID(), type: "agent", agentId: reviewer.id }] },
+    { id: randomUUID(), type: "approval", participants: [{ id: randomUUID(), type: "user", userId }] },
+  ] };
+  const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Synthetic review-budget task", identifier: `${company.issuePrefix}-1`, status: "in_progress", assigneeAgentId: builder.id, responsibleUserId: userId, executionPolicy: policy }).returning();
+  async function run(agentId: string, status = "succeeded") {
+    return (await db.insert(heartbeatRuns).values({ companyId: company.id, agentId, issueId: issue.id, nativeIssueId: issue.id, scopeKind: "issue", status, responsibleUserId: userId, startedAt: new Date(), contextSnapshot: { issueId: issue.id } }).returning())[0];
+  }
+  const board = await appFor({ type: "board", userId, companyIds: [company.id], source: "session", isInstanceAdmin: false });
+  const agentApp = async (agentId: string, runId: string) => appFor({ type: "agent", agentId, companyId: company.id, runId, onBehalfOfUserId: userId, onBehalfOfMemberships: [{ companyId: company.id, membershipRole: "owner", status: "active" }], source: "agent_jwt" });
+  const read = async () => (await db.select().from(issues).where(eq(issues.id,issue.id)))[0];
+  const ledger = async () => (await db.select().from(issueReviewCycleBudgets).where(eq(issueReviewCycleBudgets.issueId,issue.id)))[0]?.ledger as any;
+  return { userId, company, builder, reviewer, issue, board, run, agentApp, read, ledger };
+}
+async function draftFixture(existing?:Awaited<ReturnType<typeof seed>>) {
+  const f=existing??await seed(),runId=randomUUID();
+  const observed=await f.read();
+  await db.update(agents).set({adapterType:"paperclip_runner",adapterConfig:{provider:"codex",model:"gpt-6.1-sol"}}).where(eq(agents.companyId,f.company.id));
+  const cwd=path.join(process.env.TMPDIR!,`scoped-workspace-${randomUUID()}`); await fs.mkdir(cwd,{recursive:true});
+  const [project]=await db.insert(projects).values({companyId:f.company.id,name:"Scoped document fixture",status:"in_progress"}).returning();
+  const [primary]=await db.insert(projectWorkspaces).values({companyId:f.company.id,projectId:project.id,name:"Native scope anchor",cwd,isPrimary:true}).returning();
+  const [workspace]=await db.insert(executionWorkspaces).values({companyId:f.company.id,projectId:project.id,projectWorkspaceId:primary.id,sourceIssueId:f.issue.id,mode:"isolated_workspace",strategyType:"git_worktree",providerType:"git_worktree",name:"Synthetic scoped candidate",cwd,providerRef:cwd,status:"active"}).returning();
+  const {buildNativeExecutionInput}=await import("../services/native-runtime/native-execution-input.js");
+  const {nativeRuntimeContextFixture}=await import("../services/native-runtime/runtime-context.test-fixture.js");
+  const {canonicalNativeRuntimeContextDigest}=await import("../vendor/paperclip-runner/index.js");
+  const runtime=nativeRuntimeContextFixture(); runtime.instructions.bundle.rootPath=cwd; runtime.aggregateDigest=canonicalNativeRuntimeContextDigest(runtime);
+  const execution=buildNativeExecutionInput({companyId:f.company.id,agentId:f.builder.id,runId,issue:observed,taskPrompt:"Inspect the scoped native document fixture",workspace:{id:workspace.id,cwd,repoUrl:null,repoRef:null,branchName:null},normalizedSessionId:randomUUID(),provider:"codex",runtimeContext:runtime,
+    completionContract:{id:randomUUID(),sha256:"a".repeat(64),schemaVersion:"paperclip.run-result.v1",contract:{revision:"1",objective:"Review the plan before remaining implementation",criteria:[{id:"plan",requirement:"Review exact plan revision"}]}}});
+  await db.insert(heartbeatRuns).values({id:runId,companyId:f.company.id,agentId:f.builder.id,runtimeMode:"native",nativeIssueId:f.issue.id,issueId:f.issue.id,scopeKind:"issue",status:"running",responsibleUserId:f.userId,runnerProfileJson:{nativeExecutionInput:execution},contextSnapshot:{issueId:f.issue.id}});
+  await db.update(issues).set({executionWorkspaceId:workspace.id,projectId:project.id,projectWorkspaceId:primary.id,executionRunId:runId,checkoutRunId:runId}).where(eq(issues.id,f.issue.id));
+  const [document]=await db.insert(documents).values({companyId:f.company.id,title:"Scoped native plan",format:"markdown",latestBody:"# Exact native plan\nRemaining implementation is unfinished."}).returning();
+  const [revision]=await db.insert(documentRevisions).values({companyId:f.company.id,documentId:document.id,revisionNumber:1,title:document.title,format:document.format,body:document.latestBody,createdByAgentId:f.builder.id,createdByRunId:runId}).returning();
+  await db.update(documents).set({latestRevisionId:revision.id}).where(eq(documents.id,document.id));
+  await db.insert(issueDocuments).values({companyId:f.company.id,issueId:f.issue.id,documentId:document.id,key:"plan"});
+  const app=await f.agentApp(f.builder.id,runId);
+  const requestBody={id:randomUUID(),documentId:document.id,revisionId:revision.id,executionWorkspaceId:workspace.id,expectedStatusVersion:observed.statusVersion,purpose:"Check this plan before implementing",remainingWork:"Implement the remaining plan after partial review; final review still required."};
+  return {...f,runId,workspace,document,revision,app,requestBody,execution};
+}
+
+async function admittedDraftFixture(existing?:Awaited<ReturnType<typeof seed>>) {
+  const f=await draftFixture(existing);
+  const prior=await f.read();
+  const draft=await request(f.app).post(`/api/issues/${f.issue.id}/scoped-reviews`).send(f.requestBody); expect(draft.status,JSON.stringify(draft.body)).toBe(201);
+  const resultId=randomUUID(),assessmentId=randomUUID(),contract=f.execution.completionContract;
+  await db.update(heartbeatRuns).set({completionContractId:contract.id,completionContractSha256:contract.sha256}).where(eq(heartbeatRuns.id,f.runId));
+  await db.insert(completionContracts).values({id:contract.id,companyId:f.company.id,issueId:f.issue.id,revision:1,schemaVersion:contract.schemaVersion,policyVersion:"phase6-v13",risk:"standard",completionAuthority:"server_arbiter",incompleteCriteriaPolicy:"preserve_non_terminal",contractJson:contract.contract as any,canonicalSha256:contract.sha256,createdByActorType:"system",createdByActorId:"native-scoped-fixture"});
+  const {nativeSha256}=await import("../services/native-runtime/canonical.js");
+  const resultJson={result:{reportedWorkDisposition:"needs_review",summary:"Review pinned document before remaining implementation",attentionRequests:[{kind:"review",ownerClass:"agent",targetAgentId:f.reviewer.id,summary:f.requestBody.purpose}]},terminal:{runTerminalState:"succeeded"}};
+  await db.insert(nativeRunResults).values({id:resultId,companyId:f.company.id,issueId:f.issue.id,runId:f.runId,completionContractId:contract.id,serverFingerprint:nativeSha256(resultJson),schemaStatus:"accepted",resultJson,canonicalSha256:nativeSha256(resultJson)});
+  await db.insert(workAssessments).values({id:assessmentId,companyId:f.company.id,issueId:f.issue.id,runId:f.runId,contractId:contract.id,resultId,triggerKind:"native_result",triggerActorCompanyId:f.company.id,priorIssueStatus:prior.status,priorStatusVersion:prior.statusVersion,priorDecisionId:prior.lastStatusDecisionId,policyVersion:"phase6-v13",assessmentJson:{reportedDisposition:"needs_review",attentionRequests:resultJson.result.attentionRequests},inputDigest:`scope:${resultId}`});
+  await db.insert(nativeRunFinalizations).values({runId:f.runId,companyId:f.company.id,issueId:f.issue.id,phase:"assessing",resultId,assessmentId});
+  const {commitNativeStatusDecision}=await import("../services/native-runtime/status-decision-committer.js");
+  const input={db,companyId:f.company.id,issueId:f.issue.id,runId:f.runId,assessmentId,priorStatus:prior.status,priorStatusVersion:prior.statusVersion,priorDecisionId:prior.lastStatusDecisionId,
+    decision:{policyVersion:"phase6-v13" as const,statusAction:"in_review" as const,toStatus:"in_review" as const,reasonCode:"actionable_attention_pending",unblockDescriptor:null,effects:[{kind:"bind_reviewer" as const,ownerAgentId:f.reviewer.id,prompt:f.requestBody.purpose}]}};
+  const committed=await commitNativeStatusDecision(input);
+  const scope=(await db.select().from(issueScopedReviews).where(eq(issueScopedReviews.id,f.requestBody.id)))[0];
+  return {...f,scope,input,committed,commitNativeStatusDecision};
+}
+
+async function reviewingDraftFixture(existing?:Awaited<ReturnType<typeof seed>>) {
+  const f=await admittedDraftFixture(existing);
+  const context={issueId:f.issue.id,nativeReviewInteractionId:f.scope.interactionId,nativeReviewDecisionId:f.scope.sourceDecisionId};
+  const [reviewerRun]=await db.insert(heartbeatRuns).values({companyId:f.company.id,agentId:f.reviewer.id,runtimeMode:"native",nativeIssueId:f.issue.id,issueId:f.issue.id,scopeKind:"issue",status:"running",responsibleUserId:f.userId,contextSnapshot:context}).returning();
+  const {claimNativeReviewExecutionLock}=await import("../services/native-runtime/native-review-participant.js");
+  expect(await claimNativeReviewExecutionLock(db,{companyId:f.company.id,issueId:f.issue.id,agentId:f.reviewer.id,runId:reviewerRun.id,contextSnapshot:context,agentNameKey:"one-scope-reviewer",claimedAt:new Date()})).toBe(true);
+  return {...f,reviewerRun,reviewerApp:await f.agentApp(f.reviewer.id,reviewerRun.id)};
+}
+
+async function nativeCandidate(existing?: Awaited<ReturnType<typeof seed>>, agentId?: string) {
+    const f=existing ?? await seed(), prior=await f.read(), runId=randomUUID(),contractId=randomUUID(),resultId=randomUUID(),assessmentId=randomUUID();
+    const { nativeSha256 }=await import("../services/native-runtime/canonical.js");
+    const resultJson={result:{reportedWorkDisposition:"done",summary:"Synthetic completed candidate",attentionRequests:[]},terminal:{runTerminalState:"succeeded"}};
+    await db.insert(heartbeatRuns).values({id:runId,companyId:f.company.id,agentId:agentId ?? f.builder.id,runtimeMode:"native",nativeIssueId:f.issue.id,issueId:f.issue.id,scopeKind:"issue",status:"succeeded",completionContractId:contractId,completionContractSha256:`synthetic-contract:${runId}`,contextSnapshot:{issueId:f.issue.id}});
+    await db.insert(completionContracts).values({id:contractId,companyId:f.company.id,issueId:f.issue.id,revision:prior.statusVersion+1,schemaVersion:"paperclip.completion-contract.v1",policyVersion:"phase6-v13",risk:"standard",completionAuthority:"server_arbiter",incompleteCriteriaPolicy:"preserve_non_terminal",contractJson:{criteria:[]},canonicalSha256:`synthetic-contract:${runId}`,createdByActorType:"system",createdByActorId:"budget-component-fixture"});
+    await db.insert(nativeRunResults).values({id:resultId,companyId:f.company.id,issueId:f.issue.id,runId,completionContractId:contractId,serverFingerprint:nativeSha256(resultJson),schemaStatus:"accepted",resultJson,canonicalSha256:nativeSha256(resultJson)});
+    await db.insert(workAssessments).values({id:assessmentId,companyId:f.company.id,issueId:f.issue.id,runId,contractId,resultId,triggerKind:"native_result",triggerActorCompanyId:f.company.id,priorIssueStatus:prior.status,priorStatusVersion:prior.statusVersion,priorDecisionId:prior.lastStatusDecisionId,policyVersion:"phase6-v13",assessmentJson:{allCriteriaSatisfied:true},inputDigest:`synthetic-assessment:${runId}`});
+    await db.insert(nativeRunFinalizations).values({runId,companyId:f.company.id,issueId:f.issue.id,phase:"assessing",resultId,assessmentId});
+    await db.update(issues).set({executionRunId:runId,checkoutRunId:runId}).where(eq(issues.id,f.issue.id));
+    const { commitNativeStatusDecision }=await import("../services/native-runtime/status-decision-committer.js");
+    const input={db,companyId:f.company.id,issueId:f.issue.id,runId,assessmentId,priorStatus:prior.status,priorStatusVersion:prior.statusVersion,priorDecisionId:prior.lastStatusDecisionId,
+      decision:{policyVersion:"phase6-v13" as const,statusAction:"done" as const,toStatus:"done" as const,reasonCode:"completion_contract_satisfied",unblockDescriptor:null,effects:[{kind:"release_checkout" as const}]}};
+    return {f,runId,contractId,resultId,assessmentId,nativeSha256,resultJson,commitNativeStatusDecision,input};
+}
+
+async function stageFixture() {
+  const base=await draftFixture(),candidate=await nativeCandidate(base),execution=structuredClone(base.execution);
+  execution.binding.runId=candidate.runId;
+  await db.update(heartbeatRuns).set({runnerProfileJson:{nativeExecutionInput:execution}}).where(eq(heartbeatRuns.id,candidate.runId));
+  await db.update(heartbeatRuns).set({status:"succeeded"}).where(eq(heartbeatRuns.id,base.runId));
+  const committed=await candidate.commitNativeStatusDecision(candidate.input);
+  const [wake]=await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId,base.company.id),eq(agentWakeupRequests.agentId,base.reviewer.id)));
+  const context=(wake.payload as any)._paperclipWakeContext;
+  const [reviewerRun]=await db.insert(heartbeatRuns).values({companyId:base.company.id,agentId:base.reviewer.id,runtimeMode:"native",nativeIssueId:base.issue.id,issueId:base.issue.id,scopeKind:"issue",status:"running",responsibleUserId:base.userId,wakeupRequestId:wake.id,contextSnapshot:context}).returning();
+  await db.update(issues).set({executionRunId:reviewerRun.id}).where(eq(issues.id,base.issue.id));
+  return {...base,candidate,committed,wake,context,reviewerRun,reviewerApp:await base.agentApp(base.reviewer.id,reviewerRun.id)};
+}
+
+async function qualifyProtectedReview(f:Awaited<ReturnType<typeof stageFixture>>|Awaited<ReturnType<typeof reviewingDraftFixture>>) {
+  const previousHome=process.env.PAPERCLIP_HOME;
+  let child:ReturnType<typeof spawn>|undefined;
+  try {
+  process.env.PAPERCLIP_HOME=await fs.mkdtemp(path.join(process.env.TMPDIR!,"protected-review-home-"));
+  await fs.mkdir((await import("../home-paths.js")).resolvePaperclipInstanceRoot(),{recursive:true,mode:0o700});
+  const {agentReviewerPolicies}=await import("@paperclipai/db");
+  await db.insert(agentReviewerPolicies).values({companyId:f.company.id,agentId:f.reviewer.id,enabled:true,revision:1,scopes:[{projectId:f.workspace.projectId!,repositoryId:"99",repository:"fixture/repository"}],updatedByUserId:f.userId});
+  const [agent]=await db.select().from(agents).where(eq(agents.id,f.reviewer.id));
+  const identity={companyId:f.company.id,agentId:f.reviewer.id,runId:f.reviewerRun.id,issueId:f.issue.id,projectId:f.workspace.projectId!,workspaceId:f.workspace.id,workspaceDirectory:f.workspace.cwd!,executionDriver:"local" as const};
+  await (await import("../services/agent-reference-folder-admission.js")).prepareAgentReferenceFolderAdmission(db,{agent, ...identity});
+  const admission=(await (await import("../services/native-runtime/reviewer-workspace-admission.js")).prepareNativeReviewerWorkspaceAdmission(db,identity))!;
+  const asset=await (await import("../services/native-runtime/runtime-context.js")).materializeAsset([{path:"AGENTS.md",content:Buffer.from("Synthetic protected review"),mode:0o400},{path:admission.instructionFile.path,content:Buffer.from(admission.instructionFile.content),mode:0o400}]);
+  const base=(await import("../services/native-runtime/runtime-context.test-fixture.js")).nativeRuntimeContextFixture();
+  const context={...base,instructions:{entryPath:"AGENTS.md",bundle:asset}};
+  const {parseNativeExecutionInput,canonicalNativeRuntimeContextDigest}=await import("../vendor/paperclip-runner/index.js");context.aggregateDigest=canonicalNativeRuntimeContextDigest(context);
+  const execution=parseNativeExecutionInput({...f.execution,binding:{...f.execution.binding,agentId:f.reviewer.id,runId:f.reviewerRun.id},runtimeContext:context});
+  await db.update(heartbeatRuns).set({runnerProfileJson:sql`coalesce(${heartbeatRuns.runnerProfileJson},'{}'::jsonb)||${JSON.stringify({nativeExecutionInput:execution})}::jsonb`}).where(eq(heartbeatRuns.id,f.reviewerRun.id));
+  child=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{stdio:"ignore"});await once(child,"spawn");
+  const started=await (await import("../services/hot-restart.js")).readProcessStartedAt(child.pid!);const runnerInstanceId=randomUUID();
+  await db.update(heartbeatRuns).set({runnerInstanceId,nativeSessionId:randomUUID(),driverKind:"codex_app_server",processPid:child.pid!,processStartedAt:new Date(started!)}).where(eq(heartbeatRuns.id,f.reviewerRun.id));
+  await (await import("../services/native-runtime/reviewer-runtime-admission.js")).recordNativeReviewerProcessAdmission(db,{execution,workspaceAccess:admission.workspaceAccess,runnerInstanceId,process:{pid:child.pid!,processGroupId:null,startedAt:started!}});
+  const actor={type:"agent" as const,agentId:f.reviewer.id,runId:f.reviewerRun.id,companyId:f.company.id,source:"agent_jwt" as const,onBehalfOfUserId:f.userId,onBehalfOfMemberships:[{companyId:f.company.id,membershipRole:"owner",status:"active"}]};
+  return {admission,execution,actor,close:async()=>{child!.kill("SIGTERM");await once(child!,"exit");if(previousHome===undefined)delete process.env.PAPERCLIP_HOME;else process.env.PAPERCLIP_HOME=previousHome;}};
+  } catch(error) {
+    if(child?.pid && child.exitCode===null){child.kill("SIGTERM");await once(child,"exit");}
+    if(previousHome===undefined)delete process.env.PAPERCLIP_HOME;else process.env.PAPERCLIP_HOME=previousHome;
+    throw error;
+  }
+}
+
+const patch = (app: express.Express, id: string, body: object) => request(app).patch(`/api/issues/${id}`).send(body);
+function ok(response: any) { expect(response.status, JSON.stringify(response.body)).toBe(200); }
+
+describe("actual normal PATCH + native postgres-js + native issue service (injected actor, no worker execution)", () => {
+  beforeAll(async () => {
+    fixture=await reviewerNativeTestDatabase();db=fixture.db;
+    expect((await db.execute(sql`select to_regclass('issue_review_cycle_budgets') as name`))[0].name).toBe("issue_review_cycle_budgets");
+    expect((await db.execute(sql`select to_regclass('issue_scoped_reviews') as name`))[0].name).toBe("issue_scoped_reviews");
+    expect((await db.execute(sql`show server_version`))[0].server_version).toMatch(/^18\.1/);
+    await import("../routes/issues.js");
+  }, 120000);
+  afterAll(async () => { await fixture?.end(); });
+  it("scoped draft pins native document revision, workspace and one configured Reviewer; duplicates neither dispatch nor spend", async () => {
+    const f=await draftFixture();
+    const first=await request(f.app).post(`/api/issues/${f.issue.id}/scoped-reviews`).send(f.requestBody);
+    expect(first.status,JSON.stringify(first.body)).toBe(201); expect(first.body.review.state).toBe("draft");
+    const {nativeSha256}=await import("../services/native-runtime/canonical.js");
+    expect(first.body.review.snapshot).toMatchObject({builderAgentId:f.builder.id,builderRunId:f.runId,reviewerAgentId:f.reviewer.id,contentSha256:nativeSha256({title:f.revision.title,format:f.revision.format,body:f.revision.body})});
+    const retry=await request(f.app).post(`/api/issues/${f.issue.id}/scoped-reviews`).send(f.requestBody); expect(retry.status).toBe(200); expect(retry.body.replayed).toBe(true);
+    const changed=await request(f.app).post(`/api/issues/${f.issue.id}/scoped-reviews`).send({...f.requestBody,purpose:"Changed purpose"}); expect(changed.status).toBe(409);
+    expect(await db.select().from(issueScopedReviews).where(eq(issueScopedReviews.issueId,f.issue.id))).toHaveLength(1);
+    expect(await f.ledger()).toBeUndefined(); expect((await f.read()).assigneeAgentId).toBe(f.builder.id);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId,f.company.id))).toHaveLength(0);
+  });
+  it("scoped draft rejects stale revisions, foreign documents, changed workspace and unauthenticated human submission", async () => {
+    const f=await draftFixture();
+    for(const bad of [{revisionId:randomUUID()},{documentId:randomUUID()},{executionWorkspaceId:randomUUID()},{expectedStatusVersion:99}]) {
+      const response=await request(f.app).post(`/api/issues/${f.issue.id}/scoped-reviews`).send({...f.requestBody,...bad}); expect(response.status,JSON.stringify(response.body)).toBe(409);
+    }
+    const board=await request(f.board).post(`/api/issues/${f.issue.id}/scoped-reviews`).send(f.requestBody); expect(board.status).toBe(403);
+    expect(await db.select().from(issueScopedReviews).where(eq(issueScopedReviews.issueId,f.issue.id))).toHaveLength(0); expect(await f.ledger()).toBeUndefined();
+  });
+  it("scoped native admission shares parent ledger and native Reviewer claim rejects a competing execution owner", async () => {
+    const f=await admittedDraftFixture();
+    expect(f.scope).toMatchObject({state:"pending",sourceDecisionId:f.committed.decision.id});
+    expect((await f.ledger()).admissions).toEqual([expect.objectContaining({kind:"scoped",scopeId:f.requestBody.id,id:f.requestBody.id})]);
+    expect(await f.read()).toMatchObject({status:"in_review",assigneeAgentId:f.builder.id});
+    const [interaction]=await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id,f.scope.interactionId!));
+    expect(interaction.payload).toMatchObject({target:{key:"scoped_review",revisionId:f.committed.decision.id},acceptLabel:"Scope passed; return remaining work"});
+    const {getNativeReviewAssignment,claimNativeReviewExecutionLock}=await import("../services/native-runtime/native-review-participant.js");
+    const context={issueId:f.issue.id,nativeReviewInteractionId:interaction.id,nativeReviewDecisionId:f.committed.decision.id};
+    expect(await getNativeReviewAssignment(db,{companyId:f.company.id,issueId:f.issue.id,agentId:f.reviewer.id,contextSnapshot:context})).toMatchObject({scopedReview:{id:f.scope.id}});
+    const [reviewerRun]=await db.insert(heartbeatRuns).values({companyId:f.company.id,agentId:f.reviewer.id,runtimeMode:"native",nativeIssueId:f.issue.id,issueId:f.issue.id,scopeKind:"issue",status:"queued",contextSnapshot:context}).returning();
+    const claim={companyId:f.company.id,issueId:f.issue.id,agentId:f.reviewer.id,runId:reviewerRun.id,contextSnapshot:context,agentNameKey:"synthetic-reviewer",claimedAt:new Date()};
+    // Native status projection normally clears checkout. Inject a competing
+    // current execution owner to test the atomic claim, not process cleanup.
+    await db.update(issues).set({executionRunId:f.runId}).where(eq(issues.id,f.issue.id));
+    expect(await claimNativeReviewExecutionLock(db,claim)).toBe(false);
+    // Synthetic observation of controller release, not a claim of real process cleanup.
+    await db.update(heartbeatRuns).set({status:"succeeded"}).where(eq(heartbeatRuns.id,f.runId));
+    await db.update(issues).set({executionRunId:null,checkoutRunId:null}).where(eq(issues.id,f.issue.id));
+    expect(await claimNativeReviewExecutionLock(db,claim)).toBe(true);
+    expect((await f.commitNativeStatusDecision(f.input)).replayed).toBe(true);
+    expect((await f.ledger()).admissions).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId,f.company.id),eq(agentWakeupRequests.agentId,f.reviewer.id)))).toHaveLength(1);
+  });
+  it.each(["accept","reject"] as const)("scoped %s records partial verdict and one durable gated Builder return without completing parent",async decision=>{
+    const f=await reviewingDraftFixture();
+    const endpoint=`/api/issues/${f.issue.id}/interactions/${f.scope.interactionId}/${decision}`;
+    const response=await request(f.reviewerApp).post(endpoint).send(decision==="reject"?{reason:"Correct the pinned plan before implementing remaining work"}:{});
+    ok(response);
+    const [scope]=await db.select().from(issueScopedReviews).where(eq(issueScopedReviews.id,f.scope.id));
+    expect(scope).toMatchObject({state:decision==="accept"?"passed":"changes_requested",verdict:decision==="accept"?"passed":"changes_requested",verdictRunId:f.reviewerRun.id,version:2});
+    expect(await f.read()).toMatchObject({status:"todo",assigneeAgentId:f.builder.id,executionRunId:f.reviewerRun.id});
+    expect((await f.ledger()).admissions).toHaveLength(1);
+    const [wake]=await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id,scope.returnWakeupId!));
+    expect(wake).toMatchObject({agentId:f.builder.id,status:"queued",idempotencyKey:`native-scoped-return:${f.scope.id}:${decision==="accept"?"accepted":"rejected"}`});
+    expect(JSON.stringify(wake.payload)).toContain(f.requestBody.remainingWork);
+    const retry=await request(f.reviewerApp).post(endpoint).send(decision==="reject"?{reason:"Correct the pinned plan before implementing remaining work"}:{});
+    expect([200,409]).toContain(retry.status);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey,wake.idempotencyKey!))).toHaveLength(1);
+    expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId,f.issue.id))).toHaveLength(0);
+  });
+  it("fifth scoped correction shares four previous normal cycles, holds selected human and refuses allowance until Reviewer settles",async()=>{
+    const base=await seed();
+    for(let n=1;n<=4;n++) {await base.run(base.builder.id);ok(await patch(base.board,base.issue.id,{status:"done",reviewCycleSubmissionId:randomUUID()}));const r=await base.run(base.reviewer.id);ok(await patch(await base.agentApp(base.reviewer.id,r.id),base.issue.id,{status:"in_progress",comment:`Correction ${n}`}));}
+    const f=await reviewingDraftFixture(base);
+    ok(await request(f.reviewerApp).post(`/api/issues/${f.issue.id}/interactions/${f.scope.interactionId}/reject`).send({reason:"The fifth shared candidate still needs correction"}));
+    expect((await f.ledger()).admissions.map((a:any)=>a.kind)).toEqual(["normal","normal","normal","normal","scoped"]);
+    expect(await f.read()).toMatchObject({status:"in_review",assigneeAgentId:null,assigneeUserId:f.userId,executionRunId:f.reviewerRun.id,executionState:{status:"changes_requested",totalReviewBudgetHold:true,totalReviewCyclesUsed:5}});
+    const [held]=await db.select().from(issueScopedReviews).where(eq(issueScopedReviews.id,f.scope.id));expect(held).toMatchObject({state:"held",verdict:"changes_requested",returnWakeupId:null});
+    const allowance={id:randomUUID(),additionalCycles:1,reason:"One explicit further shared review cycle"};
+    const blocked=await patch(f.board,f.issue.id,{reviewCycleAllowance:allowance});expect(blocked.status).toBe(409);expect((await f.ledger()).allowances).toHaveLength(0);
+    // Synthetic observed settlement; full native process/lease acceptance remains separate.
+    await db.update(heartbeatRuns).set({status:"succeeded"}).where(eq(heartbeatRuns.id,f.reviewerRun.id));await db.update(issues).set({executionRunId:null}).where(eq(issues.id,f.issue.id));
+    ok(await patch(f.board,f.issue.id,{reviewCycleAllowance:allowance}));expect((await f.ledger()).admissions).toHaveLength(5);expect((await f.ledger()).allowances).toHaveLength(1);
+    expect(await f.read()).toMatchObject({assigneeAgentId:f.builder.id,executionState:{totalReviewBudgetHold:false}});
+  },90000);
+  it("scoped controller admission rejects a new Builder during review and accepts only exact Reviewer run context",async()=>{
+    const f=await reviewingDraftFixture(); const {assertScopedRunAdmission}=await import("../services/scoped-review-admission.js");
+    await expect(assertScopedRunAdmission(db,{companyId:f.company.id,issueId:f.issue.id,runId:f.reviewerRun.id})).resolves.toBeUndefined();
+    const [builder]=await db.insert(heartbeatRuns).values({companyId:f.company.id,agentId:f.builder.id,runtimeMode:"native",nativeIssueId:f.issue.id,issueId:f.issue.id,scopeKind:"issue",status:"queued",contextSnapshot:{issueId:f.issue.id}}).returning();
+    await expect(assertScopedRunAdmission(db,{companyId:f.company.id,issueId:f.issue.id,runId:builder.id})).rejects.toThrow("new Builder turn cannot start");
+    await db.update(issues).set({workspaceBindingRevision:sql`${issues.workspaceBindingRevision}+1`}).where(eq(issues.id,f.issue.id));
+    await expect(assertScopedRunAdmission(db,{companyId:f.company.id,issueId:f.issue.id,runId:f.reviewerRun.id})).rejects.toThrow("workspace or configured workflow changed");
+    expect((await f.ledger()).admissions).toHaveLength(1);
+  });
+  it("scoped return admission checks durable receipt, settlement, task version and exact artifact before workspace startup",async()=>{
+    const f=await reviewingDraftFixture();ok(await request(f.reviewerApp).post(`/api/issues/${f.issue.id}/interactions/${f.scope.interactionId}/accept`).send({}));
+    const [scope]=await db.select().from(issueScopedReviews).where(eq(issueScopedReviews.id,f.scope.id));
+    const [returned]=await db.insert(heartbeatRuns).values({companyId:f.company.id,agentId:f.builder.id,runtimeMode:"native",nativeIssueId:f.issue.id,issueId:f.issue.id,scopeKind:"issue",status:"queued",wakeupRequestId:scope.returnWakeupId,contextSnapshot:{issueId:f.issue.id,scopedReviewId:scope.id}}).returning();
+    const {assertScopedRunAdmission}=await import("../services/scoped-review-admission.js");
+    const identity={companyId:f.company.id,issueId:f.issue.id,runId:returned.id};
+    await expect(assertScopedRunAdmission(db,identity)).rejects.toThrow("Reviewer must settle");
+    await db.update(heartbeatRuns).set({status:"succeeded"}).where(eq(heartbeatRuns.id,f.reviewerRun.id));await db.update(issues).set({executionRunId:null}).where(eq(issues.id,f.issue.id));
+    await expect(assertScopedRunAdmission(db,identity)).resolves.toBeUndefined();
+    await db.update(issues).set({statusVersion:sql`${issues.statusVersion}+1`}).where(eq(issues.id,f.issue.id));
+    await expect(assertScopedRunAdmission(db,identity)).rejects.toThrow("no longer current");
+    expect((await f.ledger()).admissions).toHaveLength(1);
+  });
+  it("scoped cancellation withdraws an unsubmitted draft idempotently without spending or dispatching",async()=>{
+    const f=await draftFixture();ok(await request(f.app).post(`/api/issues/${f.issue.id}/scoped-reviews`).send(f.requestBody).then(r=>({...r,status:r.status===201?200:r.status})));
+    const url=`/api/issues/${f.issue.id}/scoped-reviews/${f.requestBody.id}/cancel`,body={requestId:randomUUID(),expectedVersion:0,reason:"Replace this unsubmitted plan"};
+    ok(await request(f.app).post(url).send(body));ok(await request(f.app).post(url).send(body));
+    const [scope]=await db.select().from(issueScopedReviews).where(eq(issueScopedReviews.id,f.requestBody.id));expect(scope).toMatchObject({state:"cancelled",version:1,sourceDecisionId:null,cancellation:{requestId:body.requestId,targetRunIds:[]}});
+    expect(await f.ledger()).toBeUndefined();expect(await f.read()).toMatchObject({status:"in_progress",assigneeAgentId:f.builder.id});
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId,f.company.id))).toHaveLength(0);
+  });
+  it("scoped cancellation persists uncertain native Stop, rejects retargeting and resumes one charged Builder return",async()=>{
+    const f=await reviewingDraftFixture(),url=`/api/issues/${f.issue.id}/scoped-reviews/${f.scope.id}/cancel`,body={requestId:randomUUID(),expectedVersion:1,reason:"Discard this stale partial candidate"};
+    expect((await request(f.reviewerApp).post(url).send(body)).status).toBe(403);
+    await db.update(documents).set({latestBody:"Changed after admission"}).where(eq(documents.id,f.document.id));
+    expect((await request(f.reviewerApp).post(`/api/issues/${f.issue.id}/interactions/${f.scope.interactionId}/accept`).send({})).status).toBe(409);
+    executionFixture.rejectStop=true;
+    try {expect((await request(f.board).post(url).send(body)).status).toBe(500);} finally {executionFixture.rejectStop=false;}
+    let [scope]=await db.select().from(issueScopedReviews).where(eq(issueScopedReviews.id,f.scope.id));expect(scope).toMatchObject({state:"cancelling",cancellation:{requestId:body.requestId,targetRunIds:[f.reviewerRun.id]},returnWakeupId:null});
+    expect((await request(f.board).post(url).send({...body,reason:"Different reason"})).status).toBe(409);
+    const {assertScopedRunAdmission}=await import("../services/scoped-review-admission.js");
+    await expect(assertScopedRunAdmission(db,{companyId:f.company.id,issueId:f.issue.id,runId:f.reviewerRun.id})).rejects.toThrow("cancellation");
+    ok(await request(f.board).post(url).send(body));ok(await request(f.board).post(url).send(body));
+    [scope]=await db.select().from(issueScopedReviews).where(eq(issueScopedReviews.id,f.scope.id));expect(scope).toMatchObject({state:"cancelled",verdict:null,verdictRunId:null,cancellation:{targetRunIds:[f.reviewerRun.id]}});
+    expect((await f.ledger()).admissions).toHaveLength(1);expect(await f.read()).toMatchObject({status:"todo",assigneeAgentId:f.builder.id});
+    const wakes=await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey,`native-scoped-return:${f.scope.id}:cancelled`));expect(wakes).toHaveLength(1);
+    const [returned]=await db.insert(heartbeatRuns).values({companyId:f.company.id,agentId:f.builder.id,runtimeMode:"native",nativeIssueId:f.issue.id,issueId:f.issue.id,scopeKind:"issue",status:"queued",wakeupRequestId:scope.returnWakeupId,contextSnapshot:{issueId:f.issue.id,scopedReviewId:scope.id}}).returning();
+    await db.update(issues).set({executionRunId:null}).where(eq(issues.id,f.issue.id));
+    await expect(assertScopedRunAdmission(db,{companyId:f.company.id,issueId:f.issue.id,runId:returned.id},{readRunTerminationProof:(await import("../services/heartbeat.js")).heartbeatService(db).readRunTerminationProof})).resolves.toBeUndefined();
+  });
+  it("enabled protected Reviewer refuses generic human and Builder PATCH before any cycle/task/wake mutation",async()=>{
+    const f=await seed(),run=await f.run(f.builder.id,"running");await db.update(issues).set({executionRunId:run.id}).where(eq(issues.id,f.issue.id));const prior=await f.read();
+    await db.execute(sql`insert into agent_reviewer_policies(company_id,agent_id,revision,enabled,updated_by_user_id) values(${f.company.id},${f.reviewer.id},1,true,${f.userId})`);
+    for(const app of [f.board,await f.agentApp(f.builder.id,run.id)]) {
+      const response=await patch(app,f.issue.id,{status:"done",reviewCycleSubmissionId:randomUUID()});expect(response.status,JSON.stringify(response.body)).toBe(409);expect(response.body.error).toContain("paperclip_finish");
+      const after=await f.read();expect(after,JSON.stringify(Object.keys(after).filter(key=>JSON.stringify((after as any)[key])!==JSON.stringify((prior as any)[key])).map(key=>({key,before:(prior as any)[key],after:(after as any)[key]})))).toEqual(prior);expect(await f.ledger()).toBeUndefined();expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId,f.company.id))).toHaveLength(0);
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,run.id)))[0].status).toBe("running");
+    }
+    await db.execute(sql`update agent_reviewer_policies set enabled=false where company_id=${f.company.id} and agent_id=${f.reviewer.id}`);
+    await db.update(heartbeatRuns).set({status:"succeeded"}).where(eq(heartbeatRuns.id,run.id));await db.update(issues).set({executionRunId:null}).where(eq(issues.id,f.issue.id));
+    ok(await patch(f.board,f.issue.id,{status:"done",reviewCycleSubmissionId:randomUUID()}));expect((await f.ledger()).admissions).toHaveLength(1);
+  });
+  it("locked protected-role recheck refuses policy enablement after a role-off preview without persistence",async()=>{
+    const f=await seed(),run=await f.run(f.builder.id),prior=await f.read();
+    const {applyIssueExecutionPolicyTransition,normalizeIssueExecutionPolicy}=await import("../services/issue-execution-policy.js");
+    const {readReviewBudgetPreviewContext,applyLockedReviewBudgetTransition}=await import("../services/review-cycle-budget-store.js");
+    const policy=normalizeIssueExecutionPolicy(prior.executionPolicy),transition={issue:prior,policy,previousPolicy:policy,requestedStatus:"done",requestedAssigneePatch:{},actor:{agentId:f.builder.id,runId:run.id},reviewCycleNow:new Date().toISOString(),
+      ...await readReviewBudgetPreviewContext(db,{companyId:f.company.id,issueId:f.issue.id}),reviewCycleAdmission:{id:run.id,companyId:f.company.id,issueId:f.issue.id,builderAgentId:f.builder.id,builderRunId:run.id,candidateId:`run:${run.id}`,kind:"normal" as const,scopeId:null}};
+    const expected=applyIssueExecutionPolicyTransition(transition);await db.execute(sql`insert into agent_reviewer_policies(company_id,agent_id,revision,enabled,updated_by_user_id) values(${f.company.id},${f.reviewer.id},1,true,${f.userId})`);
+    const persist=vi.fn(async()=>{});await expect(db.transaction(tx=>applyLockedReviewBudgetTransition(tx,{companyId:f.company.id,issueId:f.issue.id,transition,expectedPreview:expected,expectedStoredPolicy:policy},persist))).rejects.toThrow("accepted native completion result");
+    expect(persist).not.toHaveBeenCalled();expect(await f.ledger()).toBeUndefined();expect(await f.read()).toEqual(prior);
+  });
+  it("enabled protected Reviewer accepts the real native completion producer and derives its selected stage proof",async()=>{
+    const base=await draftFixture();await db.execute(sql`insert into agent_reviewer_policies(company_id,agent_id,revision,enabled,updated_by_user_id) values(${base.company.id},${base.reviewer.id},1,true,${base.userId})`);
+    const candidate=await nativeCandidate(base),execution=structuredClone(base.execution);execution.binding.runId=candidate.runId;
+    await db.update(heartbeatRuns).set({runnerProfileJson:{nativeExecutionInput:execution}}).where(eq(heartbeatRuns.id,candidate.runId));
+    const committed=await candidate.commitNativeStatusDecision(candidate.input);expect(committed.issue).toMatchObject({status:"in_review",assigneeAgentId:base.reviewer.id});
+    const [wake]=await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId,base.company.id),eq(agentWakeupRequests.agentId,base.reviewer.id)));
+    const {getNativeStageReviewAssignment}=await import("../services/native-runtime/native-stage-review.js");expect(await getNativeStageReviewAssignment(db,{companyId:base.company.id,issueId:base.issue.id,agentId:base.reviewer.id,contextSnapshot:(wake.payload as any)._paperclipWakeContext})).not.toBeNull();
+    expect((await base.ledger()).admissions).toHaveLength(1);
+  });
+  it("native scheduler consumes scoped return intent once and defers actual dispatch until Reviewer release",async()=>{
+    const f=await reviewingDraftFixture();ok(await request(f.reviewerApp).post(`/api/issues/${f.issue.id}/interactions/${f.scope.interactionId}/accept`).send({}));
+    const [scope]=await db.select().from(issueScopedReviews).where(eq(issueScopedReviews.id,f.scope.id));
+    // Ignore the earlier captured Reviewer wake in this targeted return test:
+    // its actual runtime was already represented by reviewingDraftFixture.
+    await db.update(agentWakeupRequests).set({status:"completed",runId:f.reviewerRun.id}).where(and(eq(agentWakeupRequests.companyId,f.company.id),eq(agentWakeupRequests.agentId,f.reviewer.id)));
+    const {heartbeatService}=await import("../services/heartbeat.js");const heartbeat=heartbeatService(db);
+    const first=await heartbeat.dispatchPendingNativeStatusWakeups({companyId:f.company.id});expect(first.scanned).toBe(1);
+    const receipts=await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.requestedByActorId,`native-status-wake-dispatch:${scope.returnWakeupId}`));
+    expect(receipts).toHaveLength(1);expect(receipts[0]).toMatchObject({agentId:f.builder.id,status:"deferred_issue_execution"});
+    expect(receipts[0].payload).toMatchObject({scopedReviewId:f.scope.id,_paperclipWakeContext:{scopedReviewId:f.scope.id,forceFreshSession:true}});
+    await heartbeat.dispatchPendingNativeStatusWakeups({companyId:f.company.id});
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.requestedByActorId,`native-status-wake-dispatch:${scope.returnWakeupId}`))).toHaveLength(1);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId,receipts[0].id))).toHaveLength(0);
+    // A synthetic persisted queued run tests the ACTUAL scheduler receipt chain;
+    // no provider starts. Execution settlement is represented explicitly.
+    const [returned]=await db.insert(heartbeatRuns).values({companyId:f.company.id,agentId:f.builder.id,runtimeMode:"native",nativeIssueId:f.issue.id,issueId:f.issue.id,scopeKind:"issue",status:"queued",wakeupRequestId:receipts[0].id,contextSnapshot:(receipts[0].payload as any)._paperclipWakeContext}).returning();
+    const {assertScopedRunAdmission}=await import("../services/scoped-review-admission.js");
+    await expect(assertScopedRunAdmission(db,{companyId:f.company.id,issueId:f.issue.id,runId:returned.id})).rejects.toThrow("Reviewer must settle");
+    await db.update(heartbeatRuns).set({status:"succeeded"}).where(eq(heartbeatRuns.id,f.reviewerRun.id));await db.update(issues).set({executionRunId:null}).where(eq(issues.id,f.issue.id));
+    await expect(assertScopedRunAdmission(db,{companyId:f.company.id,issueId:f.issue.id,runId:returned.id},{readRunTerminationProof:(await import("../services/heartbeat.js")).heartbeatService(db).readRunTerminationProof})).resolves.toBeUndefined();
+  });
+  it("native normal stage refuses same-workspace revision drift and same-stage policy edits",async()=>{
+    const f=await stageFixture();const {getNativeStageReviewAssignment}=await import("../services/native-runtime/native-stage-review.js");
+    const input={companyId:f.company.id,issueId:f.issue.id,agentId:f.reviewer.id,runId:f.reviewerRun.id,contextSnapshot:f.context};
+    expect(await getNativeStageReviewAssignment(db,input)).not.toBeNull();
+    await db.update(issues).set({workspaceBindingRevision:sql`${issues.workspaceBindingRevision}+1`}).where(eq(issues.id,f.issue.id));expect(await getNativeStageReviewAssignment(db,input)).toBeNull();
+    await db.update(issues).set({workspaceBindingRevision:f.issue.workspaceBindingRevision,executionPolicy:{...(await f.read()).executionPolicy as any,maxReviewRounds:4}}).where(eq(issues.id,f.issue.id));expect(await getNativeStageReviewAssignment(db,input)).toBeNull();
+    expect((await f.ledger()).admissions).toHaveLength(1);
+  });
+  it.each(["approved","changes_requested"] as const)("narrow native normal stage %s binds the accepted candidate and records one immutable decision",async outcome=>{
+    const f=await stageFixture(),url=`/api/issues/${f.issue.id}/execution-stage-review/decisions`;
+    const {getNativeStageReviewAssignment,nativeStageReviewOutcome}=await import("../services/native-runtime/native-stage-review.js");
+    const proof=await getNativeStageReviewAssignment(db,{companyId:f.company.id,issueId:f.issue.id,agentId:f.reviewer.id,runId:f.reviewerRun.id,contextSnapshot:f.context});expect(proof).not.toBeNull();
+    const body={id:randomUUID(),stageId:proof!.stage.id,admissionId:proof!.admission.id,sourceDecisionId:proof!.sourceDecision.id,expectedStatusVersion:proof!.issue.statusVersion,outcome,body:"Concrete independent review finding"};
+    expect((await request(f.board).post(url).send(body)).status).toBe(403);
+    expect((await request(f.reviewerApp).post(url).send({...body,sourceDecisionId:randomUUID()})).status).toBe(403);
+    const {PaperclipRunnerToolAuthority}=await import("../services/native-runtime/paperclip-runner-tool-authority.js");
+    const authority=new PaperclipRunnerToolAuthority(db,{companyId:f.company.id,issueId:f.issue.id,agentId:f.reviewer.id,runId:f.reviewerRun.id,nativeStageReview:{nativeStageDecisionId:f.context.nativeStageDecisionId,nativeStageAdmissionId:f.context.nativeStageAdmissionId,nativeStageStatusVersion:f.context.nativeStageStatusVersion}});
+    expect(authority.definitions().map(tool=>tool.name)).toContain("resolve_stage_review");expect(authority.definitions().map(tool=>tool.name)).not.toContain("call_api");
+    await expect(authority.execute({tool:"finish_task",callId:randomUUID(),arguments:{}})).rejects.toThrow("may only inspect");
+    if(outcome==="approved") await authority.execute({tool:"resolve_stage_review",callId:randomUUID(),arguments:{id:body.id,outcome,body:body.body}});
+    else ok(await request(f.reviewerApp).post(url).send(body));
+    const retry=await request(f.reviewerApp).post(url).send(body);ok(retry);expect(retry.body.replayed).toBe(true);
+    expect(await authority.execute({tool:"resolve_stage_review",callId:randomUUID(),arguments:{id:body.id,outcome,body:body.body}})).toMatchObject({replayed:true});authority.close();
+    expect((await request(f.reviewerApp).post(url).send({...body,body:"Altered replay"})).status).toBe(409);
+    expect(await f.read()).toMatchObject({status:outcome==="approved"?"in_review":"in_progress",assigneeAgentId:outcome==="approved"?null:f.builder.id,assigneeUserId:outcome==="approved"?f.userId:null,executionRunId:f.reviewerRun.id});
+    expect((await f.ledger()).admissions).toHaveLength(1);expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.createdByRunId,f.reviewerRun.id))).toHaveLength(1);
+    expect(await nativeStageReviewOutcome(db,{companyId:f.company.id,issueId:f.issue.id,agentId:f.reviewer.id,runId:f.reviewerRun.id,contextSnapshot:f.context})).toBe("resolved");
+    if(outcome==="changes_requested") {
+      const [returnIntent]=await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey,`native-stage-decision:${body.id}`));
+      expect(returnIntent).toMatchObject({requestedByActorType:"system",requestedByActorId:"native-status-committer",agentId:f.builder.id,status:"queued"});
+    }
+  });
+  it("counts five manual Builder candidates, holds fifth, records one allowance, restarts same Reviewer and retains decision/audit history", async () => {
+    const f = await seed();
+    for (let n=1;n<=5;n++) {
+      await f.run(f.builder.id);
+      ok(await patch(f.board,f.issue.id,{ status: "done", reviewCycleSubmissionId: randomUUID() }));
+      expect((await f.read()).assigneeAgentId).toBe(f.reviewer.id);
+      const reviewRun=await f.run(f.reviewer.id);
+      ok(await patch(await f.agentApp(f.reviewer.id,reviewRun.id),f.issue.id,{ status: "in_progress", comment: `Correction ${n}` }));
+      expect((await f.ledger()).admissions).toHaveLength(n);
+    }
+    const held=await f.read(); expect(held.status).toBe("in_review"); expect(held.assigneeUserId).toBe(f.userId);
+    expect(held.executionState).toMatchObject({ totalReviewBudgetHold: true, totalReviewCyclesUsed:5 });
+    const { issueService }=await import("../services/issues.js");
+    const claimRun=await f.run(f.builder.id,"running");
+    await expect(issueService(db).checkout(f.issue.id,f.builder.id,["in_review"],claimRun.id)).rejects.toThrow();
+    expect((await f.read()).assigneeUserId).toBe(f.userId);
+    // Retire this synthetic fixture run so the following allowance does not need executor stop.
+    await db.update(heartbeatRuns).set({status:"succeeded"}).where(eq(heartbeatRuns.id,claimRun.id));
+    const receipt={id:randomUUID(),additionalCycles:1,reason:"One explicit additional correction"};
+    ok(await patch(f.board,f.issue.id,{ reviewCycleAllowance:receipt }));
+    expect((await f.ledger()).allowances).toHaveLength(1);
+    expect((await f.read()).assigneeAgentId).toBe(f.builder.id);
+    await f.run(f.builder.id); ok(await patch(f.board,f.issue.id,{status:"done",reviewCycleSubmissionId:randomUUID()}));
+    expect((await f.read()).assigneeAgentId).toBe(f.reviewer.id); expect((await f.ledger()).admissions).toHaveLength(6);
+    const decisions=await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId,f.issue.id)); expect(decisions).toHaveLength(5);
+    const audit=await db.select().from(activityLog).where(and(eq(activityLog.entityId,f.issue.id),eq(activityLog.action,"issue.updated")));
+    expect(audit.some(e=>(e.details as any)?.reviewCycleAllowance?.id===receipt.id)).toBe(true);
+  }, 90000);
+  it("native status committer admits accepted Builder completion, durably wakes selected Reviewer once and replays without another cycle", async () => {
+    const {f,runId,resultId,nativeSha256,resultJson,commitNativeStatusDecision,input}=await nativeCandidate();
+    const first=await commitNativeStatusDecision(input);
+    expect(first.issue).toMatchObject({status:"in_review",assigneeAgentId:f.reviewer.id,checkoutRunId:null});
+    expect((await f.ledger()).admissions[0]).toMatchObject({id:resultId,builderRunId:runId,candidateId:`native-result:${resultId}:${nativeSha256(resultJson)}`});
+    const wakes=await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId,f.company.id),eq(agentWakeupRequests.agentId,f.reviewer.id)));
+    expect(wakes).toHaveLength(1); expect(wakes[0].payload).toMatchObject({executionStage:{wakeRole:"reviewer",allowedActions:["approve","request_changes"]}});
+    expect((await db.select().from(statusDecisionEffects).where(eq(statusDecisionEffects.decisionId,first.decision.id))).some(e=>e.effectKind==="execution_stage_wake")).toBe(true);
+    const replay=await commitNativeStatusDecision(input); expect(replay.replayed).toBe(true);
+    expect((await f.ledger()).admissions).toHaveLength(1);
+    expect(await db.select().from(statusDecisions).where(eq(statusDecisions.issueId,f.issue.id))).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId,f.company.id),eq(agentWakeupRequests.agentId,f.reviewer.id)))).toHaveLength(1);
+  });
+  it("native Builder candidates share the same five-total hold as normal HTTP review corrections", async () => {
+    const f=await seed();
+    for(let n=1;n<=5;n++) {
+      const native=await nativeCandidate(f); await native.commitNativeStatusDecision(native.input);
+      expect((await f.read()).assigneeAgentId).toBe(f.reviewer.id);
+      const reviewerRun=await f.run(f.reviewer.id);
+      ok(await patch(await f.agentApp(f.reviewer.id,reviewerRun.id),f.issue.id,{status:"in_progress",comment:`Native candidate correction ${n}`}));
+      expect((await f.ledger()).admissions).toHaveLength(n);
+    }
+    expect(await f.read()).toMatchObject({status:"in_review",assigneeAgentId:null,assigneeUserId:f.userId,executionState:{totalReviewBudgetHold:true,totalReviewCyclesUsed:5}});
+    expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId,f.issue.id))).toHaveLength(5);
+  },90000);
+  it("native projection failure rolls back decision, ledger, task and Reviewer wake", async () => {
+    const {f,input,commitNativeStatusDecision}=await nativeCandidate();
+    await expect(commitNativeStatusDecision({...input,failpoint:"status_projection"})).rejects.toThrow("native_status_failpoint:status_projection");
+    expect(await f.ledger()).toBeUndefined(); expect((await f.read()).status).toBe("in_progress");
+    expect(await db.select().from(statusDecisions).where(eq(statusDecisions.issueId,f.issue.id))).toHaveLength(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId,f.company.id))).toHaveLength(0);
+  });
+  it("native rejected result cannot supply a review admission", async () => {
+    const {f,input,resultId,commitNativeStatusDecision}=await nativeCandidate();
+    await db.update(nativeRunResults).set({schemaStatus:"rejected"}).where(eq(nativeRunResults.id,resultId));
+    await expect(commitNativeStatusDecision(input)).rejects.toThrow("accepted bound Builder result");
+    expect(await f.ledger()).toBeUndefined(); expect((await f.read()).status).toBe("in_progress");
+  });
+  it("native completion-review attention conflicts are explicit rather than creating a second review engine", async () => {
+    const {f,input,commitNativeStatusDecision}=await nativeCandidate();
+    await expect(commitNativeStatusDecision({...input,decision:{...input.decision,statusAction:"in_review",toStatus:"in_review",effects:[{kind:"bind_reviewer",ownerAgentId:f.reviewer.id,prompt:"Different native completion review"}]}})).rejects.toThrow("shared-owner adapter");
+    expect(await f.ledger()).toBeUndefined(); expect((await f.read()).status).toBe("in_progress");
+  });
+  it("native Reviewer terminal report preserves its pending stage without approving or spending another cycle", async () => {
+    const first=await nativeCandidate(); await first.commitNativeStatusDecision(first.input);
+    const second=await nativeCandidate(first.f,first.f.reviewer.id);
+    const result=await second.commitNativeStatusDecision({...second.input,decision:{...second.input.decision,statusAction:"in_review",toStatus:"in_review",reasonCode:"governed_gate_pending",effects:[{kind:"create_interaction",gate:{kind:"execution_stage",id:second.runId}}]}});
+    expect(result.issue.executionState).toMatchObject({status:"pending",currentParticipant:{type:"agent",agentId:first.f.reviewer.id}});
+    expect((await first.f.ledger()).admissions).toHaveLength(1);
+    expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId,first.f.issue.id))).toHaveLength(0);
+    expect(await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId,first.f.company.id),eq(agentWakeupRequests.agentId,first.f.reviewer.id)))).toHaveLength(1);
+  });
+  it("actual tiny Git quarantine restore preserves pending Reviewer and the original cycle ledger", async () => {
+    const f=await seed(); await f.run(f.builder.id);
+    ok(await patch(f.board,f.issue.id,{status:"done",reviewCycleSubmissionId:randomUUID()}));
+    const fixture=path.resolve(fileURLToPath(new URL("../../../../",import.meta.url)),"private",`quarantine-${randomUUID()}`);
+    const repo=path.join(fixture,"repo"),work=path.join(fixture,"work"); await fs.mkdir(repo,{recursive:true});
+    const exec=promisify(execFile),git=async(cwd:string,args:string[]) => (await exec("git",["-c","core.hooksPath=/dev/null","-c","commit.gpgsign=false","-C",cwd,...args])).stdout.trim();
+    await git(repo,["init"]); await git(repo,["config","user.name","Paperclip Synthetic Fixture"]); await git(repo,["config","user.email","fixture@example.test"]);
+    await fs.writeFile(path.join(repo,"README.md"),"Synthetic source candidate\n"); await git(repo,["add","README.md"]); await git(repo,["commit","-m","Synthetic candidate"]); await git(repo,["branch","-M","main"]);
+    await git(repo,["branch","feature/recorded"]); await git(repo,["worktree","add","-b","feature/live",work,"feature/recorded"]);
+    await fs.appendFile(path.join(work,"README.md"),"Retained synthetic dirty work\n");
+    const [project]=await db.insert(projects).values({companyId:f.company.id,name:"Synthetic quarantine project",status:"in_progress"}).returning();
+    const [primary]=await db.insert(projectWorkspaces).values({companyId:f.company.id,projectId:project.id,name:"Synthetic primary",cwd:repo,isPrimary:true}).returning();
+    const [workspace]=await db.insert(executionWorkspaces).values({companyId:f.company.id,projectId:project.id,projectWorkspaceId:primary.id,sourceIssueId:f.issue.id,mode:"isolated_workspace",strategyType:"git_worktree",providerType:"git_worktree",name:"feature/recorded",branchName:"feature/recorded",baseRef:"main",cwd:work,providerRef:work,status:"active"}).returning();
+    await db.update(issues).set({status:"blocked",assigneeAgentId:f.builder.id,projectId:project.id,projectWorkspaceId:primary.id,executionWorkspaceId:workspace.id}).where(eq(issues.id,f.issue.id));
+    const { executionWorkspaceService }=await import("../services/execution-workspaces.js");
+    const restored=await executionWorkspaceService(db).reconcileExecutionWorkspaceBranch(workspace.id,{mode:"quarantine_restore",reason:"Retain synthetic dirty work and restore recorded branch",actor:{actorType:"user",actorId:f.userId,agentId:null,runId:null}});
+    expect(restored.restoredSourceIssue).toMatchObject({status:"in_review",assigneeAgentId:f.reviewer.id});
+    expect((await f.ledger()).admissions).toHaveLength(1);
+    expect(await git(work,["branch","--show-current"])).toBe("feature/recorded");
+    expect(await git(work,["status","--porcelain"])).toBe("");
+    expect(await git(repo,["branch","--list","paperclip/rescue/*"])).not.toBe("");
+  },90000);
+  it("native recovery hand-back preserves total ledger and requires fresh same-Reviewer review after correction", async () => {
+    const f=await seed(); await f.run(f.builder.id);
+    ok(await patch(f.board,f.issue.id,{status:"done",reviewCycleSubmissionId:randomUUID()}));
+    const reviewRun=await f.run(f.reviewer.id);
+    ok(await patch(await f.agentApp(f.reviewer.id,reviewRun.id),f.issue.id,{status:"in_progress",comment:"Correct this candidate before retry"}));
+    // Synthetic environmental failure; recovery itself uses actual native HTTP/service gates.
+    await db.update(issues).set({status:"blocked",executionRunId:null,checkoutRunId:null}).where(eq(issues.id,f.issue.id));
+    const [action]=await db.insert(issueRecoveryActions).values({companyId:f.company.id,sourceIssueId:f.issue.id,kind:"active_run_watchdog",ownerType:"board",ownerUserId:f.userId,returnOwnerAgentId:f.builder.id,cause:"synthetic_fixture_repair",fingerprint:randomUUID(),nextAction:"Repair synthetic fixture",evidence:{}}).returning();
+    const response=await request(f.board).post(`/api/issues/${f.issue.id}/recovery-actions/resolve`).send({actionId:action.id,outcome:"restored",sourceIssueStatus:"todo",resolutionNote:"Synthetic environmental repair confirmed; candidate still requires independent review."});
+    ok(response); expect((await f.ledger()).admissions).toHaveLength(1);
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id,action.id)))[0].status).toBe("resolved");
+    await f.run(f.builder.id); ok(await patch(f.board,f.issue.id,{status:"done",reviewCycleSubmissionId:randomUUID()}));
+    expect((await f.read()).assigneeAgentId).toBe(f.reviewer.id); expect((await f.ledger()).admissions).toHaveLength(2);
+  });
+  it("unadapted native setter fails closed; Reviewer release retains stage assignment and total ledger", async () => {
+    const f=await seed(); await f.run(f.builder.id);
+    ok(await patch(f.board,f.issue.id,{status:"done",reviewCycleSubmissionId:randomUUID()}));
+    const { issueService }=await import("../services/issues.js");
+    await expect(issueService(db).update(f.issue.id,{status:"done"})).rejects.toThrow("locked task-wide review budget adapter");
+    const run=await f.run(f.reviewer.id);
+    await db.update(issues).set({status:"in_progress",checkoutRunId:run.id,executionRunId:run.id}).where(eq(issues.id,f.issue.id));
+    await issueService(db).release(f.issue.id,f.reviewer.id,run.id);
+    expect(await f.read()).toMatchObject({status:"in_review",assigneeAgentId:f.reviewer.id,checkoutRunId:null});
+    expect((await f.ledger()).admissions).toHaveLength(1);
+  });
+  it("native approval comment advances the same Reviewer stage atomically without another cycle", async () => {
+    const f=await seed(); await f.run(f.builder.id);
+    ok(await patch(f.board,f.issue.id,{status:"done",reviewCycleSubmissionId:randomUUID()}));
+    const reviewerRun=await f.run(f.reviewer.id);
+    const app=await f.agentApp(f.reviewer.id,reviewerRun.id);
+    const response=await request(app).post(`/api/issues/${f.issue.id}/comments`).send({body:"## Review: APPROVED\nChecked this candidate."});
+    expect(response.status,JSON.stringify(response.body)).toBe(201);
+    expect((await f.read()).assigneeUserId).toBe(f.userId); expect((await f.ledger()).admissions).toHaveLength(1);
+    const decisions=await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId,f.issue.id));
+    expect(decisions).toHaveLength(1); expect(decisions[0].outcome).toBe("approved");
+    const audit=await db.select().from(activityLog).where(eq(activityLog.entityId,f.issue.id));
+    expect(audit.some(e=>(e.details as any)?.source==="auto_approval_comment")).toBe(true);
+  });
+  it("does not admit or mutate a candidate when native active-run stop is unconfirmed", async () => {
+    const f=await seed(); executionFixture.rejectStop=true; const run=await f.run(f.builder.id,"running");
+    await db.update(issues).set({checkoutRunId:run.id,executionRunId:run.id}).where(eq(issues.id,f.issue.id));
+    const response=await patch(f.board,f.issue.id,{status:"done",reviewCycleSubmissionId:randomUUID()});
+    expect(response.status).toBe(500); expect(response.body.error).toContain("Unconfirmed executor stop"); executionFixture.rejectStop=false;
+    expect(await f.ledger()).toBeUndefined(); expect((await f.read()).status).toBe("in_progress");
+  });
+  it("derives automatic receipt from authenticated Builder run and duplicate submit does not charge twice", async () => {
+    const f=await seed(), run=await f.run(f.builder.id,"running"), app=await f.agentApp(f.builder.id,run.id);
+    await db.update(issues).set({checkoutRunId:run.id,executionRunId:run.id}).where(eq(issues.id,f.issue.id));
+    ok(await patch(app,f.issue.id,{status:"done",reviewCycleSubmissionId:randomUUID()}));
+    expect((await f.ledger()).admissions[0]).toMatchObject({id:run.id,builderRunId:run.id,builderAgentId:f.builder.id});
+    const response=await patch(app,f.issue.id,{status:"done"});
+    // The old Builder no longer owns the pending Reviewer stage; native refusal is retained.
+    expect([200,403,409,422]).toContain(response.status); expect((await f.ledger()).admissions).toHaveLength(1);
+  });
+  it("native completion-review history without legacy decisions cannot receive a new five-cycle ledger",async()=>{
+    const f=await seed();
+    const policy=structuredClone(f.issue.executionPolicy) as any;delete policy.totalReviewCycles;
+    await db.update(issues).set({executionPolicy:policy}).where(eq(issues.id,f.issue.id));
+    const c=await nativeCandidate(f);
+    await c.commitNativeStatusDecision({...c.input,decision:{...c.input.decision,statusAction:"in_review",toStatus:"in_review",reasonCode:"actionable_attention_pending",effects:[{kind:"bind_reviewer",ownerAgentId:f.reviewer.id,prompt:"Native prior review"}]}});
+    await db.update(issues).set({executionPolicy:f.issue.executionPolicy}).where(eq(issues.id,f.issue.id));
+    expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId,f.issue.id))).toHaveLength(0);
+    const context=await (await import("../services/review-cycle-budget-store.js")).readReviewBudgetPreviewContext(db,{companyId:f.company.id,issueId:f.issue.id});
+    expect(context.reviewCycleBudget).toBeNull();expect(context.reviewCycleInitializationAuthorized).toBe(false);
+  });
+  it("concurrent native commit and lost-reply replay spend one candidate and persist one Reviewer wake",async()=>{
+    const c=await nativeCandidate();const results=await Promise.allSettled([c.commitNativeStatusDecision(c.input),c.commitNativeStatusDecision(c.input)]);
+    expect(results.some(result=>result.status==="fulfilled"),JSON.stringify(results.map(result=>result.status==="rejected"?{name:result.reason?.name,message:result.reason?.message,code:result.reason?.code,stack:result.reason?.stack}:"fulfilled"))).toBe(true);
+    expect((await c.f.ledger()).admissions).toHaveLength(1);
+    expect(await db.select().from(statusDecisions).where(eq(statusDecisions.issueId,c.f.issue.id))).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId,c.f.company.id))).toHaveLength(1);
+    expect((await c.commitNativeStatusDecision(c.input)).replayed).toBe(true);
+  });
+  it.each(["admissionId","sourceDecisionId","expectedStatusVersion","stageId"] as const)("historical stage replay refuses altered %s and never changes its budget",async field=>{
+    const f=await stageFixture(),{getNativeStageReviewAssignment,decideNativeStageReview}=await (async()=>({...await import("../services/native-runtime/native-stage-review.js"),...await import("../services/native-runtime/native-stage-review-decision.js")}))();
+    const proof=(await getNativeStageReviewAssignment(db,{companyId:f.company.id,issueId:f.issue.id,agentId:f.reviewer.id,runId:f.reviewerRun.id,contextSnapshot:f.context}))!;
+    const requestBody={id:randomUUID(),stageId:proof.stage.id,admissionId:proof.admission.id,sourceDecisionId:proof.sourceDecision.id,expectedStatusVersion:proof.issue.statusVersion,outcome:"changes_requested" as const,body:"Exact receipt finding"};
+    const input={companyId:f.company.id,issueId:f.issue.id,agentId:f.reviewer.id,runId:f.reviewerRun.id,request:requestBody};
+    await decideNativeStageReview(db,input);
+    await expect(decideNativeStageReview(db,{...input,request:{...requestBody,[field]:field==="expectedStatusVersion"?requestBody.expectedStatusVersion+1:randomUUID()}})).rejects.toMatchObject({status:409});
+    expect((await f.ledger()).admissions).toHaveLength(1);
+  });
+
+  it.each(["title","executionPolicy"])("refuses allowance combined with %s before any task or ledger effect",async field=>{
+    const f=await seed(),before=await f.read();
+    const response=await patch(f.board,f.issue.id,{reviewCycleAllowance:{id:randomUUID(),additionalCycles:1,reason:"Separate operation required"},[field]:field==="title"?"Changed title":{...f.issue.executionPolicy as any,stages:[]}});
+    expect(response.status).toBe(422);expect(await f.read()).toEqual(before);expect(await f.ledger()).toBeUndefined();
+  });
+
+  it.each(["stage","scoped"] as const)("protected %s admission reaches actual HTTP verdict and retains F05 policy/process boundaries",async kind=>{
+    const f=kind==="stage"?await stageFixture():await reviewingDraftFixture();const protectedRun=await qualifyProtectedReview(f);
+    try {
+      expect(protectedRun.admission.record.assignment.kind).toBe(kind==="stage"?"execution_stage_review":"scoped_review");
+      const app=await appFor(protectedRun.actor,true);
+      expect((await patch(app,f.issue.id,{status:"done"})).status).toBe(403);
+      if(kind==="stage") {
+        const stage=f as Awaited<ReturnType<typeof stageFixture>>;
+        const body={id:randomUUID(),stageId:protectedRun.admission.record.assignment.kind==="execution_stage_review"?protectedRun.admission.record.assignment.stageId:"",admissionId:stage.context.nativeStageAdmissionId,sourceDecisionId:stage.context.nativeStageDecisionId,expectedStatusVersion:stage.context.nativeStageStatusVersion,outcome:"approved",body:"Protected native stage approved"};
+        const url=`/api/issues/${f.issue.id}/execution-stage-review/decisions`;
+        ok(await request(app).post(url).send(body));ok(await request(app).post(url).send(body));
+        expect((await request(app).post(url).send({...body,admissionId:randomUUID()})).status).toBe(403);
+        expect((await f.read()).assigneeUserId).toBe(f.userId);
+      } else {
+        const scope=f as Awaited<ReturnType<typeof reviewingDraftFixture>>;
+        ok(await request(app).post(`/api/issues/${f.issue.id}/interactions/${scope.scope.interactionId}/accept`).send({}));
+        expect((await f.read()).status).not.toBe("done");expect((await f.read()).assigneeAgentId).toBe(f.builder.id);
+      }
+      expect((await f.ledger()).admissions).toHaveLength(1);
+    } finally {await protectedRun.close();}
+  });
+  it.each(["responsible_operator","authorizing_operator","responsible_viewer","authorizing_viewer"])("protected stage keeps native delegated mutation ceiling: %s",async mode=>{
+    const f=await stageFixture(),protectedRun=await qualifyProtectedReview(f);
+    try {
+      const user=`delegated-${randomUUID()}`;await db.insert(authUsers).values({id:user,name:"Delegated fixture",email:`${user}@example.test`,createdAt:new Date(),updatedAt:new Date()});
+      await db.insert(companyMemberships).values({companyId:f.company.id,principalType:"user",principalId:user,status:"active",membershipRole:mode.endsWith("operator")?"operator":"viewer"});
+      const actor={...protectedRun.actor,...(mode.startsWith("authorizing")?{authorizingUserId:user}:{onBehalfOfUserId:user})};
+      const proof=(await (await import("../services/native-runtime/native-stage-review.js")).getNativeStageReviewAssignment(db,{companyId:f.company.id,issueId:f.issue.id,agentId:f.reviewer.id,runId:f.reviewerRun.id,contextSnapshot:f.context}))!;
+      const body={id:randomUUID(),stageId:proof.stage.id,admissionId:proof.admission.id,sourceDecisionId:proof.sourceDecision.id,expectedStatusVersion:proof.issue.statusVersion,outcome:"changes_requested" as const,body:"Delegated native verdict"};
+      const {decideNativeStageReview}=await import("../services/native-runtime/native-stage-review-decision.js");
+      const operation=decideNativeStageReview(db,{companyId:f.company.id,issueId:f.issue.id,agentId:f.reviewer.id,runId:f.reviewerRun.id,request:body,actor});
+      if(mode.endsWith("operator"))await expect(operation).resolves.toMatchObject({replayed:false});
+      else {await expect(operation).rejects.toMatchObject({status:403});expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.createdByRunId,f.reviewerRun.id))).toHaveLength(0);}
+    } finally {await protectedRun.close();}
+  });
+
+  it("historical native stage replay still checks the current actor and delegated mutation ceiling",async()=>{
+    const f=await stageFixture();const {getNativeStageReviewAssignment,nativeStageReviewOutcome}=await import("../services/native-runtime/native-stage-review.js");
+    const {decideNativeStageReview}=await import("../services/native-runtime/native-stage-review-decision.js");
+    const proof=(await getNativeStageReviewAssignment(db,{companyId:f.company.id,issueId:f.issue.id,agentId:f.reviewer.id,runId:f.reviewerRun.id,contextSnapshot:f.context}))!;
+    const input={companyId:f.company.id,issueId:f.issue.id,agentId:f.reviewer.id,runId:f.reviewerRun.id,request:{id:randomUUID(),stageId:proof.stage.id,admissionId:proof.admission.id,sourceDecisionId:proof.sourceDecision.id,expectedStatusVersion:proof.issue.statusVersion,outcome:"changes_requested" as const,body:"Original exact verdict"}};
+    await decideNativeStageReview(db,input);
+    const user=`replay-viewer-${randomUUID()}`;await db.insert(authUsers).values({id:user,name:"Replay viewer",email:`${user}@example.test`,createdAt:new Date(),updatedAt:new Date()});
+    await db.insert(companyMemberships).values({companyId:f.company.id,principalType:"user",principalId:user,status:"active",membershipRole:"viewer"});
+    const actor={type:"agent" as const,agentId:f.reviewer.id,runId:f.reviewerRun.id,companyId:f.company.id,source:"agent_jwt" as const,onBehalfOfUserId:user};
+    await expect(decideNativeStageReview(db,{...input,actor})).rejects.toMatchObject({status:403});
+    await expect(decideNativeStageReview(db,{...input,actor:{...actor,agentId:f.builder.id}})).rejects.toMatchObject({status:403});
+    expect(await nativeStageReviewOutcome(db,{...input,contextSnapshot:{...f.context,nativeStageAdmissionId:randomUUID()}})).toBe("stale");
+    expect((await f.ledger()).admissions).toHaveLength(1);
+  });
+  it.each([false,true])("stage-only actual executor suppresses generic GitHub preparation before stale=%s backend admission",async stale=>{
+    const f=await stageFixture();const {materializeAsset}=await import("../services/native-runtime/runtime-context.js");
+    const {nativeRuntimeContextFixture}=await import("../services/native-runtime/runtime-context.test-fixture.js");
+    const {parseNativeExecutionInput,canonicalNativeRuntimeContextDigest}=await import("../vendor/paperclip-runner/index.js");
+    const runtime=nativeRuntimeContextFixture();runtime.instructions={entryPath:"AGENTS.md",bundle:await materializeAsset([{path:"AGENTS.md",content:Buffer.from("Synthetic stage preparation test"),mode:0o400}])};runtime.aggregateDigest=canonicalNativeRuntimeContextDigest(runtime);
+    const execution=parseNativeExecutionInput({...f.execution,binding:{...f.execution.binding,agentId:f.reviewer.id,runId:f.reviewerRun.id},runtimeContext:runtime});
+    await db.update(heartbeatRuns).set({completionContractId:execution.completionContract.id,completionContractSha256:execution.completionContract.sha256,runnerProfileJson:{nativeExecutionInput:execution}}).where(eq(heartbeatRuns.id,f.reviewerRun.id));
+    await db.insert(nativeRunFinalizations).values({runId:f.reviewerRun.id,companyId:f.company.id,issueId:f.issue.id,phase:"executing"});
+    if(stale)await db.update(issues).set({statusVersion:sql`${issues.statusVersion}+1`}).where(eq(issues.id,f.issue.id));
+    const github=await import("../services/native-runtime/native-github-access.js");const access=vi.spyOn(github,"createNativeGitHubAccess").mockImplementation(async()=>{throw new Error("Generic GitHub must not prepare a stage run");});
+    const backend={descriptor:vi.fn(async()=>{throw new Error("bounded_stage_backend_reached");}),openSession:vi.fn(async()=>{throw new Error("provider_must_not_start");})};
+    try {
+      const result=await (await import("../services/native-runtime/native-session-executor.js")).executePaperclipNativeSession({db,execution,managedGitHub:true,backend,runnerInstanceId:randomUUID()}).catch(error=>error);
+      expect(access).not.toHaveBeenCalled();expect(backend.openSession).not.toHaveBeenCalled();
+      if(stale)expect(result).toMatchObject({code:"native_provider_state_incompatible"});
+      else expect(backend.descriptor,result instanceof Error?result.stack:JSON.stringify(result)).toHaveBeenCalled();
+    } finally {access.mockRestore();}
+  });
+
+  it("concurrent fifth manual submissions serialize to one debit and the selected human hold",async()=>{
+    const f=await seed();
+    for(let cycle=0;cycle<4;cycle++) {
+      await f.run(f.builder.id);ok(await patch(f.board,f.issue.id,{status:"done",reviewCycleSubmissionId:randomUUID()}));
+      const reviewer=await f.run(f.reviewer.id);ok(await patch(await f.agentApp(f.reviewer.id,reviewer.id),f.issue.id,{status:"in_progress",comment:"Correction required"}));
+    }
+    await f.run(f.builder.id);
+    const results=await Promise.all([patch(f.board,f.issue.id,{status:"done",reviewCycleSubmissionId:randomUUID()}),patch(f.board,f.issue.id,{status:"done",reviewCycleSubmissionId:randomUUID()})]);
+    expect(results.filter(result=>result.status===200)).toHaveLength(1);
+    expect(results.some(result=>[409,422].includes(result.status))).toBe(true);
+    expect((await f.ledger()).admissions).toHaveLength(5);
+    const reviewer=await f.run(f.reviewer.id);ok(await patch(await f.agentApp(f.reviewer.id,reviewer.id),f.issue.id,{status:"in_progress",comment:"Fifth unresolved candidate"}));
+    expect(await f.read()).toMatchObject({status:"in_review",assigneeUserId:f.userId,executionState:{totalReviewBudgetHold:true,totalReviewCyclesUsed:5}});
+  });
+
+  it("native nested stage setter rolls back its verdict, task and return wake on outer audit failure",async()=>{
+    const f=await stageFixture(),{getNativeStageReviewAssignment}=await import("../services/native-runtime/native-stage-review.js");
+    const {decideNativeStageReview}=await import("../services/native-runtime/native-stage-review-decision.js");
+    const proof=(await getNativeStageReviewAssignment(db,{companyId:f.company.id,issueId:f.issue.id,agentId:f.reviewer.id,runId:f.reviewerRun.id,contextSnapshot:f.context}))!;
+    const input={companyId:f.company.id,issueId:f.issue.id,agentId:f.reviewer.id,runId:f.reviewerRun.id,request:{id:randomUUID(),stageId:proof.stage.id,admissionId:proof.admission.id,sourceDecisionId:proof.sourceDecision.id,expectedStatusVersion:proof.issue.statusVersion,outcome:"changes_requested" as const,body:"Audit atomicity"}};
+    const before=await f.read(),ledger=await f.ledger();
+    await db.execute(sql.raw(`create function f06_stage_audit_failure() returns trigger language plpgsql as $$ begin if new.action='issue.execution_stage_decided' then raise exception 'synthetic_f06_outer_audit_failure'; end if; return new; end $$; create trigger f06_stage_audit_failure before insert on activity_log for each row execute function f06_stage_audit_failure();`));
+    try {await expect(decideNativeStageReview(db,input)).rejects.toMatchObject({cause:{message:"synthetic_f06_outer_audit_failure"}});}
+    finally {await db.execute(sql.raw("drop trigger f06_stage_audit_failure on activity_log; drop function f06_stage_audit_failure();"));}
+    expect(await f.read()).toEqual(before);expect(await f.ledger()).toEqual(ledger);
+    expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.id,input.request.id))).toHaveLength(0);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey,`native-stage-decision:${input.request.id}`))).toHaveLength(0);
+    expect((await decideNativeStageReview(db,input)).replayed).toBe(false);
+  });
+
+  it("terminal scoped cancellation retains every lost-reply target and refuses Builder return without native termination proof",async()=>{
+    const f=await reviewingDraftFixture(),url=`/api/issues/${f.issue.id}/scoped-reviews/${f.scope.id}/cancel`,body={requestId:randomUUID(),expectedVersion:1,reason:"Stop exact partial review"};
+    executionFixture.loseStopReply=true;
+    try {expect((await request(f.board).post(url).send(body)).status).toBe(500);}finally{executionFixture.loseStopReply=false;}
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,f.reviewerRun.id)))[0].status).toBe("cancelled");
+    // Model native lock release arriving before the missing physical receipt.
+    await db.update(issues).set({executionRunId:null}).where(eq(issues.id,f.issue.id));
+    executionFixture.suppressStopProof=true;
+    try {const denied=await request(f.board).post(url).send(body);expect(denied.status,JSON.stringify(denied.body)).toBe(409);expect(denied.body.details.code).toBe("scoped_review_stop_unsettled");}
+    finally {executionFixture.suppressStopProof=false;}
+    let [scope]=await db.select().from(issueScopedReviews).where(eq(issueScopedReviews.id,f.scope.id));
+    expect(scope).toMatchObject({state:"cancelling",returnWakeupId:null,cancellation:{targetRunIds:[f.reviewerRun.id]}});
+    expect((await f.ledger()).admissions).toHaveLength(1);
+    ok(await request(f.board).post(url).send(body));ok(await request(f.board).post(url).send(body));
+    [scope]=await db.select().from(issueScopedReviews).where(eq(issueScopedReviews.id,f.scope.id));
+    expect(scope).toMatchObject({state:"cancelled",cancellation:{targetRunIds:[f.reviewerRun.id]}});
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.idempotencyKey,`native-scoped-return:${f.scope.id}:cancelled`))).toHaveLength(1);
+    const [returned]=await db.insert(heartbeatRuns).values({companyId:f.company.id,agentId:f.builder.id,runtimeMode:"native",nativeIssueId:f.issue.id,issueId:f.issue.id,scopeKind:"issue",status:"queued",wakeupRequestId:scope.returnWakeupId,contextSnapshot:{issueId:f.issue.id,scopedReviewId:scope.id}}).returning();
+    const {assertScopedRunAdmission}=await import("../services/scoped-review-admission.js");const reader=(await import("../services/heartbeat.js")).heartbeatService(db).readRunTerminationProof;
+    await expect(assertScopedRunAdmission(db,{companyId:f.company.id,issueId:f.issue.id,runId:returned.id},{readRunTerminationProof:reader})).resolves.toBeUndefined();
+    await db.update(heartbeatRuns).set({processPid:process.pid,processGroupId:null,processStartedAt:new Date()}).where(eq(heartbeatRuns.id,f.reviewerRun.id));
+    await expect(assertScopedRunAdmission(db,{companyId:f.company.id,issueId:f.issue.id,runId:returned.id},{readRunTerminationProof:reader})).rejects.toMatchObject({details:{code:"scoped_review_stop_unsettled"}});
+  });
+
+  it("queued context-only scoped Stop uses native never-dispatched proof and refuses a foreign task binding",async()=>{
+    const f=await admittedDraftFixture();
+    const [queued]=await db.insert(heartbeatRuns).values({companyId:f.company.id,agentId:f.reviewer.id,status:"queued",responsibleUserId:f.userId,
+      contextSnapshot:{taskId:f.issue.id,nativeReviewInteractionId:f.scope.interactionId}}).returning();
+    const body={requestId:randomUUID(),expectedVersion:1,reason:"Withdraw queued partial review"};
+    ok(await request(f.board).post(`/api/issues/${f.issue.id}/scoped-reviews/${f.scope.id}/cancel`).send(body));
+    const [scope]=await db.select().from(issueScopedReviews).where(eq(issueScopedReviews.id,f.scope.id));
+    expect(scope).toMatchObject({state:"cancelled",cancellation:{targetRunIds:[queued.id]}});
+    const reader=(await import("../services/heartbeat.js")).heartbeatService(db).readRunTerminationProof;
+    expect(await reader({companyId:f.company.id,runId:queued.id})).toMatchObject({runId:queued.id,issueId:f.issue.id,proof:"never_dispatched"});
+    const [returned]=await db.insert(heartbeatRuns).values({companyId:f.company.id,agentId:f.builder.id,runtimeMode:"native",nativeIssueId:f.issue.id,issueId:f.issue.id,status:"queued",wakeupRequestId:scope.returnWakeupId,contextSnapshot:{issueId:f.issue.id,scopedReviewId:scope.id}}).returning();
+    const {assertScopedRunAdmission}=await import("../services/scoped-review-admission.js");
+    await expect(assertScopedRunAdmission(db,{companyId:f.company.id,issueId:f.issue.id,runId:returned.id},{readRunTerminationProof:reader})).resolves.toBeUndefined();
+    const foreignId=randomUUID();
+    await db.update(heartbeatRuns).set({issueId:null,nativeIssueId:null,contextSnapshot:{taskId:foreignId,nativeReviewInteractionId:f.scope.interactionId}}).where(eq(heartbeatRuns.id,queued.id));
+    const [changedTarget]=await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,queued.id));
+    expect((await import("../services/run-task-binding.js")).boundRunIssueId(changedTarget)).toBe(foreignId);
+    await expect(assertScopedRunAdmission(db,{companyId:f.company.id,issueId:f.issue.id,runId:returned.id},{readRunTerminationProof:reader})).rejects.toMatchObject({details:{code:"scoped_review_return_waiting_release"}});
+  });
+
+});

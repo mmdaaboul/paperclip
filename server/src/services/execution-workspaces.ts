@@ -1,4 +1,5 @@
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
+import { applyLockedReviewBudgetTransition, readReviewBudgetPreviewContext } from "./review-cycle-budget-store.js";
 import { effectiveProjectWorkspacePolicy } from "./project-workspace-provider.js";
 import { readRemoteWorkspaceAuthority, readWorkspaceProviderBinding } from "@paperclipai/shared";
 import { cleanupRemoteWorkspaceAllocation, inspectRemoteWorkspacePersistence, type DestroyRemoteWorkspaceLease } from "./remote-workspace-lifecycle.js";
@@ -5395,7 +5396,7 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
 
           const requestedStatus = quarantineRestoreRequestedSourceStatus(sourceBefore);
           const policy = normalizeIssueExecutionPolicy(sourceBefore.executionPolicy ?? null);
-          const transition = applyIssueExecutionPolicyTransition({
+          const quarantineTransitionInput = {
             issue: sourceBefore,
             policy,
             previousPolicy: policy,
@@ -5406,18 +5407,27 @@ export function executionWorkspaceService(db: Db, opts: ExecutionWorkspaceServic
               userId: input.actor.actorType === "user" ? input.actor.actorId : null,
             },
             commentBody: null,
-          });
+            ...(policy?.totalReviewCycles===5 ? {...await readReviewBudgetPreviewContext(tx,{companyId:sourceBefore.companyId,issueId:sourceBefore.id}),reviewCycleNow:new Date().toISOString()} : {}),
+          };
+          const transition = applyIssueExecutionPolicyTransition(quarantineTransitionInput);
           const { issueService } = await import("./issues.js");
-          const updatedIssue = await issueService(db).update(
-            lockedWorkspace.sourceIssueId,
+          const persistRestoredSource = async (patch: Record<string,unknown>) => issueService(policy?.totalReviewCycles===5?tx as unknown as Db:db).update(
+            sourceBefore.id,
             {
               ...(requestedStatus ? { status: requestedStatus } : {}),
-              ...transition.patch,
+              ...patch,
               actorAgentId: input.actor.agentId ?? null,
               actorUserId: input.actor.actorType === "user" ? input.actor.actorId : null,
             },
             tx,
           );
+          const restoredHolder: {value?: Awaited<ReturnType<typeof persistRestoredSource>>}={};
+          if(policy?.totalReviewCycles===5) await applyLockedReviewBudgetTransition(tx,{companyId:sourceBefore.companyId,issueId:sourceBefore.id,
+            transition:quarantineTransitionInput,expectedPreview:transition,expectedStoredPolicy:policy},async(_sameTx,_source,committed)=>{
+              restoredHolder.value=await persistRestoredSource(committed.patch);
+            });
+          else restoredHolder.value=await persistRestoredSource(transition.patch);
+          const updatedIssue=restoredHolder.value;
           if (!updatedIssue) throw notFound("Source issue not found");
           restoredSourceIssue = {
             id: updatedIssue.id,

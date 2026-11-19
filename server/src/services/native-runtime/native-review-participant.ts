@@ -1,9 +1,15 @@
 import { notifyStatusCardIssueChange } from "../status-card-notifications.js";
 import { notifyAttentionRetentionWork } from "../retention-work-notifications.js";
+import { scopedReviewSnapshotSchema, type ScopedReviewSnapshot } from "@paperclipai/shared";
+import { normalizeIssueExecutionPolicy } from "../issue-execution-policy.js";
+import { assertCurrentScopedArtifact } from "../scoped-reviews.js";
+import { nativeSha256 } from "./canonical.js";
+import { parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 import {
   agents,
   heartbeatRuns,
   issueThreadInteractions,
+  issueScopedReviews,
   issues,
   statusDecisions,
   type Db,
@@ -55,12 +61,16 @@ export type NativeReviewAssignmentFacts = {
     contextSnapshot: Record<string, unknown> | null;
   };
   allowResolvedByRunId?: string;
+  scoped?: {id:string;companyId:string;issueId:string;state:string;snapshot:ScopedReviewSnapshot;
+    interactionId:string|null;sourceDecisionId:string|null;verdictRunId:string|null;artifactCurrent:boolean;
+    currentWorkspaceId:string|null;currentWorkspaceBindingRevision:number;currentPolicySha256:string;sourceExecutionSha256:string};
 };
 
 export type NativeReviewAssignment = {
   interaction: typeof issueThreadInteractions.$inferSelect;
   sourceDecision: typeof statusDecisions.$inferSelect;
   sourceRun: typeof heartbeatRuns.$inferSelect;
+  scopedReview?: typeof issueScopedReviews.$inferSelect;
 };
 
 export function readNativeReviewAssignmentContext(
@@ -83,10 +93,18 @@ function isNativeCompletionReview(interaction: InteractionFacts, decisionId: str
     && target.revisionId === decisionId;
 }
 
+function isScopedNativeReview(interaction:InteractionFacts|null|undefined,decisionId:string|undefined) {
+  return typeof decisionId==="string" && interaction?.payload?.target?.type==="custom" && interaction.payload.target.key==="scoped_review"
+    && interaction.payload.target.revisionId===decisionId;
+}
+
 export function validateNativeReviewAssignmentFacts(input: NativeReviewAssignmentFacts): boolean {
   const { interaction, decision, sourceRun } = input;
   if (!input.agentInvokable) return false;
-  if (input.issueAssigneeAgentId !== sourceRun?.agentId) return false;
+  const isScoped=isScopedNativeReview(interaction,decision?.id);
+  const sameResolvedRun=(interaction?.status==="accepted" || interaction?.status==="rejected")
+    && input.allowResolvedByRunId && interaction.resolvedByRunId===input.allowResolvedByRunId && interaction.resolvedByAgentId===input.agentId;
+  if (input.issueAssigneeAgentId !== sourceRun?.agentId && !(isScoped && sameResolvedRun)) return false;
   if (sourceRun?.agentId === input.agentId) return false;
   if (!interaction || interaction.companyId !== input.companyId || interaction.issueId !== input.issueId) return false;
   if (!decision || decision.companyId !== input.companyId || decision.issueId !== input.issueId) return false;
@@ -97,7 +115,17 @@ export function validateNativeReviewAssignmentFacts(input: NativeReviewAssignmen
   if (interaction.addresseeAgentId !== input.agentId) return false;
   if (interaction.addresseeUserId) return false;
   if (interaction.payload?.toolAction || interaction.payload?.secretProposal) return false;
-  if (!isNativeCompletionReview(interaction, decision.id)) return false;
+  if (!isNativeCompletionReview(interaction, decision.id) && !isScoped) return false;
+  if(isScoped) {
+    const scope=input.scoped;
+    if(!scope || scope.companyId!==input.companyId || scope.issueId!==input.issueId || scope.interactionId!==interaction.id || scope.sourceDecisionId!==decision.id
+      || scope.snapshot.id!==scope.id || scope.snapshot.companyId!==input.companyId || scope.snapshot.issueId!==input.issueId
+      || scope.snapshot.builderAgentId!==sourceRun.agentId || scope.snapshot.builderRunId!==sourceRun.id || scope.snapshot.reviewerAgentId!==input.agentId
+      || scope.snapshot.executionWorkspaceId!==scope.currentWorkspaceId || scope.snapshot.workspaceBindingRevision!==scope.currentWorkspaceBindingRevision || scope.snapshot.policySha256!==scope.currentPolicySha256 || scope.snapshot.executionSha256!==scope.sourceExecutionSha256)
+      return false;
+    if(interaction.status==="pending" ? scope.state!=="pending" || !scope.artifactCurrent
+      : !sameResolvedRun || scope.verdictRunId!==input.allowResolvedByRunId || !["passed","changes_requested","held"].includes(scope.state)) return false;
+  }
 
   if (input.actingRun) {
     const actingContext = readNativeReviewAssignmentContext(
@@ -173,10 +201,16 @@ export async function getNativeReviewAssignment(
     eq(statusDecisions.issueId, input.issueId),
   )).limit(1).then((rows) => rows[0] ?? null);
   if (!interaction || !decision) return null;
+  const scopedTarget=isScopedNativeReview(interaction as InteractionFacts,decision.id);
+  const scopedReview=scopedTarget ? await db.select().from(issueScopedReviews).where(and(eq(issueScopedReviews.companyId,input.companyId),
+    eq(issueScopedReviews.issueId,input.issueId),eq(issueScopedReviews.interactionId,interaction.id),eq(issueScopedReviews.sourceDecisionId,decision.id))).then(rows=>rows[0]??null) : null;
+  if(scopedTarget && !scopedReview) return null;
+  const scopedSnapshot=scopedReview ? scopedReviewSnapshotSchema.safeParse(scopedReview.snapshot) : null;
+  if(scopedSnapshot && !scopedSnapshot.success) return null;
   const sourceRun = await db.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.id, decision.runId),
     eq(heartbeatRuns.companyId, input.companyId),
-    eq(heartbeatRuns.agentId, issue.assigneeAgentId ?? "00000000-0000-0000-0000-000000000000"),
+    eq(heartbeatRuns.agentId, scopedSnapshot?.success ? scopedSnapshot.data.builderAgentId : issue.assigneeAgentId ?? "00000000-0000-0000-0000-000000000000"),
     eq(heartbeatRuns.nativeIssueId, input.issueId),
   )).limit(1).then((rows) => rows[0] ?? null);
   if (!sourceRun) return null;
@@ -189,6 +223,14 @@ export async function getNativeReviewAssignment(
     : undefined;
   if (input.actingRunId && !actingRun) return null;
   const invokability = await evaluateAgentInvokabilityFromDb(db, agent);
+  let scopedFacts:NativeReviewAssignmentFacts["scoped"];
+  if(scopedReview && scopedSnapshot?.success) {
+    let execution;try {execution=parseNativeExecutionInput(sourceRun.runnerProfileJson?.nativeExecutionInput);}catch{return null;}
+    let artifactCurrent=true;
+    try {await assertCurrentScopedArtifact(db,scopedSnapshot.data);}catch{artifactCurrent=false;}
+    scopedFacts={...scopedReview,snapshot:scopedSnapshot.data,artifactCurrent,currentWorkspaceId:issue.executionWorkspaceId,currentWorkspaceBindingRevision:issue.workspaceBindingRevision,
+      currentPolicySha256:nativeSha256(normalizeIssueExecutionPolicy(issue.executionPolicy)),sourceExecutionSha256:nativeSha256(execution)};
+  }
   const valid = validateNativeReviewAssignmentFacts({
     companyId: input.companyId,
     issueId: input.issueId,
@@ -213,8 +255,9 @@ export async function getNativeReviewAssignment(
       : undefined,
     issueExecutionRunId: input.issueExecutionRunId,
     allowResolvedByRunId: input.allowResolvedByRunId,
+    ...(scopedFacts?{scoped:scopedFacts}:{}),
   });
-  return valid ? { interaction, sourceDecision: decision, sourceRun } : null;
+  return valid ? { interaction, sourceDecision: decision, sourceRun, ...(scopedReview?{scopedReview}:{}) } : null;
 }
 
 

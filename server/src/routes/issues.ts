@@ -1,3 +1,13 @@
+import { assertProtectedReviewSubmissionSupported, assertProtectedGenericReviewHandoff } from "../services/review-cycle-protected-reviewer.js";
+import { decideNativeStageReview, nativeStageReviewDecisionSchema } from "../services/native-runtime/native-stage-review-decision.js";
+import { cancelScopedReviewSchema, createScopedReviewSchema } from "@paperclipai/shared";
+import { scopedReviewCancellationService } from "../services/scoped-review-cancellation.js";
+import { assertScopedAllowanceExecutionSettled, isScopedReviewInteraction } from "../services/scoped-review-resolution.js";
+import { scopedReviewService, assertNoActiveScopedControlMutation, SCOPED_CONTROL_FIELDS } from "../services/scoped-reviews.js";
+import { applyLockedReviewBudgetTransition, readReviewBudgetPreviewContext } from "../services/review-cycle-budget-store.js";
+import { normalReviewCycleSubmission } from "../services/review-cycle-http.js";
+import type { TransitionInput, TransitionResult } from "../services/issue-execution-policy.js";
+import { boundRunIssueIdSql } from "../services/run-task-binding.js";
 import { reviewerActorRestricted } from "../services/reviewer-role.js";
 import { listStalledDependencies } from "../services/recovery/blocker-stall-wakeups.js";
 import { confirmMcpAttachmentCleanup, recordMcpAttachmentCleanup, type McpAttachmentCleanup } from "../services/public-mcp/upload-cleanup.js";
@@ -93,6 +103,7 @@ import {
   issueComments,
   issueDocuments,
   issueExecutionDecisions,
+  issueScopedReviews,
   issueRelations,
   issueRecoveryActions,
   issueThreadInteractions,
@@ -2523,6 +2534,13 @@ async function queueResolvedInteractionContinuationWakeup(input: {
 }) {
   if (!input.issue.assigneeAgentId || isClosedIssueStatus(input.issue.status))
     return;
+  if(isScopedReviewInteraction({kind:input.interaction.kind,payload:input.interaction.payload})) {
+    const [scope]=await input.db.select().from(issueScopedReviews).where(and(eq(issueScopedReviews.companyId,input.issue.companyId),eq(issueScopedReviews.issueId,input.issue.id),eq(issueScopedReviews.interactionId,input.interaction.id)));
+    if(!scope || scope.state!=="held" && !scope.returnWakeupId) throw conflict("Scoped decision has no durable return receipt");
+    // Native queue owns the already-committed return. A lost HTTP response or
+    // duplicate resolution must never enqueue a second independent turn.
+    return;
+  }
 
   const reviewPathLost =
     input.issue.status === "in_review" &&
@@ -10642,8 +10660,11 @@ export function issueRoutes(
             status: sourceIssueStatus,
             ...(repairedWorkspaceSettings ? { executionWorkspaceSettings: repairedWorkspaceSettings } : {}),
           };
-          if (!safeHandBack) {
-            await assertInReviewReviewPath({
+          const recoveryPolicy=normalizeIssueExecutionPolicy(lockedIssue.executionPolicy ?? null);
+          let recoveryBudgetInput: TransitionInput | undefined;
+          let recoveryBudgetPreview: TransitionResult | undefined;
+          let recoveryDecisionId: string | undefined;
+          if (!safeHandBack) await assertInReviewReviewPath({
               existing: lockedIssue,
               updateFields,
               actorType: actor.actorType,
@@ -10651,10 +10672,9 @@ export function issueRoutes(
               actorAgentId: actor.agentId,
               actorRunId: actor.runId,
             });
-            const executionPolicy = normalizeIssueExecutionPolicy(
-              lockedIssue.executionPolicy ?? null,
-            );
-            const transition = applyIssueExecutionPolicyTransition({
+          if (!safeHandBack || recoveryPolicy?.totalReviewCycles===5) {
+            const executionPolicy=recoveryPolicy;
+            const recoveryInput: TransitionInput={
               issue: lockedIssue,
               policy: executionPolicy,
               previousPolicy: executionPolicy,
@@ -10662,14 +10682,18 @@ export function issueRoutes(
               requestedAssigneePatch: {},
               actor: {
                 agentId: actor.agentId ?? null,
+                runId: actor.runId ?? null,
                 userId: actor.actorType === "user" ? actor.actorId : null,
               },
               allowBoardOverride: req.actor.type === "board" && req.actor.source !== "mcp_oauth",
               commentBody: resolutionNote ?? null,
-            });
+              ...(executionPolicy?.totalReviewCycles===5 ? {...await readReviewBudgetPreviewContext(tx,{companyId:lockedIssue.companyId,issueId:id}),reviewCycleNow:new Date().toISOString()} : {}),
+            };
+            const transition=applyIssueExecutionPolicyTransition(recoveryInput);
+            if(executionPolicy?.totalReviewCycles===5) {recoveryBudgetInput=recoveryInput;recoveryBudgetPreview=structuredClone(transition);}
             Object.assign(updateFields, transition.patch);
             if (transition.decision) {
-              const decisionId = randomUUID();
+              const decisionId = randomUUID(); recoveryDecisionId=decisionId;
               const nextExecutionState = updateFields.executionState;
               if (
                 !nextExecutionState ||
@@ -10698,26 +10722,41 @@ export function issueRoutes(
             }
           }
 
-          const issueUpdate = {
+          const issueUpdate: Record<string, unknown> = {
             ...updateFields,
             actorAgentId: actor.agentId ?? null,
             actorUserId: actor.actorType === "user" ? actor.actorId : null,
           };
-          const updatedIssue =
+          const recoverySetter=recoveryBudgetInput?issueService(tx as unknown as Db):svc;
+          const performRecoveryUpdate = async () =>
             sourceIssueStatus === "done" || sourceIssueStatus === "cancelled"
-              ? await svc.update(
+              ? await recoverySetter.update(
                   id,
                   issueUpdate,
                   tx,
                   postCommitActivityPublications,
                   postCommitIssueActions,
                 )
-              : await svc.update(
+              : await recoverySetter.update(
                   id,
                   issueUpdate,
                   tx,
                   postCommitActivityPublications,
                 );
+          const recoveryHolder: {value?: Awaited<ReturnType<typeof performRecoveryUpdate>>}={};
+          if(recoveryBudgetInput) await applyLockedReviewBudgetTransition(tx,{companyId:lockedIssue.companyId,issueId:id,
+            transition:recoveryBudgetInput,expectedPreview:recoveryBudgetPreview,expectedStoredPolicy:recoveryPolicy},async(_sameTx,_locked,committed)=>{
+              Object.assign(issueUpdate,committed.patch);
+              if(recoveryDecisionId && committed.patch.executionState) issueUpdate.executionState={...committed.patch.executionState,lastDecisionId:recoveryDecisionId};
+              recoveryHolder.value=await performRecoveryUpdate();
+            });
+          else recoveryHolder.value=await performRecoveryUpdate();
+          const updatedIssue=recoveryHolder.value;
+          if(updatedIssue && recoveryBudgetInput) await logActivity(tx as unknown as Db,{
+            companyId:updatedIssue.companyId,actorType:actor.actorType,actorId:actor.actorId,agentId:actor.agentId,runId:actor.runId,
+            agentApiKeyId:actor.agentApiKeyId,action:"issue.updated",entityType:"issue",entityId:updatedIssue.id,
+            details:{identifier:updatedIssue.identifier,status:updatedIssue.status,source:"recovery_action_resolution",recoveryActionId:activeRecoveryAction.id,_previous:{status:lockedIssue.status}},
+          },postCommitActivityPublications);
           if (!updatedIssue) throw notFound("Issue not found");
           issue = updatedIssue;
         }
@@ -10762,7 +10801,8 @@ export function issueRoutes(
 
       await routinesSvc.syncRunStatusForIssue(result.issue.id);
 
-      if (sourceIssueStatus && existing.status !== result.issue.status) {
+      if (sourceIssueStatus && existing.status !== result.issue.status
+        && normalizeIssueExecutionPolicy(result.issue.executionPolicy)?.totalReviewCycles!==5) {
         await logActivity(db, {
           companyId: result.issue.companyId,
           actorType: actor.actorType,
@@ -14384,6 +14424,49 @@ export function issueRoutes(
       { code: "native_run_status_reported_by_finish", requestedStatus },
     );
   }
+  router.get("/issues/:id/scoped-reviews", async (req,res) => {
+    const issue=await getAccessibleResource(req,res,svc.getById(req.params.id as string),"Issue not found");
+    if(!issue || !await assertIssueReadAllowed(req,res,issue)) return;
+    const reviews=await scopedReviewService(db).list(issue.companyId,issue.id);
+    const context=await readReviewBudgetPreviewContext(db,{companyId:issue.companyId,issueId:issue.id});
+    const ledger=context.reviewCycleBudget,allowance=ledger?ledger.initialAllowance+ledger.allowances.reduce((n,a)=>n+a.additionalCycles,0):5;
+    const budget=ledger?{used:ledger.admissions.length,allowance,remaining:allowance-ledger.admissions.length}
+      :normalizeIssueExecutionPolicy(issue.executionPolicy)?.totalReviewCycles===5 && context.reviewCycleInitializationAuthorized?{used:0,allowance:5,remaining:5}:null;
+    res.json({issueId:issue.id,companyId:issue.companyId,totalReviewCycles:normalizeIssueExecutionPolicy(issue.executionPolicy)?.totalReviewCycles??null,reviews,budget});
+  });
+  router.post("/issues/:id/execution-stage-review/decisions",validate(nativeStageReviewDecisionSchema),async(req,res)=>{
+    const issue=await getAccessibleResource(req,res,svc.getById(req.params.id as string),"Issue not found");
+    if(!issue || !await assertIssueReadAllowed(req,res,issue)) return;
+    if(req.actor.type!=="agent" || req.actor.source!=="agent_jwt" || !req.actor.agentId || !req.actor.runId) throw forbidden("This narrow decision requires the authenticated selected native Reviewer run");
+    res.json(await decideNativeStageReview(db,{companyId:issue.companyId,issueId:issue.id,agentId:req.actor.agentId,runId:req.actor.runId,request:req.body,actor:req.actor}));
+  });
+  router.post("/issues/:id/scoped-reviews/:scopeId/cancel",validate(cancelScopedReviewSchema),async(req,res)=>{
+    const issue=await getAccessibleResource(req,res,svc.getById(req.params.id as string),"Issue not found");
+    if(!issue || !await assertAgentIssueMutationAllowed(req,res,issue,{allowVisibleIssueWrite:true})) return;
+    const actor=getActorInfo(req);
+    const cancellation=scopedReviewCancellationService(db,{readRunTerminationProof:heartbeat.readRunTerminationProof});
+    const input={companyId:issue.companyId,issueId:issue.id,scopeId:req.params.scopeId as string,
+      actor:{agentId:actor.agentId??null,runId:actor.runId??null,userId:actor.actorType==="user"?actor.actorId:null},request:req.body};
+    const begun=await cancellation.begin(input);
+    if(begun.scope.state==="cancelled") {res.json(begun.scope);return;}
+    for(const runId of begun.runIds) {
+      const stopped=await heartbeat.cancelRun(runId,"Scoped review cancelled by its task manager",{
+        errorCode:"scoped_review_cancelled",resultJson:{scopedReviewCancellation:{scopeId:input.scopeId,requestId:req.body.requestId}},
+        eventMessage:"scoped review cancellation requested",eventPayload:{issueId:issue.id,scopeId:input.scopeId}});
+      if(!stopped || stopped.status!=="cancelled") throw conflict("Native Stop has not confirmed this scoped cancellation; reload and resume the recorded request",{code:"scoped_review_stop_unconfirmed",scopeId:input.scopeId});
+    }
+    res.json(await cancellation.finish(input));
+  });
+
+  router.post("/issues/:id/scoped-reviews",validate(createScopedReviewSchema),async(req,res)=>{
+    const issue=await getAccessibleResource(req,res,svc.getById(req.params.id as string),"Issue not found");
+    if(!issue || !await assertAgentIssueMutationAllowed(req,res,issue)) return;
+    if(req.actor.type!=="agent" || req.actor.source!=="agent_jwt" || !req.actor.agentId || !req.actor.runId)
+      throw forbidden("Scoped review drafts require an authenticated native Builder run");
+    const result=await scopedReviewService(db).createDraft({companyId:issue.companyId,issueId:issue.id,
+      actor:{agentId:req.actor.agentId,runId:req.actor.runId},request:req.body});
+    res.status(result.replayed?200:201).json(result);
+  });
 
   router.patch(
     "/issues/:id",
@@ -14406,6 +14489,7 @@ export function issueRoutes(
       )) {
         throw unprocessable("expectedExecutionPolicy requires a policy-only update");
       }
+      if(req.body.reviewCycleAllowance!==undefined && Object.keys(req.body).some(key=>key!=="reviewCycleAllowance"))throw unprocessable("A review-cycle allowance must be submitted alone; it cannot change policy, content or task controls");
       if (req.body.expectedExecutionDecision !== undefined && (
         !["done", "in_progress"].includes(req.body.status ?? "") ||
         typeof req.body.comment !== "string" || !req.body.comment.trim() ||
@@ -14425,6 +14509,14 @@ export function issueRoutes(
           req.actor.type === "board" && req.actor.source !== "mcp_oauth" ? req.actor.userId ?? null : null);
       }
       await assertNativeRunKeepsOwnExecutionLock(req, existing);
+      const normalizedAssigneeAgentId =
+        await normalizeIssueAssigneeAgentReference(
+          existing.companyId,
+          req.body.assigneeAgentId as string | null | undefined,
+          { actorType: req.actor.type },
+        );
+      await assertProtectedGenericReviewHandoff(db,{companyId:existing.companyId,issueId:existing.id,requestedStatus:req.body.status,
+        executionPolicy:req.body.executionPolicy===undefined?existing.executionPolicy:req.body.executionPolicy,executionState:existing.executionState,assigneeAgentId:existing.assigneeAgentId,assigneeUserId:existing.assigneeUserId,requestedAssigneeAgentId:normalizedAssigneeAgentId,requestedAssigneeUserId:req.body.assigneeUserId});
       if (req.body.expectedStatusVersion !== undefined && (
         existing.statusVersion !== req.body.expectedStatusVersion || existing.status !== "backlog"
       )) {
@@ -14487,12 +14579,6 @@ export function issueRoutes(
       const actor = getActorInfo(req);
       const isClosed = isClosedIssueStatus(existing.status);
       const isBlocked = existing.status === "blocked";
-      const normalizedAssigneeAgentId =
-        await normalizeIssueAssigneeAgentReference(
-          existing.companyId,
-          req.body.assigneeAgentId as string | null | undefined,
-          { actorType: req.actor.type },
-        );
       const titleOrDescriptionChanged =
         req.body.title !== undefined || req.body.description !== undefined;
       const existingRelations = Array.isArray(req.body.blockedByIssueIds)
@@ -14504,6 +14590,8 @@ export function issueRoutes(
         attachmentIds: commentAttachmentIds,
         reviewInteractionId: requestedReviewInteractionId,
         reviewRequest,
+        reviewCycleSubmissionId,
+        reviewCycleAllowance,
         reopen: reopenRequested,
         resume: resumeRequested,
         interrupt: interruptRequested,
@@ -14565,6 +14653,8 @@ export function issueRoutes(
       const parentAdjustedActivityDetails = parentAdjusted
         ? { parentId: plannedParentId ?? null, requestedParentId: parentAdjusted.requestedParent?.id ?? null, parentAdjusted }
         : {};
+      await assertNoActiveScopedControlMutation(db,existing,req.body);
+      if(reviewCycleAllowance) await assertScopedAllowanceExecutionSettled(db,existing.companyId,existing.id);
     if (req.body.visibility === "private" && !existing.projectId && updateFields.projectId === undefined) {
       const responsibleUserId = existing.responsibleUserId ?? (req.actor.type === "board"
         ? req.actor.userId ?? null
@@ -14928,33 +15018,45 @@ export function issueRoutes(
         req.body.executionPolicy !== undefined && monitorChanged,
       );
 
-      const transition: ReturnType<typeof applyIssueExecutionPolicyTransition> = expectedStatusVersion !== undefined
-        ? { patch: {} }
-        : applyIssueExecutionPolicyTransition({
-        issue: existing,
-        policy: nextExecutionPolicy,
-        previousPolicy: previousExecutionPolicy,
-        requestedStatus:
-          typeof updateFields.status === "string"
-            ? updateFields.status
-            : undefined,
-        requestedAssigneePatch: {
-          assigneeAgentId: normalizedAssigneeAgentId,
-          assigneeUserId:
-            req.body.assigneeUserId === undefined
-              ? undefined
-              : (req.body.assigneeUserId as string | null),
-        },
-        actor: {
-          agentId: actor.agentId ?? null,
-          userId: actor.actorType === "user" ? actor.actorId : null,
-        },
+      const usesTaskTotalReviewBudget = previousExecutionPolicy?.totalReviewCycles === 5 || nextExecutionPolicy?.totalReviewCycles === 5;
+      if (reviewCycleAllowance && (!usesTaskTotalReviewBudget || req.actor.type !== "board" || req.actor.source === "mcp_oauth")) {
+        throw forbidden("Additional review cycles require a selected-human decision in Paperclip on a task using the total budget");
+      }
+      const totalReviewTransitionTime = new Date().toISOString();
+      const transitionInput: TransitionInput = {
+        issue: existing, policy: nextExecutionPolicy, previousPolicy: previousExecutionPolicy,
+        requestedStatus: typeof updateFields.status === "string" ? updateFields.status : undefined,
+        requestedAssigneePatch: { assigneeAgentId: normalizedAssigneeAgentId,
+          assigneeUserId: req.body.assigneeUserId === undefined ? undefined : req.body.assigneeUserId as string | null },
+        actor: { agentId: actor.agentId ?? null, runId: actor.runId ?? null,
+          userId: actor.actorType === "user" ? actor.actorId : null },
         allowBoardOverride: expectedExecutionDecision === undefined && req.actor.type === "board" && req.actor.source !== "mcp_oauth",
-        commentBody,
-        reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
-        monitorExplicitlyUpdated:
-          req.body.executionPolicy !== undefined && monitorChanged,
-      });
+        commentBody, reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
+        monitorExplicitlyUpdated: req.body.executionPolicy !== undefined && monitorChanged,
+      };
+      if (usesTaskTotalReviewBudget) {
+        Object.assign(transitionInput, await readReviewBudgetPreviewContext(db, { companyId: existing.companyId, issueId: existing.id }));
+        transitionInput.reviewCycleNow = totalReviewTransitionTime;
+        transitionInput.reviewCycleHumanSubmissionAuthorized = req.actor.type === "board" && req.actor.source !== "mcp_oauth";
+        if (reviewCycleAllowance) transitionInput.reviewCycleAllowance = { request: reviewCycleAllowance, authorized: true };
+        transitionInput.reviewCycleAdmission = await normalReviewCycleSubmission({ issue: existing, requestedStatus: updateFields.status,
+          actor: transitionInput.actor, clientSubmissionId: reviewCycleSubmissionId,
+          findObservedBuilderRun: async builderAgentId => {
+            const [run] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.companyId, existing.companyId), eq(heartbeatRuns.agentId, builderAgentId),
+              eq(boundRunIssueIdSql(), existing.id),
+              or(...(existing.executionRunId ?? existing.checkoutRunId ? [eq(heartbeatRuns.id, (existing.executionRunId ?? existing.checkoutRunId)!)] : []), eq(heartbeatRuns.status, "succeeded")),
+            )).orderBy(desc(heartbeatRuns.startedAt), desc(heartbeatRuns.createdAt)).limit(1);
+            return run?.id ?? null;
+          },
+        });
+      }
+      const transition: ReturnType<typeof applyIssueExecutionPolicyTransition> = expectedStatusVersion !== undefined && !usesTaskTotalReviewBudget
+        ? { patch: {} } : applyIssueExecutionPolicyTransition(transitionInput);
+      // A preview is only for native access/stop/completion planning. Commit
+      // recomputes under task->ledger locks and rejects any changed outcome.
+      const totalReviewPreview: TransitionResult | undefined = usesTaskTotalReviewBudget ? structuredClone(transition) : undefined;
+      if(usesTaskTotalReviewBudget) await assertProtectedReviewSubmissionSupported(db,{companyId:existing.companyId,issueId:existing.id,admission:transitionInput.reviewCycleAdmission,result:transition});
       if (expectedExecutionDecision !== undefined && (!transition.decision ||
         transition.decision.outcome !== (req.body.status === "done" ? "approved" : "changes_requested"))) {
         throw conflict("The task execution stage changed. Read its latest state before deciding.", { code: "execution_decision_changed" });
@@ -15141,7 +15243,7 @@ export function issueRoutes(
       const enteringReviewRequested =
         existing.status !== "in_review" && updateFields.status === "in_review";
       const persistReviewActivityTransactionally =
-        enteringReviewRequested || Boolean(reviewInteractionId);
+        enteringReviewRequested || Boolean(reviewInteractionId) || usesTaskTotalReviewBudget;
 
       const nextAssigneeAgentId =
         updateFields.assigneeAgentId === undefined
@@ -15367,8 +15469,9 @@ export function issueRoutes(
         updateFields.status === "done" || updateFields.status === "cancelled";
       const updateIssue = (tx?: Parameters<typeof svc.update>[2]) => {
         if (tx) {
+          const setter=usesTaskTotalReviewBudget?issueService(tx as unknown as Db):svc;
           if (shouldCollectCompletionPublication) {
-            return svc.update(
+            return setter.update(
               id,
               issueUpdateData,
               tx,
@@ -15377,14 +15480,14 @@ export function issueRoutes(
             );
           }
           return shouldCollectTerminalIssueActions
-            ? svc.update(
+            ? setter.update(
                 id,
                 issueUpdateData,
                 tx,
                 undefined,
                 postCommitIssueActions,
               )
-            : svc.update(id, issueUpdateData, tx);
+            : setter.update(id, issueUpdateData, tx);
         }
         return shouldCollectCompletionPublication
           ? svc.update(id, issueUpdateData, db, postCommitActivityPublications)
@@ -15445,6 +15548,8 @@ export function issueRoutes(
               authorizationReason: issueMutationAuthorizationReason,
               changes,
               ...(reviewInteractionId ? { reviewInteractionId } : {}),
+              ...(reviewCycleAllowance ? { reviewCycleAllowance } : {}),
+              ...(transitionInput.reviewCycleAdmission ? { reviewCycleSubmission: transitionInput.reviewCycleAdmission } : {}),
               ...(commentBody ? { source: "comment" } : {}),
               ...(resumeRequested === true
                 ? { resumeIntent: true, followUpRequested: true }
@@ -15507,7 +15612,7 @@ export function issueRoutes(
         ? await sourceTrustForActorWrite(existing, actor)
         : undefined;
       const shouldUseTransactionalIssueUpdate =
-        Boolean(commentAttachmentIds?.length) ||
+        usesTaskTotalReviewBudget || Boolean(commentAttachmentIds?.length) ||
         commentWithAdapterOverrides ||
         Boolean(decision) ||
         shouldRelayStop ||
@@ -15530,7 +15635,22 @@ export function issueRoutes(
               !(await assertLockedReviewPolicyAllowsMutation(tx))
             )
               return null;
-            const updated = await updateIssue(tx);
+            let updated: Awaited<ReturnType<typeof svc.update>> | undefined;
+            if (usesTaskTotalReviewBudget) {
+              const lockedUpdate: { value: Awaited<ReturnType<typeof svc.update>> | undefined } = { value: undefined };
+              await applyLockedReviewBudgetTransition(tx, { companyId: existing.companyId, issueId: existing.id,
+                transition: transitionInput, expectedPreview: totalReviewPreview, expectedStoredPolicy: previousExecutionPolicy,
+                scopedControlMutation:SCOPED_CONTROL_FIELDS.some(key=>req.body[key]!==undefined) }, async (_budgetTx, _lockedIssue, committedTransition) => {
+                if (decisionId && committedTransition.patch.executionState && typeof committedTransition.patch.executionState === "object") {
+                  committedTransition.patch.executionState = { ...committedTransition.patch.executionState, lastDecisionId: decisionId };
+                }
+                Object.assign(updateFields, committedTransition.patch);
+                Object.assign(issueUpdateData, committedTransition.patch);
+                lockedUpdate.value = await updateIssue(tx);
+                if (!lockedUpdate.value) throw notFound("Issue not found");
+              });
+              updated = lockedUpdate.value;
+            } else updated = await updateIssue(tx);
             if (!updated) return null;
             if (commentAttachmentIds?.length || commentWithAdapterOverrides || transactionalHumanDecision) {
               // Adapter settings, reassignment, comment and upload binding commit together.
@@ -19686,17 +19806,23 @@ export function issueRoutes(
       let goalCommentSteered = false;
       let fastResponseEnqueued = false;
       if (shouldAutoApproveReviewComment) {
-        const transition = applyIssueExecutionPolicyTransition({
+        const usesCommentTotalBudget = currentExecutionPolicy?.totalReviewCycles === 5;
+        const commentTransitionInput: TransitionInput = {
           issue: currentIssue,
           policy: currentExecutionPolicy,
           requestedStatus: "done",
           requestedAssigneePatch: {},
           actor: {
             agentId: actor.agentId ?? null,
+            runId: actor.runId ?? null,
             userId: actor.actorType === "user" ? actor.actorId : null,
           },
           commentBody: req.body.body,
-        });
+          ...(usesCommentTotalBudget ? { ...await readReviewBudgetPreviewContext(db, { companyId: currentIssue.companyId, issueId: id }),
+            reviewCycleNow: new Date().toISOString() } : {}),
+        };
+        const transition = applyIssueExecutionPolicyTransition(commentTransitionInput);
+        const commentTotalPreview = usesCommentTotalBudget ? structuredClone(transition) : undefined;
         const decisionId = transition.decision ? randomUUID() : null;
         if (decisionId) {
           const nextExecutionState = transition.patch.executionState;
@@ -19712,7 +19838,7 @@ export function issueRoutes(
         }
 
         issueBeforeCommentDecision = currentIssue;
-        const updatePatch = {
+        const updatePatch: Record<string, unknown> = {
           ...transition.patch,
           status:
             typeof transition.patch.status === "string"
@@ -19757,22 +19883,37 @@ export function issueRoutes(
               },
               tx,
             );
-            const updated =
+            const commentSetter=usesCommentTotalBudget?issueService(tx as unknown as Db):svc;
+            const performNativeUpdate = async () => {
+              const updated =
               actor.actorType === "user" && currentIssue.status !== "done"
-                ? await svc.update(
+                ? await commentSetter.update(
                     id,
                     updatePatch,
                     tx,
                     postCommitActivityPublications,
                     postCommitIssueActions,
                   )
-                : await svc.update(
+                : await commentSetter.update(
                     id,
                     updatePatch,
                     tx,
                     undefined,
                     postCommitIssueActions,
                   );
+              if (!updated) throw new AutoApprovalIssueMissingError();
+              return updated;
+            };
+            const holder: { value?: Awaited<ReturnType<typeof performNativeUpdate>> } = {};
+            if (usesCommentTotalBudget) {
+              await applyLockedReviewBudgetTransition(tx, { companyId: currentIssue.companyId, issueId: id,
+                transition: commentTransitionInput, expectedPreview: commentTotalPreview, expectedStoredPolicy: currentExecutionPolicy }, async (_sameTx, _lockedIssue, committed) => {
+                Object.assign(updatePatch, committed.patch);
+                if (decisionId && committed.patch.executionState) updatePatch.executionState = { ...committed.patch.executionState, lastDecisionId: decisionId };
+                holder.value = await performNativeUpdate();
+              });
+            } else holder.value = await performNativeUpdate();
+            const updated = holder.value;
             // Throw (not return null) so drizzle rolls back the inserted comment when the issue
             // has been concurrently deleted between the initial fetch and the in-transaction update.
             if (!updated) throw new AutoApprovalIssueMissingError();
@@ -19792,6 +19933,13 @@ export function issueRoutes(
               });
             }
 
+            if (usesCommentTotalBudget) await logActivity(tx as unknown as Db, {
+              companyId: updated.companyId, actorType: actor.actorType, actorId: actor.actorId,
+              agentId: actor.agentId, runId: actor.runId, agentApiKeyId: actor.agentApiKeyId,
+              action: "issue.updated", entityType: "issue", entityId: updated.id,
+              details: { status: updated.status, identifier: updated.identifier, source: "auto_approval_comment",
+                _previous: { status: currentIssue.status } },
+            }, postCommitActivityPublications);
             return { comment: insertedComment, issue: updated };
           });
         } catch (err) {
@@ -19808,7 +19956,7 @@ export function issueRoutes(
         currentIssue = txResult.issue;
         // Mirror the normal status-change audit trail: every other in_review -> done path
         // emits an `issue.updated` activity, so emit one here too for the auto-approval path.
-        if (issueBeforeCommentDecision.status !== currentIssue.status) {
+        if (!usesCommentTotalBudget && issueBeforeCommentDecision.status !== currentIssue.status) {
           await logActivity(db, {
             companyId: currentIssue.companyId,
             actorType: actor.actorType,

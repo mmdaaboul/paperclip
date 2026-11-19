@@ -108,6 +108,7 @@ export type AuthorizationAction =
   | "issue:comment"
   | "issue:mutate"
   | "issue:resolve_assigned_review"
+  | "issue:resolve_assigned_stage_review"
   | "issue:read"
   | "project:read"
   | "project:write_workspace"
@@ -213,7 +214,7 @@ function permissionForAction(action: AuthorizationAction): PermissionKey | null 
   ) {
     return null;
   }
-  if (action === "issue:comment" || action === "issue:mutate" || action === "issue:resolve_assigned_review") return null;
+  if (action === "issue:comment" || action === "issue:mutate" || action === "issue:resolve_assigned_review" || action === "issue:resolve_assigned_stage_review") return null;
   return action;
 }
 
@@ -2875,6 +2876,41 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
     resource: AuthorizationResource;
     scope?: Record<string, unknown> | null;
   }): Promise<AuthorizationDecision> {
+    if (input.action === "issue:resolve_assigned_stage_review") {
+      const denied=()=>deny({action:input.action,reason:"deny_policy_restricted",explanation:"Only the exact current native stage Reviewer may record its verdict."});
+      if(input.actor.type!=="agent" || !input.actor.agentId || !input.actor.runId || input.resource.type!=="issue" || !input.resource.issueId || input.actor.companyId!==input.resource.companyId)return denied();
+      const visible=await decide({...input,action:"issue:read"});if(!visible.allowed)return {...visible,action:input.action};
+      const [run]=await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id,input.actor.runId),eq(heartbeatRuns.companyId,input.resource.companyId),eq(heartbeatRuns.agentId,input.actor.agentId)));
+      if(!run)return denied();
+      const {getNativeStageReviewAssignment}=await import("./native-runtime/native-stage-review.js");
+      const assigned=await getNativeStageReviewAssignment(db as Db,{companyId:input.resource.companyId,issueId:input.resource.issueId,agentId:input.actor.agentId,runId:input.actor.runId,contextSnapshot:run.contextSnapshot});
+      const requested=input.scope?.stageDecisionRequest;
+      let historical:Awaited<ReturnType<typeof import("./native-runtime/native-stage-review.js").historicalNativeStageDecision>>=null;
+      if(requested!==undefined) {
+        const {nativeStageReviewDecisionSchema}=await import("@paperclipai/shared");
+        const parsed=nativeStageReviewDecisionSchema.safeParse(requested);if(!parsed.success)return denied();
+        if(assigned) {
+          if(parsed.data.stageId!==assigned.stage.id || parsed.data.admissionId!==assigned.admission.id || parsed.data.sourceDecisionId!==assigned.sourceDecision.id || parsed.data.expectedStatusVersion!==assigned.issue.statusVersion)return denied();
+        } else {
+          const {historicalNativeStageDecision}=await import("./native-runtime/native-stage-review.js");
+          historical=await historicalNativeStageDecision(db as Db,{companyId:input.resource.companyId,issueId:input.resource.issueId,agentId:input.actor.agentId,runId:input.actor.runId,request:parsed.data});
+        }
+      }
+      if(!assigned && !historical)return denied();
+      const reviewer=await loadAgent(input.actor.agentId);
+      if(!reviewer || (await resolveActorTrust({actorAgent:reviewer,actor:input.actor,companyId:input.resource.companyId,resource:input.resource})).kind!=="standard")return denied();
+      if(await reviewerActorRestricted(db,{companyId:input.resource.companyId,agentId:input.actor.agentId,runId:input.actor.runId})) {
+        try {const {assertNativeReviewerProcessAdmissionCurrent}=await import("./native-runtime/reviewer-runtime-admission.js");
+          await assertNativeReviewerProcessAdmissionCurrent(db as Db,{companyId:input.resource.companyId,agentId:input.actor.agentId,runId:input.actor.runId},{allowResolvedReview:!!historical});
+        } catch {return denied();}
+      }
+      const issue=assigned?.issue??(await db.select().from(issues).where(and(eq(issues.id,input.resource.issueId),eq(issues.companyId,input.resource.companyId))))[0];
+      if(!issue)return denied();
+      const mutation={...input,action:"issue:mutate" as const,resource:{...input.resource,status:issue.status,assigneeAgentId:issue.assigneeAgentId,assigneeUserId:issue.assigneeUserId,projectId:issue.projectId}};
+      const allowed=allow({action:input.action,reason:"allow_assigned_review",explanation:"This exact native stage belongs to the authenticated Reviewer run."});
+      const responsible=await applyResponsibleUserIntersection(mutation,allowed);
+      return {...await applyAuthorizingUserIntersection(mutation,responsible),action:input.action};
+    }
     if (input.action === "issue:resolve_assigned_review") {
       const denied = () => deny({ action: input.action, reason: "deny_policy_restricted",
         explanation: "Only the current protected native review may be resolved by this authenticated run." });

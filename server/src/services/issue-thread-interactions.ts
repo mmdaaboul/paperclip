@@ -7,6 +7,7 @@ import { notifyChatConfirmationResolution } from "./chat-confirmation-notificati
 import { notifyChatRunMilestones } from "./chat-run-milestone-notifications.js";
 import { notifyToolReviewChange } from "./tool-review-work-notifications.js";
 import { projectGitHubInteractionErrors } from "./tool-access/github-action-error-projection.js";
+import { isScopedReviewInteraction, resolveScopedReviewInTransaction } from "./scoped-review-resolution.js";
 import { normalizeEscapedLineBreaks } from "@paperclipai/shared/validators/text";
 import { notifyDeliveryWork, DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import { historicalQuestionCondition } from "./issue-question-context.js";
@@ -538,7 +539,9 @@ async function assertRequestConfirmationResolutionAllowedUnderLock(
     (await isIssueReviewVerdictInteraction(tx, { issue, interaction }));
 
   assertInteractionResolutionAllowed(interaction, actor);
-  if (actor.agentId && isNativeCompletionReview(interaction)) {
+  if(isScopedReviewInteraction(interaction) && (!actor.agentId || !actor.runId || actor.userId || actor.systemId))
+    throw forbidden("Only the assigned native independent Reviewer may decide this partial scope");
+  if (actor.agentId && (isNativeCompletionReview(interaction) || isScopedReviewInteraction(interaction))) {
     const target = (interaction.payload as { target?: { revisionId?: string } }).target;
     if (!actor.runId || !await getNativeReviewAssignment(tx, {
       companyId: issue.companyId, issueId: issue.id, agentId: actor.agentId,
@@ -2563,7 +2566,11 @@ export function issueThreadInteractionService(
         acceptedPlanTarget?.issueId === issueContext.id &&
         acceptedPlanTarget.key === "plan" &&
         issueContext.workMode === "planning";
-      if (isNativeCompletionReview(lockedCurrent)) {
+      if(isScopedReviewInteraction(lockedCurrent)) {
+        const returned=await resolveScopedReviewInTransaction({db,tx:tx as unknown as Db,companyId:issueContext.companyId,issueId:issueContext.id,
+          interactionId:lockedCurrent.id,actor:args.actor,outcome:"passed",reason:"",publications:postCommitActivityPublications});
+        continuationIssue={id:returned.id,status:returned.status,assigneeAgentId:returned.assigneeAgentId,assigneeUserId:returned.assigneeUserId};
+      } else if (isNativeCompletionReview(lockedCurrent)) {
         const otherPending = await tx.select({ id: issueThreadInteractions.id })
           .from(issueThreadInteractions).where(and(
             eq(issueThreadInteractions.companyId, issueContext.companyId),
@@ -2731,6 +2738,7 @@ export function issueThreadInteractionService(
     }
 
     const now = new Date();
+    const scopedPublications: ActivityPublication[]=[];
     const updated = await db.transaction(async (tx) => {
       await assertInteractionRunWriteAllowed(tx as unknown as Db, args.issue, args.actor);
       await notifyChatConfirmationResolution(tx, args.current);
@@ -2862,7 +2870,10 @@ export function issueThreadInteractionService(
         !activeResponseIsRevisingOlderProposal &&
         (lockedCurrent.continuationPolicy === "wake_assignee" ||
           rejectedPlanNeedsRevision);
-      if (
+      if(isScopedReviewInteraction(lockedCurrent)) {
+        await resolveScopedReviewInTransaction({db,tx:tx as unknown as Db,companyId:issueContext.companyId,issueId:issueContext.id,
+          interactionId:lockedCurrent.id,actor:args.actor,outcome:"changes_requested",reason,publications:scopedPublications});
+      } else if (
         isNativeCompletionReview(lockedCurrent) ||
         shouldResumeReviewedIssue
       ) {
@@ -2888,7 +2899,7 @@ export function issueThreadInteractionService(
     });
 
     const rejected = hydrateInteraction(updated);
-    const publish = (committedDb: Db) => emitInteractionResolvedTelemetry(committedDb, rejected);
+    const publish = async (committedDb: Db) => {for(const publication of scopedPublications) publishActivity(publication);await emitInteractionResolvedTelemetry(committedDb,rejected);};
     if (args.mutationOptions?.deferConfirmationCommitEffects) args.mutationOptions.deferConfirmationCommitEffects(publish);
     else await publish(db);
     return rejected;
@@ -5435,6 +5446,7 @@ export function issueThreadInteractionService(
       }
       if (current.status !== "pending") throw interactionTerminalError(current);
 
+      if(isScopedReviewInteraction(current)) throw conflict("Use the scoped-review cancellation action so native Stop, history and return controls remain intact",{code:"scoped_review_cancel_required"});
       const reason = data.reason?.trim() || null;
       const now = new Date();
       // One transaction, linked tool action first: revoking pending/approved
@@ -5706,6 +5718,7 @@ export function issueThreadInteractionService(
       }
       if (current.status !== "pending") throw interactionTerminalError(current);
 
+      if(isScopedReviewInteraction(current)) throw conflict("Use the scoped-review cancellation action to retain native return controls",{code:"scoped_review_cancel_required"});
       const reason = data.reason?.trim() || null;
       const now = new Date();
       const updated = await db.transaction(async (tx) => {

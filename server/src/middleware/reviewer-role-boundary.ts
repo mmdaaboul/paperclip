@@ -41,6 +41,12 @@ export function reviewerRoleBoundary(db: Db): RequestHandler {
         if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
         return next();
       }
+      const stage=new RegExp(`^/api/issues/(${uuid})/execution-stage-review/decisions$`).exec(req.path);
+      if(req.method==="POST" && stage) {
+        const decision=await authorizationService(db).decide({actor:req.actor,action:"issue:resolve_assigned_stage_review",resource:{type:"issue",companyId:req.actor.companyId,issueId:stage[1]!},scope:{stageDecisionRequest:req.body}});
+        if(!decision.allowed)throw forbidden(decision.explanation,authorizationDeniedDetails(decision));
+        return next();
+      }
       throw forbidden("The Reviewer role cannot mutate agent/company/runtime configuration or use generic control-plane write routes");
     } catch (error) { next(error); }
   };

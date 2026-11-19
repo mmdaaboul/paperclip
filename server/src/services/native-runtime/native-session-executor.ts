@@ -1,3 +1,4 @@
+import { getNativeStageReviewAssignment, readNativeStageReviewContext } from "./native-stage-review.js";
 import { providerDrainStateFromSnapshot } from "../../vendor/paperclip-runner/index.js";
 import type { WorkspaceAccessSnapshot } from "../../vendor/paperclip-runner/index.js";
 import { proveReviewerRecordedOwnerStopped, reviewerRecordedProcessIds, type ReviewerProcessEvidence } from "./reviewer-policy-process-proof.js";
@@ -9526,6 +9527,17 @@ export async function executePaperclipNativeSession(input: {
         eq(heartbeatRuns.companyId, input.execution.binding.companyId), eq(heartbeatRuns.agentId, input.execution.binding.agentId)));
       if (stoppingRun && await readClaimedNativeStopRecovery(input.db, stoppingRun, input.leaseOwner)) stopLease = input.leaseOwner;
     }
+    const [reviewRun]=await input.db.select({contextSnapshot:heartbeatRuns.contextSnapshot}).from(heartbeatRuns).where(and(eq(heartbeatRuns.id,runId),eq(heartbeatRuns.companyId,input.execution.binding.companyId),eq(heartbeatRuns.agentId,input.execution.binding.agentId)));
+    const stageContext=stopLease?null:readNativeStageReviewContext(reviewRun?.contextSnapshot);
+    if(stageContext && !await getNativeStageReviewAssignment(input.db,{...input.execution.binding,contextSnapshot:stageContext}))throw new NativeProviderStateIncompatibleError("native_stage_review_assignment_no_longer_available");
+    let scopedOnly=false;
+    const interactionContext=stopLease?null:readNativeReviewAssignmentContext(reviewRun?.contextSnapshot);
+    if(interactionContext) {
+      const assigned=await getNativeReviewAssignment(input.db,{...input.execution.binding,contextSnapshot:interactionContext});
+      if(!assigned)throw new NativeProviderStateIncompatibleError("native_review_assignment_no_longer_available");
+      scopedOnly=!!assigned.scopedReview;
+    }
+    if(stageContext || scopedOnly)input={...input,managedGitHub:false};
     const workspaceAccess = stopLease
       ? await resolveNativeWorkspacePolicyForClaimedStop(input.db, input.execution, stopLease, input.workspaceAccess)
       : await resolveNativeWorkspacePolicy(input.db, input.execution, input.workspaceAccess);
@@ -14667,18 +14679,22 @@ async function createRunnerdBackendWithinSessionClaim(
   ));
   const protectedReviewer = input.workspaceAccess?.policy.readOnlyWorkspace === true;
   const cleanupOnly = input.recoveryPurpose === "stop_cleanup";
-  const noExternalTools = protectedReviewer || cleanupOnly;
+  let noExternalTools = protectedReviewer || cleanupOnly;
   const pinnedSkills = new Set("runtimeContext" in input.execution ? input.execution.runtimeContext.skills.map((skill) => skill.key) : []);
-  const connectorAssignments = !noExternalTools && input.execution.provider.kind !== "muse" ? connectorToolDefinitionsForSkills(pinnedSkills) : [];
+
   const reviewRun = await input.db.select({ contextSnapshot: heartbeatRuns.contextSnapshot })
     .from(heartbeatRuns).where(and(
       eq(heartbeatRuns.id, input.execution.binding.runId),
       eq(heartbeatRuns.companyId, input.execution.binding.companyId),
     )).limit(1).then((rows) => rows[0]);
+  const nativeStageReview=cleanupOnly?null:readNativeStageReviewContext(reviewRun?.contextSnapshot);
+  if(nativeStageReview && !await getNativeStageReviewAssignment(input.db,{...input.execution.binding,contextSnapshot:nativeStageReview}))throw new Error("native_stage_review_assignment_no_longer_available");
+  noExternalTools ||= !!nativeStageReview;
   const nativeReview = cleanupOnly ? null : readNativeReviewAssignmentContext(reviewRun?.contextSnapshot);
   if (!cleanupOnly && nativeReview && !await getNativeReviewAssignment(input.db, {
     ...input.execution.binding, contextSnapshot: nativeReview,
   })) throw new Error("native_review_assignment_no_longer_available");
+  const connectorAssignments = !noExternalTools && input.execution.provider.kind !== "muse" ? connectorToolDefinitionsForSkills(pinnedSkills) : [];
   // Codex and OpenCode send dynamic tool calls over authenticated PRP. Keep
   // the assigned gateway on the control plane instead of asking the sandbox to
   // reach the host's HTTP origin (which may be private or loopback-only).
@@ -14703,7 +14719,7 @@ async function createRunnerdBackendWithinSessionClaim(
     ? pluginTaskOwner = preparePluginTaskOwner().then(prepared => { input.beginRetainedRunAttachment!(); return prepared; })
     : undefined;
   const [preparedEnvironment, preparedAssignedMcp, preparedPluginTaskOwner] = await Promise.allSettled([
-    Promise.resolve().then(() => input.prepareRunnerEnvironment?.() ?? input.runnerEnvironment),
+    Promise.resolve().then(() => noExternalTools ? input.runnerEnvironment : input.prepareRunnerEnvironment?.() ?? input.runnerEnvironment),
     Promise.resolve().then(() => !noExternalTools && relayAssignedMcp && !nativeReview && assignedMcpUrl && assignedMcpToken
       ? timeController("assigned_mcp", () => createAssignedMcpTools({
         gateway: getAssignedMcpGateway(input.db),
@@ -14735,6 +14751,7 @@ async function createRunnerdBackendWithinSessionClaim(
     apiUrl: resolveLocalRuntimeApiUrl(),
     casesEnabled: input.casesEnabled === true,
     ...(nativeReview ? { nativeReview } : {}),
+    ...(nativeStageReview ? { nativeStageReview } : {}),
     connectorAssignments,
     assignedMcpTools,
     companyId: input.execution.binding.companyId,
@@ -14760,7 +14777,7 @@ async function createRunnerdBackendWithinSessionClaim(
     executionTargetKind: target.kind,
     installRemoteArtifact: !pluginTask && remoteTarget && remoteCommandRunner
       ? createArtifactInstaller(remoteTarget.remoteCwd, remoteCommandRunner) : undefined,
-    imageGeneration: nativeReview || pluginTask ? undefined
+    imageGeneration: nativeReview || nativeStageReview || pluginTask ? undefined
       : imageGenerationBindingForRun({ providerKind: input.execution.provider.kind, contextSnapshot: reviewRun?.contextSnapshot }),
     readRemoteWorkspaceFile: !pluginTask && remoteTarget && remoteCommandRunner
       ? (file) => readVerifiedRemoteWorkspaceFile({ runner: remoteCommandRunner, workspaceRoot: remoteTarget.remoteCwd, ...file })

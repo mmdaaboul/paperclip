@@ -1,3 +1,4 @@
+import { createUuid } from "../lib/uuid";
 import { useEffect, useId, useRef, useState } from "react";
 import type { Issue } from "@paperclipai/shared";
 import { useQueryClient } from "@tanstack/react-query";
@@ -31,12 +32,14 @@ function DecisionForm({ issue, currentUserId, expectedKey }: Props & { expectedK
   const queryClient = useQueryClient();
   const inputId = useId();
   const busy = useRef(false);
+  const allowanceId = useRef(createUuid());
   const mounted = useRef(true);
   const [comment, setComment] = useState("");
   const [pending, setPending] = useState(false);
   const [locked, setLocked] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState(false);
+  const [allowanceSaved, setAllowanceSaved] = useState(false);
   const stage = issue.executionState?.currentStageType === "review" ? "review" : "approval";
 
   useEffect(() => {
@@ -53,7 +56,7 @@ function DecisionForm({ issue, currentUserId, expectedKey }: Props & { expectedK
     ]) void queryClient.invalidateQueries({ queryKey });
   }
 
-  async function decide(status: "done" | "in_progress") {
+  async function decide(status: "done" | "in_progress" | "allow_one_more") {
     const body = comment.trim();
     if (!body || busy.current || locked || saved) return;
     busy.current = true;
@@ -72,10 +75,13 @@ function DecisionForm({ issue, currentUserId, expectedKey }: Props & { expectedK
       submitted = true;
       // The server checks the current human participant and records the decision
       // and comment together. Do not override assignees, policies, or execution state.
-      await issuesApi.update(issue.id, {
+      await issuesApi.update(issue.id, status==="allow_one_more"
+        ? {reviewCycleAllowance:{id:allowanceId.current,additionalCycles:1,reason:body}}
+        : {
         status, comment: body,
         expectedExecutionDecision: { statusVersion: latest.statusVersion, executionPolicy: latest.executionPolicy, executionState: latest.executionState },
       });
+      setAllowanceSaved(status==="allow_one_more");
       setSaved(true);
       setComment("");
       refresh();
@@ -99,13 +105,16 @@ function DecisionForm({ issue, currentUserId, expectedKey }: Props & { expectedK
 
   return (
     <div className="flex min-w-0 flex-col gap-3" aria-busy={pending}>
-      {saved ? <p role="status" className="text-sm">Your {stage} decision was saved.</p> : <>
+      {saved ? <p role="status" className="text-sm">{allowanceSaved?"One additional review cycle was authorized; earlier usage is retained.":<>Your {stage} decision was saved.</>}</p> : <>
+        {issue.executionPolicy?.totalReviewCycles===5 && issue.executionState?.totalReviewCyclesUsed!==undefined && <p className="text-xs text-muted-foreground">Review cycles: {issue.executionState.totalReviewCyclesUsed} of {issue.executionState.totalReviewCycleAllowance} used.</p>}
+        {issue.executionState?.totalReviewBudgetHold && <p className="text-sm">The review allowance is exhausted. Earlier usage remains counted; only an explicit human allowance permits another correction cycle.</p>}
         <label htmlFor={inputId} className="text-sm font-medium">Decision comment (required)</label>
         <Textarea
           id={inputId} value={comment} required disabled={pending || locked}
           onChange={(event) => setComment(event.target.value)}
           placeholder="Explain your approval or the changes needed."
         />
+        {issue.executionPolicy?.totalReviewCycles===5 && issue.executionState?.totalReviewBudgetHold && <Button type="button" variant="outline" disabled={pending||locked||!comment.trim()} onClick={()=>void decide("allow_one_more")}>Allow one additional review cycle</Button>}
         <div className="flex flex-wrap items-center justify-between gap-2">
           <Button type="button" variant="outline" disabled={pending || locked || !comment.trim()}
             onClick={() => void decide("in_progress")}>Request changes</Button>

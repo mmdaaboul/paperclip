@@ -1,3 +1,4 @@
+import { IssueScopedReviews } from "../IssueScopedReviews";
 import { isLockedIssueStub } from "@/components/LockedIssueChip";
 import { IssueExecutionDecision } from "../IssueExecutionDecision";
 import { IssuePullRequestLinks } from "../IssuePullRequestLinks";
@@ -2716,6 +2717,7 @@ export function IssueProperties({
         )}
 
         {policyAvailable && <IssueExecutionDecision issue={issue} currentUserId={currentUserId} />}
+        {policyAvailable && <IssueScopedReviews issue={issue} currentUserId={currentUserId} />}
 
         {showScheduledRetryRow && scheduledRetry?.scheduledRetryReason === "workspace_busy" ? (
           <PropertyRow label="Workspace">

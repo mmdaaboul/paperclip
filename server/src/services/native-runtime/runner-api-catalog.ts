@@ -88,6 +88,7 @@ export function buildRunnerApiCatalog(document: Json = buildOpenApiDocument()): 
       const method = verb.toUpperCase();
       const conversationalConfirmation = method === "POST"
         && /^\/api\/issues\/\{[^}]+\}\/interactions\/\{[^}]+\}\/resolve-from-comment$/.test(path);
+      const scopedReviewIntent=method==="POST" && /^\/api\/issues\/\{[^}]+\}\/scoped-reviews(?:\/\{[^}]+\}\/cancel)?$/.test(path);
       const taskTitleUpdate = method === "PUT" && /^\/api\/issues\/\{[^}]+\}\/title$/.test(path);
       const skillReference = runnerApiReference[`${method} ${path.replace(/\{[^}]+\}/g, "{}")}`];
       const protocol = operation["x-paperclip-transport"] === "protocol" || (operation["x-paperclip-transport"] !== "rest" && (!path.startsWith("/api/") || /\/(oauth|auth|runtime-tools|mcp|ws)(\/|$)/.test(path)
@@ -117,7 +118,7 @@ export function buildRunnerApiCatalog(document: Json = buildOpenApiDocument()): 
           : "Prefer an available dedicated tool for its supported fields. call_api supports the route's other operations and fields under the same agent permissions.",
         allowedModes: operation["x-paperclip-connection-management"] ? (method === "GET" ? ["standard", "ask", "planning"] : ["standard"]) : method !== "GET" && (path.endsWith("/case-handoffs") || /\/handoffs\//.test(path)) ? ["standard"]
           : method === "GET" || method === "HEAD" || taskTitleUpdate ? ["standard", "ask", "planning", "skill_test"]
-          : conversationalConfirmation ? ["standard", "planning", "skill_test"] : ["standard", "skill_test"],
+          : conversationalConfirmation || scopedReviewIntent ? ["standard", "planning", "skill_test"] : ["standard", "skill_test"],
         ...(skillReference ? { skillReference } : {}),
       });
     }

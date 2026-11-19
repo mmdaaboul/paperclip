@@ -1,4 +1,7 @@
 import type { Db } from "@paperclipai/db";
+import { scopedReviewSnapshotSchema } from "@paperclipai/shared";
+import { nativeSha256 } from "./canonical.js";
+import { getNativeStageReviewAssignment, historicalNativeStageDecision, nativeStageAssignmentRecord } from "./native-stage-review.js";
 import { z } from "zod";
 import { getNativeReviewAssignment } from "./native-review-participant.js";
 
@@ -25,9 +28,18 @@ export async function resolveNativeReviewerAssignment(db: Db, input: {
   actingRunId?: string; issueExecutionRunId?: string | null; allowResolvedByRunId?: string;
 }) {
   const native = await getNativeReviewAssignment(db, input);
-  if (!native) return null;
-  const record = nativeReviewerAssignmentRecordSchema.parse({ kind: "native_completion_review",
-    interactionId: native.interaction.id, sourceDecisionId: native.sourceDecision.id,
-    sourceRunId: native.sourceRun.id, builderAgentId: native.sourceRun.agentId });
-  return { record, sourceRun: native.sourceRun, sourceDecision: native.sourceDecision };
+  if(native) {
+    const source={sourceDecisionId:native.sourceDecision.id,sourceRunId:native.sourceRun.id,builderAgentId:native.sourceRun.agentId};
+    const record=nativeReviewerAssignmentRecordSchema.parse(native.scopedReview
+      ? {kind:"scoped_review",interactionId:native.interaction.id,...source,scopeId:native.scopedReview.id,scopeSnapshotDigest:nativeSha256(scopedReviewSnapshotSchema.parse(native.scopedReview.snapshot))}
+      : {kind:"native_completion_review",interactionId:native.interaction.id,...source});
+    return {record,sourceRun:native.sourceRun,sourceDecision:native.sourceDecision};
+  }
+  const stage=await getNativeStageReviewAssignment(db,{...input,...(input.actingRunId?{runId:input.actingRunId}:{})});
+  if(stage)return {record:nativeReviewerAssignmentRecordSchema.parse(nativeStageAssignmentRecord(stage)),sourceRun:stage.sourceRun,sourceDecision:stage.sourceDecision};
+  if(input.actingRunId && input.allowResolvedByRunId===input.actingRunId) {
+    const receipt=await historicalNativeStageDecision(db,{...input,runId:input.actingRunId});
+    if(receipt)return {record:nativeReviewerAssignmentRecordSchema.parse(receipt.record),sourceRun:receipt.sourceRun,sourceDecision:receipt.sourceDecision};
+  }
+  return null;
 }

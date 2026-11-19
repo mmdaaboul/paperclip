@@ -13,6 +13,10 @@ import { notifyObsoletePolicyReviews } from "../obsolete-policy-review-notificat
 import { notifyCancelledWorkspacePreservation } from "../cancelled-workspace-preservation-notifications.js";
 import { notifyInstructionCollection } from "../instruction-collection-notifications.js";
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
+import { previewNativeReviewCycleBudget } from "./native-review-cycle-budget.js";
+import { previewNativeScopedReview, assertCurrentScopedArtifact } from "../scoped-reviews.js";
+import { applyLockedReviewBudgetTransition, withLockedScopedReviewBudget } from "../review-cycle-budget-store.js";
+import { parseIssueExecutionState } from "../issue-execution-policy.js";
 import { scheduledIssueMonitorWait } from "../issue-monitors.js";
 import { onboardingFirstTaskCompletionAllowed } from "../onboarding-first-task-admission.js";
 import { NativeDeliverableEvidenceError, validateNativeDeliverableEvidence } from "./native-deliverable-feedback.js";
@@ -37,6 +41,7 @@ import {
   issueApprovals,
   issueRecoveryActions,
   issueThreadInteractions,
+  issueScopedReviews,
   issues,
   nativeRunFinalizations,
   nativeRunResults,
@@ -583,6 +588,7 @@ async function materializeDecisionEffect(input: {
   preMaterializedEffects?: ReadonlyMap<string, NativeMaterializedStatusEffect>;
   /** Terminal heartbeat_runs rows this effect wrote. The caller emits agent.task_run for each, after its transaction commits. */
   terminalRunsToEmit?: (typeof heartbeatRuns.$inferSelect)[];
+  scopedReviewPlan?: NonNullable<Awaited<ReturnType<typeof previewNativeScopedReview>>>;
 }): Promise<NativeMaterializedStatusEffect> {
   const { effect } = input;
   if (effect.kind === "create_interaction") {
@@ -637,6 +643,7 @@ async function materializeDecisionEffect(input: {
     };
   }
   if (effect.kind === "bind_reviewer") {
+    const materializeReview=async(scopedContext?:{scope:{state:string;version:string|number;interactionId:string|null;sourceDecisionId:string|null};duplicate:boolean})=>{
     failAt("interaction_materialization", input.failpoint);
     const reviewInput: Extract<
       CreateIssueThreadInteraction,
@@ -655,17 +662,17 @@ async function materializeDecisionEffect(input: {
       payload: {
         version: 1,
         prompt: effect.prompt,
-        detailsMarkdown: effect.detailsMarkdown ?? null,
-        acceptLabel: "Approve completion",
-        rejectLabel: "Continue work",
+        detailsMarkdown: input.scopedReviewPlan ? [effect.detailsMarkdown,`Scope: ${input.scopedReviewPlan.snapshot.purpose}`,`Remaining work: ${input.scopedReviewPlan.snapshot.remainingWork}`,`Native document revision: ${input.scopedReviewPlan.snapshot.revisionId}`,`Content SHA256: ${input.scopedReviewPlan.snapshot.contentSha256}`].filter(Boolean).join("\n\n") : effect.detailsMarkdown ?? null,
+        acceptLabel: input.scopedReviewPlan ? "Scope passed; return remaining work" : "Approve completion",
+        rejectLabel: input.scopedReviewPlan ? "Request scope changes" : "Continue work",
         allowDeclineReason: true,
         rejectRequiresReason: true,
         supersedeOnUserComment: false,
         target: {
           type: "custom",
-          key: "native_completion_review",
+          key: input.scopedReviewPlan ? "scoped_review" : "native_completion_review",
           revisionId: input.decisionId,
-          label: "Completion decision",
+          label: input.scopedReviewPlan ? "Partial document review; task unfinished" : "Completion decision",
         },
       },
     };
@@ -674,6 +681,18 @@ async function materializeDecisionEffect(input: {
       reviewInput,
       { systemId: "native-status-committer", runId: input.runId },
     );
+    if(input.scopedReviewPlan) {
+      if(!scopedContext) throw new Error("Scoped interaction requires its locked budget owner");
+      if(scopedContext.duplicate) {
+        if(scopedContext.scope.interactionId!==interaction.id || scopedContext.scope.sourceDecisionId!==input.decisionId)
+          throw new Error("Scoped interaction replay binding changed");
+      } else {
+        const [savedScope]=await input.tx.update(issueScopedReviews).set({state:"pending",interactionId:interaction.id,sourceDecisionId:input.decisionId,
+          version:sql`${issueScopedReviews.version}+1`,updatedAt:new Date()}).where(and(eq(issueScopedReviews.id,input.scopedReviewPlan.scope.id),
+          eq(issueScopedReviews.state,"draft"),eq(issueScopedReviews.version,Number(scopedContext.scope.version)))).returning({id:issueScopedReviews.id});
+        if(!savedScope) throw new Error("Scoped admission lost its version claim");
+      }
+    }
     // The card and its next actor commit together. The post-commit dispatcher
     // revalidates this exact review before granting a scoped reviewer run.
     const reviewContext = {
@@ -704,6 +723,14 @@ async function materializeDecisionEffect(input: {
         reviewerWakeId,
       },
     };
+    };
+    if(input.scopedReviewPlan) return withLockedScopedReviewBudget(input.tx,{companyId:input.companyId,issueId:input.issue.id,
+      scopeId:input.scopedReviewPlan.scope.id,expectedSnapshot:input.scopedReviewPlan.snapshot,expectedBudgetSha256:input.scopedReviewPlan.budgetSha256,now:input.scopedReviewPlan.now,
+      operation:{kind:"admit",sourceDecisionId:input.decisionId,assessmentId:input.scopedReviewPlan.assessmentId,resultId:input.scopedReviewPlan.resultId}},async context=>{
+        await assertCurrentScopedArtifact(input.tx,input.scopedReviewPlan!.snapshot,true);
+        return materializeReview(context);
+      });
+    return materializeReview();
   }
   if (effect.kind === "notify_owner") {
     const wakeId = await enqueueWake({
@@ -1646,7 +1673,13 @@ export async function commitNativeStatusDecision(input: {
   if (input.decision.reasonCode === null) {
     throw new Error("native_status_reason_code_required");
   }
-  const reasonCode = input.decision.reasonCode;
+  let reasonCode = input.decision.reasonCode;
+  const originalNativeDecision=input.decision;
+  const [preflightCoordinator]=await input.db.select({phase:nativeRunFinalizations.phase}).from(nativeRunFinalizations).where(and(
+    eq(nativeRunFinalizations.runId,input.runId),eq(nativeRunFinalizations.companyId,input.companyId),eq(nativeRunFinalizations.issueId,input.issueId)));
+  const replayExpected=preflightCoordinator?.phase==="committed" && !input.supersedesCommittedDecisionId;
+  const scopedReviewPlan=replayExpected?null:await previewNativeScopedReview(input.db,input);
+  const totalReviewPlan = replayExpected || scopedReviewPlan ? null : await previewNativeReviewCycleBudget(input.db, input);
   if (reasonCode === "native_provider_model_rejected" && !input.requireModelRejectionOwner) {
     throw new Error("native_model_rejection_owner_required");
   }
@@ -2103,12 +2136,18 @@ export async function commitNativeStatusDecision(input: {
         })
         .where(eq(nativeRunFinalizations.runId, input.runId));
     };
+    if(totalReviewPlan) {
+      input={...input,decision:totalReviewPlan.decision};
+      reasonCode=input.decision.reasonCode!;
+    }
     const decisionJson = {
       statusAction: input.decision.statusAction,
       toStatus: input.decision.toStatus,
       reasonCode,
       unblockDescriptor: input.decision.unblockDescriptor,
       effects: input.decision.effects,
+      ...(scopedReviewPlan?{scopedReview:{id:scopedReviewPlan.scope.id,documentId:scopedReviewPlan.snapshot.documentId,
+        revisionId:scopedReviewPlan.snapshot.revisionId,contentSha256:scopedReviewPlan.snapshot.contentSha256,executionWorkspaceId:scopedReviewPlan.snapshot.executionWorkspaceId}}:{}),
       ...(externalChatReviewPresentation
         ? { externalChatReviewPresentation }
         : {}),
@@ -2260,6 +2299,7 @@ export async function commitNativeStatusDecision(input: {
           failpoint: input.failpoint,
           preMaterializedEffects,
           terminalRunsToEmit,
+          ...(scopedReviewPlan?{scopedReviewPlan}:{}),
         }),
       );
     }
@@ -2280,19 +2320,29 @@ export async function commitNativeStatusDecision(input: {
       if (!updated) throw new NativeStatusRaceError();
     } else {
       failAt("status_projection", input.failpoint);
-      const projected = await issueService(tx as unknown as Db).update(
-        input.issueId,
-        {
-          status: input.decision.toStatus,
-          statusVersion: input.priorStatusVersion + 1,
-          lastStatusDecisionId: decisionRow.id,
-          unblockDescriptor: input.decision.unblockDescriptor,
-          actorAgentId: null,
-          actorUserId: null,
-        },
-        tx,
-        publications,
-      );
+      const nativeProjection: Record<string,unknown>={status:input.decision.toStatus,
+        statusVersion:input.priorStatusVersion+1,lastStatusDecisionId:decisionRow.id,
+        unblockDescriptor:input.decision.unblockDescriptor,actorAgentId:null,actorUserId:null};
+      const holder: { value?: Awaited<ReturnType<ReturnType<typeof issueService>["update"]>> }={};
+      if(scopedReviewPlan) {
+        await withLockedScopedReviewBudget(tx,{companyId:input.companyId,issueId:input.issueId,scopeId:scopedReviewPlan.scope.id,
+          expectedSnapshot:scopedReviewPlan.snapshot,expectedBudgetSha256:scopedReviewPlan.budgetSha256,now:scopedReviewPlan.now,
+          operation:{kind:"admit",sourceDecisionId:decisionRow.id,assessmentId:scopedReviewPlan.assessmentId,resultId:scopedReviewPlan.resultId}},async()=>{
+            await assertCurrentScopedArtifact(tx as unknown as Db,scopedReviewPlan.snapshot,true);
+            holder.value=await issueService(tx as unknown as Db).update(input.issueId,nativeProjection,tx,publications);
+          });
+      } else if(totalReviewPlan) {
+        if(coordinator.resultId) await tx.select({id:nativeRunResults.id}).from(nativeRunResults).where(eq(nativeRunResults.id,coordinator.resultId)).for("share");
+        await tx.select({id:workAssessments.id}).from(workAssessments).where(eq(workAssessments.id,input.assessmentId)).for("share");
+        const committedPlan=await previewNativeReviewCycleBudget(tx as unknown as Db,{...input,decision:originalNativeDecision});
+        if(!committedPlan) throw new NativeStatusRaceError();
+        committedPlan.transition.reviewCycleNow=totalReviewPlan.transition.reviewCycleNow;
+        await applyLockedReviewBudgetTransition(tx,{companyId:input.companyId,issueId:input.issueId,
+          transition:committedPlan.transition,expectedPreview:totalReviewPlan.preview,expectedStoredPolicy:totalReviewPlan.transition.policy},async(_sameTx,_lockedIssue,result)=>{
+          holder.value=await issueService(tx as unknown as Db).update(input.issueId,{...nativeProjection,...result.patch},tx,publications);
+        });
+      } else holder.value=await issueService(tx as unknown as Db).update(input.issueId,nativeProjection,tx,publications);
+      const projected=holder.value;
       if (!projected) throw new NativeStatusRaceError();
       updated = projected;
       if (updated.originKind === "routine_execution") {
@@ -2333,6 +2383,24 @@ export async function commitNativeStatusDecision(input: {
           reasonCode,
         },
       });
+    }
+
+    if(totalReviewPlan && !totalReviewPlan.preview.decision) {
+      const previous=parseIssueExecutionState(issue.executionState), next=parseIssueExecutionState(updated.executionState);
+      const participant=next?.currentParticipant;
+      const changed=next?.status==="pending" && (previous?.status!=="pending" || previous.currentStageId!==next.currentStageId
+        || JSON.stringify(previous.currentParticipant)!==JSON.stringify(participant));
+      if(changed && participant?.type==="agent" && participant.agentId) {
+        const executionStage={wakeRole:next.currentStageType==="approval"?"approver":"reviewer",stageId:next.currentStageId,
+          stageType:next.currentStageType,currentParticipant:participant,returnAssignee:next.returnAssignee,
+          reviewRequest:next.reviewRequest??null,lastDecisionOutcome:next.lastDecisionOutcome,allowedActions:["approve","request_changes"],
+          policySha256:nativeSha256(totalReviewPlan.transition.policy),workspaceBindingRevision:updated.workspaceBindingRevision,executionWorkspaceId:updated.executionWorkspaceId};
+        const wakeId=await enqueueWake({tx:tx as unknown as Db,companyId:input.companyId,issueId:input.issueId,agentId:participant.agentId,
+          reason:next.currentStageType==="approval"?"execution_approval_requested":"execution_review_requested",
+          idempotencyKey:`native-execution-stage:${decisionRow.id}:${next.currentStageId}`,payload:{executionStage,nativeStageDecisionId:decisionRow.id,nativeStageAdmissionId:totalReviewPlan?.preview.reviewCycleBudget?.admissions.at(-1)?.id,nativeStageStatusVersion:updated.statusVersion},
+          contextSnapshot:{executionStage,nativeStageDecisionId:decisionRow.id,nativeStageAdmissionId:totalReviewPlan?.preview.reviewCycleBudget?.admissions.at(-1)?.id,nativeStageStatusVersion:updated.statusVersion,forceFreshSession:true}});
+        materialized.push({effectKind:"execution_stage_wake",targetType:"agent_wakeup_request",targetId:wakeId,payload:{stageId:next.currentStageId,agentId:participant.agentId}});
+      }
     }
 
     if (input.decision.statusAction === "done" && issue.status !== "done") {

@@ -1,4 +1,5 @@
 import { readRequiredQualityReview } from "../required-quality-review.js";
+import { nativeStageReviewOutcome } from "./native-stage-review.js";
 import { pendingTaskRepository } from "../task-workspace-tools.js";
 import { onboardingFirstTaskCompletionAllowed } from "../onboarding-first-task-admission.js";
 import { eligibleIssueMonitorWait } from "../issue-monitors.js";
@@ -93,6 +94,12 @@ export async function nativeCompletionFeedback(
   }
   const acceptedHandoff = await assertNativeCaseHandoffResult(db, runId, issue.id, result);
   if (acceptedHandoff) return "The persisted case handoff controls this turn. End the turn; the task remains open for its next agent.";
+  const stageOutcome=await nativeStageReviewOutcome(db,{companyId:run.companyId,issueId:issue.id,agentId:run.agentId,runId:run.id,contextSnapshot:run.contextSnapshot});
+  if(stageOutcome) {
+    if(result.continuation?.kind==="monitor") throw new Error("Stage review runs cannot yield to a task monitor");
+    if(stageOutcome==="pending" && result.reportedWorkDisposition!=="blocked") throw new Error("Record the selected stage verdict with resolve_stage_review before finishing, or report its concrete blocker");
+    return "The dedicated review verdict controls this task; this report cannot override it.";
+  }
   const reviewContext = readNativeReviewAssignmentContext(run.contextSnapshot);
   if (reviewContext) {
     if (result.continuation?.kind === "monitor") throw new Error("Review-only runs cannot yield to a task monitor; resolve the assigned review or report its blocker.");

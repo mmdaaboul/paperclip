@@ -1,3 +1,5 @@
+import { boundRunIssueId } from "../run-task-binding.js";
+import { noRetainedExecutionPredicate } from "../pre-dispatch-execution-evidence.js";
 import { instanceSettingsService } from "../instance-settings.js";
 import { writeDeferredExecutionWait } from "../deferred-execution-wait.js";
 import type { DeferredReceiptRecoveryOptions } from "../deferred-execution-notifications.js";
@@ -1179,23 +1181,23 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       && typeof intent.intentAuditId === "string" && typeof intent.acknowledgementAuditId === "string";
   }
 
-  async function completedRunTerminationProof(run: typeof heartbeatRuns.$inferSelect): Promise<string | null> {
+  async function completedRunTerminationProof(run: typeof heartbeatRuns.$inferSelect, database:Db=db): Promise<string | null> {
     // Logical completion can win the race with queued Stop delivery. It does
     // not prove a provider exited, and an in-process owner must still settle.
     if (!isHeartbeatRunTerminalStatus(run.status) || activeRunExecutions.has(run.id) ||
       runningProcesses.has(run.id) || adapterExecutionControls.has(run.id) || processRunCancellationSettlements.has(run.id)) return null;
-    const leases = await db.select().from(environmentLeases).where(and(
+    const leases = await database.select().from(environmentLeases).where(and(
       eq(environmentLeases.companyId, run.companyId), eq(environmentLeases.heartbeatRunId, run.id),
     ));
     if (leases.some(lease => lease.provider !== "local"))
       return leases.every(hasRemoteTerminationReceipt) ? "provider_termination_receipt" : null;
     if (run.processPid || run.processGroupId || run.processStartedAt)
-      return await recordedLocalExecutionStopped(db, run) ? "local_process_exit" : null;
-    if (await readNativeLocalProcessStop(db, run.companyId, run.id)) return "local_process_stop_receipt";
+      return await recordedLocalExecutionStopped(database, run) ? "local_process_exit" : null;
+    if (await readNativeLocalProcessStop(database, run.companyId, run.id)) return "local_process_stop_receipt";
     // Normal native finalization clears mutable process fields. Rebind the
     // latest server-owned launch identity before checking that exact local
     // process and group. Any newer start invalidates the older observation.
-    const [identity] = await db.select({ eventType: heartbeatRunEvents.eventType, payload: heartbeatRunEvents.payload })
+    const [identity] = await database.select({ eventType: heartbeatRunEvents.eventType, payload: heartbeatRunEvents.payload })
       .from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.companyId, run.companyId),
         eq(heartbeatRunEvents.runId, run.id), isNull(heartbeatRunEvents.sourceEventId),
         inArray(heartbeatRunEvents.eventType, [PROCESS_START_REQUESTED, PROCESS_IDENTITY_RECORDED, "native.local_process_stopped"])))
@@ -1208,8 +1210,19 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
       typeof recorded.processStartedAt !== "string") return null;
     const processStartedAt = new Date(recorded.processStartedAt);
     if (Number.isNaN(processStartedAt.getTime())) return null;
-    return await recordedLocalExecutionStopped(db, { ...run, processPid: recorded.processPid,
+    return await recordedLocalExecutionStopped(database, { ...run, processPid: recorded.processPid,
       processGroupId: recorded.processGroupId, processStartedAt }) ? "local_process_exit" : null;
+  }
+
+  /** Read-only target-aware settlement owned by native Stop. A terminal row
+   * alone grants nothing. Use the caller's locked transaction for DB evidence. */
+  async function readRunTerminationProof(input:{companyId:string;runId:string},database:Db=db) {
+    const [run]=await database.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId,input.companyId),eq(heartbeatRuns.id,input.runId)));
+    if(!run || !isHeartbeatRunTerminalStatus(run.status) || activeRunExecutions.has(run.id) || runningProcesses.has(run.id) || adapterExecutionControls.has(run.id) || processRunCancellationSettlements.has(run.id))return null;
+    const proof=await completedRunTerminationProof(run,database);
+    if(proof)return {runId:run.id,companyId:run.companyId,agentId:run.agentId,issueId:boundRunIssueId(run),proof};
+    const [neverDispatched]=await database.select({id:heartbeatRuns.id}).from(heartbeatRuns).where(and(eq(heartbeatRuns.id,run.id),eq(heartbeatRuns.companyId,run.companyId),noRetainedExecutionPredicate()));
+    return neverDispatched?{runId:run.id,companyId:run.companyId,agentId:run.agentId,issueId:boundRunIssueId(run),proof:"never_dispatched"}:null;
   }
 
   function deliveredBudgetCancellationResult(run: typeof heartbeatRuns.$inferSelect, deliveredAt: Date) {
@@ -1852,6 +1865,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
   }
 
   return {
+    readRunTerminationProof,
     cancelBudgetScopeWork,
     releaseIssueExecutionAndPromote,
     releaseEnvironmentLeasesForRun,

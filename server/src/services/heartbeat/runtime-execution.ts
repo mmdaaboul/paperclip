@@ -1,3 +1,4 @@
+import { assertScopedRunAdmission } from "../scoped-review-admission.js";
 import { readClaimedNativeStopRecovery } from "../native-runtime/native-cancellation-request.js";
 import { readContextCompactionRequest } from "../context-compaction.js";
 import { remoteWorkspaceFailureCause } from "../remote-workspace-transport.js";
@@ -192,7 +193,7 @@ export interface HeartbeatRuntimeExecutionInput {
   };
   services: Pick<RunState, "upsertTaskSession" | "getRun"> &
     Pick<Lifecycle, "persistRunProcessMetadata" | "recordCurrentHeartbeatRunRuntimeProgress"> &
-    Pick<ReturnType<typeof createHeartbeatRunControl>, "cancelRunInternal"> &
+    Pick<ReturnType<typeof createHeartbeatRunControl>, "cancelRunInternal" | "readRunTerminationProof"> &
     Pick<ReturnType<typeof createHeartbeatQueue>, "enqueueWakeup" | "dispatchPendingNativeStatusWakeups"> & {
     executionWorkspacesSvc: Pick<ReturnType<typeof executionWorkspaceService>, "getStoredById">;
     instanceSettings: Pick<ReturnType<typeof instanceSettingsService>, "getExperimental">;
@@ -242,6 +243,7 @@ function readNonEmptyString(value: unknown): string | null {
 export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExecutionInput): Promise<HeartbeatRuntimeExecutionResult> {
   const { run, agent, options } = input;
   const { issueRef, issueContext, context, issueId, taskKey, executionContinuation } = input.task;
+  if(issueId)await assertScopedRunAdmission(db,{companyId:agent.companyId,issueId,runId:run.id},{readRunTerminationProof:input.services.readRunTerminationProof});
   const { nativeRuntimeResolution, nativeExecution, nativeRunnerInstanceId, adapter, runtimeForAdapter, getNativeFreshSessionHandoff, getFreshSessionHandoff, runOptions } = input.runtime;
   const { persistedExecutionWorkspace, executionWorkspace, executionTarget, workspaceOperationRecorder, nativeWorkspaceSync, workspaceRestoreSource, remoteExecution } = input.workspace;
   const remoteWorkspaceAuthority = readRemoteWorkspaceAuthority(persistedExecutionWorkspace?.metadata);

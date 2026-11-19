@@ -788,6 +788,8 @@ export interface QualityReviewBinding {
 }
 
 export interface IssueExecutionPolicy {
+  /** Explicit selected workflow; native policies without this flag remain unchanged. */
+  totalReviewCycles?: 5;
   mode: IssueExecutionPolicyMode;
   requiredQualityReview?: RequiredQualityReview;
   commentRequired: boolean;
@@ -825,6 +827,9 @@ export interface IssueReviewRequest {
 }
 
 export interface IssueExecutionState {
+  totalReviewBudgetHold?: boolean;
+  totalReviewCyclesUsed?: number;
+  totalReviewCycleAllowance?: number;
   status: IssueExecutionStateStatus;
   currentStageId: string | null;
   currentStageIndex: number | null;

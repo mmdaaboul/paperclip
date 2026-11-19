@@ -1,3 +1,4 @@
+import { assertScopedRunAdmission } from "./scoped-review-admission.js";
 import { registerHeldPreparationResumer } from "./interrupted-preparation-hold-settlement.js";
 import { resolveProviderApiPlacement } from "./native-runtime/provider-api-placement.js";
 import { isProcessRunAdmissionClosed } from "./heartbeat/run-admission.js";
@@ -2207,6 +2208,7 @@ export function heartbeatService(
       const taskKey = deriveTaskKeyWithHeartbeatFallback(context, null);
       const sessionCodec = getAdapterSessionCodec(agent.adapterType);
       const issueId = readNonEmptyString(context.issueId);
+      if(issueId)await assertScopedRunAdmission(db,{companyId:agent.companyId,issueId,runId:run.id},{readRunTerminationProof:runControl.readRunTerminationProof});
       const freshWorkspace = await readFreshWorkspaceReadiness(db, run);
       if (issueId && canApplyTaskWorkspaceSelectionAtAdmission({ admittedInput: parseObject(run.runnerProfileJson).nativeExecutionInput, restarting: Boolean(runOptions.nativeRestartRecovery), hasLeaseOwner: Boolean(runOptions.nativeLeaseOwner) })) {
         const changed = await executionWorkspacesSvc.applyPendingTaskWorkspaceSelection({ companyId: agent.companyId,
@@ -2220,6 +2222,7 @@ export function heartbeatService(
           delete context.resumeSessionParams;
           delete context.resumeSessionDisplayId;
           context.workspaceSelectionChanged = true;
+          await assertScopedRunAdmission(db,{companyId:agent.companyId,issueId,runId:run.id},{readRunTerminationProof:runControl.readRunTerminationProof});
         }
       }
       let issueContext = issueId
@@ -3557,6 +3560,7 @@ export function heartbeatService(
             upsertTaskSession,
             getRun,
             cancelRunInternal,
+            readRunTerminationProof:runControl.readRunTerminationProof,
             enqueueWakeup,
             persistRunProcessMetadata: async (processRunId, meta) => {
               if (!issueId || (executionTarget && executionTarget.kind !== "local")) {
@@ -4507,6 +4511,7 @@ export function heartbeatService(
     tickIssueMonitors,
     nextIssueMonitorAt,
 
+    readRunTerminationProof: runControl.readRunTerminationProof,
     cancelRun: (runId: string, reason?: string, options?: CancelRunOptions) =>
       cancelRunInternal(runId, reason, options),
 

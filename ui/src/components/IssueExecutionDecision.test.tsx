@@ -256,3 +256,52 @@ describe("human execution decisions", () => {
     expect(issuesApi.update).not.toHaveBeenCalled();
   });
 });
+
+function exhaustedBudgetTask(): Issue {
+  const issue = fixture("review");
+  issue.executionPolicy!.totalReviewCycles = 5;
+  issue.executionPolicy!.stages[0].participants = [{ id: "one-reviewer", type: "agent", agentId: "reviewer", userId: null }];
+  issue.executionPolicy!.stages.push({ id: "human-final", type: "approval", approvalsNeeded: 1,
+    participants: [{ id: "human", type: "user", userId: "owner", agentId: null }] });
+  Object.assign(issue.executionState!, { totalReviewBudgetHold: true, totalReviewCyclesUsed: 5, totalReviewCycleAllowance: 5 });
+  return issue;
+}
+
+describe("explicit human allowance for one configured Reviewer", () => {
+  it("shows usage and requires a reason before granting one additional cycle", async () => {
+    task = exhaustedBudgetTask(); await render();
+    expect(container.textContent).toContain("Review cycles: 5 of 5 used");
+    expect(button("Allow one additional review cycle").disabled).toBe(true);
+    await type("  One more correction is justified.  ");
+    await click("Allow one additional review cycle");
+    expect(issuesApi.update).toHaveBeenCalledTimes(1);
+    const payload = vi.mocked(issuesApi.update).mock.calls[0][1];
+    expect(payload).toEqual({ reviewCycleAllowance: { id: expect.stringMatching(/^[a-f0-9-]{36}$/), additionalCycles: 1, reason: "One more correction is justified." } });
+    expect(container.querySelector('[role="status"]')?.textContent).toContain("earlier usage is retained");
+  });
+  it("does not expose allowance controls to an unrelated user", async () => {
+    task = exhaustedBudgetTask(); await render(task, "other");
+    expect(container.querySelector("button")).toBeNull();
+  });
+  it("locks a stale allowance conflict until the task is refreshed",async()=>{
+    task=exhaustedBudgetTask();vi.mocked(issuesApi.update).mockRejectedValueOnce(new ApiError("Task changed",409,{}));
+    await render();await type("One more cycle.");await click("Allow one additional review cycle");
+    expect(button("Allow one additional review cycle").disabled).toBe(true);
+    await click("Allow one additional review cycle");expect(issuesApi.update).toHaveBeenCalledTimes(1);
+  });
+  it("locks an uncertain grant and never repeats it blindly", async () => {
+    task = exhaustedBudgetTask(); vi.mocked(issuesApi.update).mockRejectedValueOnce(new Error("Response lost"));
+    await render(); await type("One more cycle."); await click("Allow one additional review cycle");
+    expect(button("Allow one additional review cycle").disabled).toBe(true);
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("Could not confirm");
+    await click("Allow one additional review cycle"); expect(issuesApi.update).toHaveBeenCalledTimes(1);
+  });
+  it("refuses a grant after the fresh read shows changed usage", async () => {
+    task = exhaustedBudgetTask(); const changed = structuredClone(task);
+    changed.executionState!.totalReviewCycleAllowance = 6;
+    vi.mocked(issuesApi.get).mockResolvedValueOnce(changed);
+    await render(); await type("One more cycle."); await click("Allow one additional review cycle");
+    expect(issuesApi.update).not.toHaveBeenCalled();
+    expect(container.querySelector('[role="alert"]')?.textContent).toContain("changed");
+  });
+});

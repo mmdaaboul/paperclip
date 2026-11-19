@@ -350,3 +350,15 @@ describe("interaction resolution replay", () => {
     expect(mockApi.get).not.toHaveBeenCalled();
   });
 });
+
+describe("manual review intent versus guarded human decision payload",()=>{
+ it("adds one submission receipt to ordinary manual review intent",async()=>{
+   mockApi.patch.mockResolvedValue({id:"task"});await issuesApi.update("task",{status:"done"});
+   expect(mockApi.patch.mock.calls.at(-1)?.[1]).toMatchObject({status:"done",reviewCycleSubmissionId:expect.stringMatching(/^[a-f0-9-]{36}$/)});
+ });
+ it("preserves the exact guarded human decision contract without a Builder receipt",async()=>{
+   const data={status:"done",comment:"Reviewed",expectedExecutionDecision:{statusVersion:3,executionPolicy:{stages:[]},executionState:{status:"pending"}}};
+   mockApi.patch.mockResolvedValue({id:"task",comment:{id:"9af8228f-0be7-45ae-a104-6fbe0af6f1d3",issueId:"5e5f9946-c706-4785-8988-d4d6f0f499ab",body:"Reviewed"}});await issuesApi.update("task",data);
+   expect(mockApi.patch.mock.calls.at(-1)?.[1]).toEqual(data);
+ });
+});

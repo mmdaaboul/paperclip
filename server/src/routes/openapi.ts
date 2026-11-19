@@ -1,3 +1,4 @@
+import { nativeStageReviewDecisionSchema, createScopedReviewSchema, cancelScopedReviewSchema } from "@paperclipai/shared";
 import { MUSE_ASSET_VERSION, museStopBoundarySchema, museDetectorCleanupAttestationSchema, createGrokInvitationSchema, configureGrokRoutineSchema, verifyGrokRoutineSchema, recoverGrokRoutineSchema, pairGrokBindingSchema, stopGrokWorkSchema, retryGrokDeliverySchema, updateFastResponseSchema } from "@paperclipai/shared";
 import { slackTestMessageSchema, slackTestMessageResultSchema, slackManagerAuthorizationSchema, slackSetupOptionsSchema, slackManagedProvisionSchema, slackManagedResultSchema, slackRegistrationSchema, slackSetupActionSchema, slackInstallAuthorizationSchema, slackRegistrationStateSchema, slackAppConfigurationSchema, slackAvatarStateSchema, slackAccountStateSchema } from "@paperclipai/shared";
 import { experimentalApiMetadata } from "./experimental-api-metadata.js";
@@ -4344,6 +4345,27 @@ registry.registerPath({
   summary: "Get an issue",
   request: { params: z.object({ id: z.string() }), query: z.object({ view: z.literal("core").optional().describe("Task fields with saved document and work-product cards, without recovery or related-task enrichment and without provider refresh.") }) },
   responses: { 200: r.ok(), 401: r.unauthorized, 404: r.notFound },
+});
+
+registry.registerPath({method:"post",path:"/api/issues/{id}/execution-stage-review/decisions",tags:["issues"],summary:"Resolve the one native independent execution-stage review assigned to this run",
+  request:{params:z.object({id:z.string()}),body:jsonBody(nativeStageReviewDecisionSchema)},responses:{200:r.ok(),400:r.badRequest,401:r.unauthorized,403:r.forbidden,404:r.notFound,409:r.conflict}});
+registry.registerPath({
+  method: "get", path: "/api/issues/{id}/scoped-reviews", tags: ["issues"],
+  summary: "List partial review requests and retained outcomes",
+  request: { params: z.object({ id: z.string() }) },
+  responses: { 200: r.ok(), 401: r.unauthorized, 403: r.forbidden, 404: r.notFound },
+});
+registry.registerPath({
+  method:"post",path:"/api/issues/{id}/scoped-reviews/{scopeId}/cancel",tags:["issues"],summary:"Cancel a scoped request while retaining shared review usage",
+  description:"The captured Builder may withdraw an unsubmitted draft. An authenticated task manager may cancel a dispatched review. Its idempotent cancellation intent blocks new dispatch; native Stop must confirm before the parent returns. An interrupted or uncertain Stop leaves the cancelling request visible for retry with the same requestId/reason. Already-spent cycles and every prior outcome remain retained.",
+  request:{params:z.object({id:z.string(),scopeId:z.string()}),body:jsonBody(cancelScopedReviewSchema)},responses:{200:r.ok(),400:r.badRequest,401:r.unauthorized,403:r.forbidden,404:r.notFound,409:r.conflict},
+});
+registry.registerPath({
+  method: "post", path: "/api/issues/{id}/scoped-reviews", tags: ["issues"],
+  summary: "Request a scoped review of an exact native document revision",
+  description: "Current native Builder only. Select the current task/workspace/status version and latest linked native document revision. The server pins integrity, configured Reviewer, purpose and remaining work. The response is durable draft intent, not completed review or dispatched execution. A duplicate id must describe the identical request. Final task completion still requires configured review and selected human approval; all substantive review cycles share the parent five-total budget.",
+  request: { params: z.object({ id: z.string() }), body: jsonBody(createScopedReviewSchema) },
+  responses: { 200: r.ok(), 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 409: r.conflict },
 });
 
 registry.registerPath({

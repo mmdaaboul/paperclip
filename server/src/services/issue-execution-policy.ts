@@ -1,3 +1,5 @@
+import { applyTotalReviewBudgetTransition } from "./total-review-budget.js";
+import type { IssueReviewCycleBudget, ReviewCycleSubmission, ReviewCycleAllowanceRequest } from "@paperclipai/shared";
 import { randomUUID } from "node:crypto";
 import type {
   IssueExecutionDecision,
@@ -19,6 +21,8 @@ type AssigneeLike = {
 };
 
 type IssueLike = AssigneeLike & {
+  id?: string;
+  companyId?: string;
   status: string;
   responsibleUserId?: string | null;
   createdByUserId?: string | null;
@@ -33,6 +37,7 @@ type IssueLike = AssigneeLike & {
 };
 
 type ActorLike = {
+  runId?: string | null;
   agentId?: string | null;
   userId?: string | null;
 };
@@ -42,7 +47,13 @@ type RequestedAssigneePatch = {
   assigneeUserId?: string | null;
 };
 
-type TransitionInput = {
+export type TransitionInput = {
+  reviewCycleBudget?: IssueReviewCycleBudget | null;
+  reviewCycleInitializationAuthorized?: boolean;
+  reviewCycleAdmission?: ReviewCycleSubmission;
+  reviewCycleHumanSubmissionAuthorized?: boolean;
+  reviewCycleAllowance?: { request: ReviewCycleAllowanceRequest; authorized: boolean };
+  reviewCycleNow?: string;
   issue: IssueLike;
   policy: IssueExecutionPolicy | null;
   previousPolicy?: IssueExecutionPolicy | null;
@@ -55,7 +66,8 @@ type TransitionInput = {
   monitorExplicitlyUpdated?: boolean;
 };
 
-type TransitionResult = {
+export type TransitionResult = {
+  reviewCycleBudget?: IssueReviewCycleBudget;
   patch: Record<string, unknown>;
   decision?: Pick<IssueExecutionDecision, "stageId" | "stageType" | "outcome" | "body">;
   workflowControlledAssignment?: boolean;
@@ -398,7 +410,7 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
   const authorizationPolicy = parsed.data.authorizationPolicy;
 
   if (stages.length === 0 && !monitor && !reviewPreset && !authorizationPolicy
-    && parsed.data.maxReviewRounds == null && !parsed.data.requiredQualityReview) return null;
+    && parsed.data.maxReviewRounds == null && !parsed.data.requiredQualityReview && parsed.data.totalReviewCycles == null) return null;
 
   return {
     mode: parsed.data.mode ?? "normal",
@@ -409,6 +421,7 @@ export function normalizeIssueExecutionPolicy(input: unknown): IssueExecutionPol
     ...(reviewPreset ? { reviewPreset } : {}),
     ...(authorizationPolicy ? { authorizationPolicy } : {}),
     ...(parsed.data.maxReviewRounds != null ? { maxReviewRounds: parsed.data.maxReviewRounds } : {}),
+    ...(parsed.data.totalReviewCycles === 5 ? { totalReviewCycles: 5 as const } : {}),
   };
 }
 
@@ -442,6 +455,7 @@ function principalsEqual(a: IssueExecutionStagePrincipal | null, b: IssueExecuti
 }
 
 function resolveMaxReviewRounds(policy: IssueExecutionPolicy | null): number {
+  if (policy?.totalReviewCycles === 5) return Number.POSITIVE_INFINITY;
   const configured = policy?.maxReviewRounds;
   return typeof configured === "number" && configured > 0 ? configured : DEFAULT_MAX_REVIEW_ROUNDS;
 }
@@ -479,7 +493,7 @@ function nextPendingStageAfter(
   return policy.stages.find((stage, index) => index > completedIndex && !completed.has(stage.id)) ?? null;
 }
 
-function selectStageParticipant(
+export function selectStageParticipant(
   stage: IssueExecutionStage,
   opts?: {
     preferred?: IssueExecutionStagePrincipal | null;
@@ -590,6 +604,7 @@ function buildPendingState(input: {
     lastDecisionOutcome: input.previous?.lastDecisionOutcome ?? null,
     monitor: input.previous?.monitor ?? null,
     changesRequestedCount: input.changesRequestedCount ?? input.previous?.changesRequestedCount ?? 0,
+    ...(input.previous?.totalReviewBudgetHold ? { totalReviewBudgetHold: true } : {}),
   };
 }
 
@@ -739,7 +754,7 @@ function applyIssueExecutionStageTransition(input: TransitionInput): TransitionR
     const escalatedHold =
       currentParticipant.type === "user" &&
       !stageHasParticipant(activeStage, currentParticipant) &&
-      (existingState?.changesRequestedCount ?? 0) >= resolveMaxReviewRounds(input.policy);
+      (existingState?.totalReviewBudgetHold === true || (existingState?.changesRequestedCount ?? 0) >= resolveMaxReviewRounds(input.policy));
     if (escalatedHold && !principalsEqual(currentParticipant, actor)) {
       // An empty patch would not override the caller's own requested fields,
       // so a status or assignee change from a non-escalated actor must be
@@ -1231,10 +1246,11 @@ export function buildIssueMonitorClearedPatch(input: {
 }
 
 export function applyIssueExecutionPolicyTransition(input: TransitionInput): TransitionResult {
-  const stageResult = applyIssueExecutionStageTransition(input);
-  const monitorPatch = applyMonitorTransition(input, stageResult.patch);
-  Object.assign(stageResult.patch, monitorPatch);
-  return stageResult;
+  return applyTotalReviewBudgetTransition(input, nativeInput => {
+    const stageResult = applyIssueExecutionStageTransition(nativeInput);
+    Object.assign(stageResult.patch, applyMonitorTransition(nativeInput, stageResult.patch));
+    return stageResult;
+  });
 }
 
 export function applyIssueMonitorPolicyTransition(input: TransitionInput): TransitionResult {

@@ -1,3 +1,5 @@
+import { getNativeStageReviewAssignment, historicalNativeStageDecision } from "./native-stage-review.js";
+import { decideNativeStageReview } from "./native-stage-review-decision.js";
 import { assertReviewerNativeToolBoundary } from "./reviewer-native-tool-boundary.js";
 import type { ReviewerGitHubToolAdapter } from "./reviewer-github-tools.js";
 import { budgetServiceInTransaction } from "../budgets.js";
@@ -195,6 +197,7 @@ type NativeDocumentContent = { id: string | null; documentId: string; body: stri
 const UNKNOWN_DOCUMENT_REVISION_BODY = "[Document revision content omitted: historical source trust could not be established.]";
 
 type Binding = {
+  nativeStageReview?: {nativeStageDecisionId:string;nativeStageAdmissionId:string;nativeStageStatusVersion:number};
   /** Controller-admitted optional role, not model/adapter configuration. */
   reviewerRole?: boolean;
   reviewerGitHubTools?: ReviewerGitHubToolAdapter;
@@ -338,6 +341,11 @@ export class PaperclipRunnerToolAuthority {
   constructor(readonly db: Db, readonly binding: Binding) {}
 
   definitions(): Array<Record<string, unknown>> {
+    if(this.binding.nativeStageReview)return [
+      ...(!this.binding.firstPartyOnly && !this.binding.museRuntime ? this.binding.reviewerGitHubTools?.definitions()??[]:[]),
+      ...CAPABILITY_SEMANTIC_TOOL_CATALOG.filter(tool=>NATIVE_REVIEW_READ_TOOLS.has(tool.operationId)).map(tool=>({name:tool.operationId,description:tool.description,inputSchema:tool.inputSchema})),
+      {name:"resolve_stage_review",description:"Record your exact assigned independent stage verdict; the shared cycle budget and selected human approval remain in force.",inputSchema:{type:"object",additionalProperties:false,properties:{id:{type:"string",format:"uuid"},outcome:{type:"string",enum:["approved","changes_requested"]},body:{type:"string",minLength:1,maxLength:12000}},required:["id","outcome","body"]}},
+    ];
     if (!this.binding.nativeReview && (this.binding.reviewerRole || this.binding.reviewerGitHubTools)) return [
       ...(!this.binding.firstPartyOnly && !this.binding.museRuntime ? this.binding.reviewerGitHubTools?.definitions() ?? [] : []),
       ...CAPABILITY_SEMANTIC_TOOL_CATALOG.filter(tool => NATIVE_REVIEW_READ_TOOLS.has(tool.operationId))
@@ -442,6 +450,7 @@ export class PaperclipRunnerToolAuthority {
     await this.#assertReviewerBoundary(call.tool);
     if (this.binding.reviewerGitHubTools?.has(call.tool)) return null; // Closed action ledger owns retry/uncertainty.
     await this.#assertToolScope(call.tool);
+    if(this.binding.nativeStageReview && call.tool==="resolve_stage_review")return {result:await this.#resolveStageReview(call.arguments,true)};
     if (!this.binding.museRuntime) await this.binding.assertBridgeAuthority?.();
     const context = await this.#boundContext({ tool: call.tool });
     const { run } = context;
@@ -583,12 +592,13 @@ export class PaperclipRunnerToolAuthority {
 
   async #assertReviewerBoundary(tool: string): Promise<void> {
     await assertReviewerNativeToolBoundary(this.db, { ...this.binding, tool,
-      nativeReview: !!this.binding.nativeReview, nativeReadTool: NATIVE_REVIEW_READ_TOOLS.has(tool),
+      nativeReview: !!this.binding.nativeReview, nativeStageReview: !!this.binding.nativeStageReview, nativeReadTool: NATIVE_REVIEW_READ_TOOLS.has(tool),
       closedDiscussionTool: !!this.binding.reviewerGitHubTools?.has(tool),
     });
   }
 
   async #assertToolScope(tool: string): Promise<void> {
+    if(this.binding.nativeStageReview && tool!=="resolve_stage_review" && !NATIVE_REVIEW_READ_TOOLS.has(tool) && !this.binding.reviewerGitHubTools?.has(tool))throw forbidden("A stage Reviewer may only inspect its task and resolve its exact assigned review");
     if (this.binding.museRuntime) {
       await this.binding.assertBridgeAuthority?.();
       if (!MUSE_NATIVE_OPERATIONS.has(tool)) throw forbidden("This operation is outside the Muse first-party runtime profile");
@@ -605,6 +615,10 @@ export class PaperclipRunnerToolAuthority {
     arguments: unknown;
   }): Promise<unknown> {
     await this.#assertReviewerBoundary(call.tool); // Before native early mutation shortcuts.
+    if(this.binding.nativeStageReview) {
+      await this.#assertToolScope(call.tool);
+      if(call.tool==="resolve_stage_review")return this.#resolveStageReview(call.arguments);
+    }
     if ((call.tool === "handoff_case" || call.tool === "create_case") && !this.binding.nativeReview) {
       if (this.binding.workMode && this.binding.workMode !== "standard") throw forbidden("Case tools require standard work mode");
       const create = call.tool === "create_case" ? createNativeCaseSchema.parse(call.arguments) : null;
@@ -1725,7 +1739,7 @@ export class PaperclipRunnerToolAuthority {
         eq(heartbeatRuns.agentId, this.binding.agentId),
         eq(heartbeatRuns.nativeIssueId, this.binding.issueId),
         eq(issues.companyId, this.binding.companyId),
-        ...(this.binding.nativeReview ? [] : [
+        ...(this.binding.nativeReview || this.binding.nativeStageReview ? [] : [
           eq(issues.assigneeAgentId, this.binding.agentId),
           eq(issues.executionRunId, this.binding.runId),
         ]),
@@ -1761,11 +1775,37 @@ export class PaperclipRunnerToolAuthority {
         throw forbidden("The assigned review is no longer available to this run.");
       }
     }
+    if(this.binding.nativeStageReview) {
+      const context=this.binding.nativeStageReview;
+      const actual=record(row.run.contextSnapshot);
+      if(actual.nativeStageDecisionId!==context.nativeStageDecisionId || actual.nativeStageAdmissionId!==context.nativeStageAdmissionId || actual.nativeStageStatusVersion!==context.nativeStageStatusVersion)throw forbidden("This run was not admitted for the supplied stage");
+      if(!await getNativeStageReviewAssignment(this.db,{...this.binding,contextSnapshot:context}) && !await historicalNativeStageDecision(this.db,this.binding))throw forbidden("The native stage is no longer available to this run");
+    }
     const privacy = await authorizationService(this.db).decide({ actor: this.#privacyActor(row.run), action: "issue:read",
       resource: { type: "issue", companyId: this.binding.companyId, issueId: row.issue.id } });
     if (!privacy.allowed) throw forbidden("The task is no longer available to this run");
     if (options.tool) assertNativeSkillTestTool(this.#apiScope(row), options.tool);
     return row;
+  }
+
+  async #resolveStageReview(value:unknown,receiptOnly=false) {
+    const args=record(value);
+    if(Object.keys(args).some(key=>!["id","outcome","body"].includes(key)) || typeof args.id!=="string")throw badRequest("Only the assigned stage verdict fields are accepted");
+    const context=this.binding.nativeStageReview!;
+    const [run]=await this.db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id,this.binding.runId),eq(heartbeatRuns.agentId,this.binding.agentId),eq(heartbeatRuns.companyId,this.binding.companyId)));
+    const actual=record(run?.contextSnapshot);
+    if(!run || actual.nativeStageDecisionId!==context.nativeStageDecisionId || actual.nativeStageAdmissionId!==context.nativeStageAdmissionId || actual.nativeStageStatusVersion!==context.nativeStageStatusVersion)throw forbidden("Stage run binding changed");
+    const proof=receiptOnly?null:await getNativeStageReviewAssignment(this.db,{...this.binding,contextSnapshot:context});
+    const historical=proof?null:await historicalNativeStageDecision(this.db,this.binding);
+    if(!proof && !historical) {
+      if(receiptOnly)return null;
+      throw forbidden("This stage is no longer assigned to this run");
+    }
+    const request={id:args.id,stageId:proof?.stage.id??historical!.record.stageId,
+      admissionId:context.nativeStageAdmissionId,sourceDecisionId:context.nativeStageDecisionId,
+      expectedStatusVersion:context.nativeStageStatusVersion,outcome:args.outcome as "approved"|"changes_requested",body:args.body as string};
+    if(receiptOnly && historical?.request.id!==args.id)return null;
+    return decideNativeStageReview(this.db,{...this.binding,request,actor:this.#privacyActor(run)});
   }
 
   async #resolveReview(value: unknown) {

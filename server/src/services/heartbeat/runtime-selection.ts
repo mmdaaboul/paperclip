@@ -1,3 +1,5 @@
+import { getNativeStageReviewAssignment, readNativeStageReviewContext } from "../native-runtime/native-stage-review.js";
+import { buildNativeStageReviewRequest } from "../native-runtime/native-review-prompt.js";
 import { reviewerActorRestricted } from "../reviewer-role.js";
 import { resolveNativeWorkspacePolicyForClaimedStop } from "../native-runtime/workspace-policy-admission.js";
 import { parseReviewerWorkspaceAdmission, reviewerAdmissionInstruction } from "../native-runtime/reviewer-workspace-admission.js";
@@ -343,13 +345,16 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         // files and Computer are not part of the recovered API controller.
         ? persistedNativeExecutionInput.binding.executionWorkspaceId
         : persistedExecutionWorkspace?.id ?? run.id;
+    const stageContext=readNativeStageReviewContext(context);
+    const nativeStageReview=stageContext?await getNativeStageReviewAssignment(db,{companyId:agent.companyId,issueId:issueRef.id,agentId:agent.id,contextSnapshot:stageContext}):null;
+    if(stageContext && !nativeStageReview)throw new Error("native_stage_review_assignment_no_longer_available");
     const nativeReviewContext = readNativeReviewAssignmentContext(context);
     const nativeReview = nativeReviewContext ? await measureRunPhase("runtime_selection.review", () => getNativeReviewAssignment(db, {
       companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id,
       contextSnapshot: nativeReviewContext,
     })) : null;
     if (nativeReviewContext && !nativeReview) throw new Error("native_review_assignment_no_longer_available");
-    const nativeReviewRequest = nativeReview
+    const nativeReviewRequest = nativeStageReview?buildNativeStageReviewRequest({stageId:nativeStageReview.stage.id,admissionId:nativeStageReview.admission.id,sourceDecisionId:nativeStageReview.sourceDecision.id,candidateId:nativeStageReview.admission.candidateId,reviewRequest:nativeStageReview.state.reviewRequest}):nativeReview
       ? buildNativeReviewRequest({
           title: nativeReview.interaction.title,
           summary: nativeReview.interaction.summary,

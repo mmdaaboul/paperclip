@@ -18,6 +18,7 @@ import { NativeDeliverableEvidenceError, validateNativeDeliverableEvidence } fro
 import { conversationTurnPresentsAnswer, pendingNativeGovernance } from "./native-governance.js";
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
 import { onboardingFirstTaskCompletionAllowed } from "../onboarding-first-task-admission.js";
+import { nativeStageReviewOutcome } from "./native-stage-review.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
 import { reconcileMuseNativeTerminalRun } from "./muse-terminal-reconciliation.js";
 import { assertNativeCaseHandoffResult } from "./native-case-handoff.js";
@@ -1506,6 +1507,7 @@ export async function finalizeNativeRun(input: {
           )
         : Promise.resolve(null),
     ]);
+    const stageReviewOutcome=await nativeStageReviewOutcome(input.db,{companyId:run.companyId,issueId:authoritativeIssue.id,agentId:run.agentId,runId:run.id,contextSnapshot:run.contextSnapshot});
     const reviewContext = readNativeReviewAssignmentContext(run.contextSnapshot);
     const nativeReview = reviewContext ? await getNativeReviewAssignment(input.db, {
       companyId: run.companyId, issueId: authoritativeIssue.id, agentId: run.agentId,
@@ -1559,7 +1561,7 @@ export async function finalizeNativeRun(input: {
       providerOverloaded: providerFailure?.errorCode === "native_provider_overloaded" && ownsProviderFailureDecision,
       providerFailureSuperseded: providerFailure?.errorCode === "native_provider_overloaded" && !ownsProviderFailureDecision,
       failureRetryCount: executionFailureRetryCount(run),
-      ...(reviewContext ? { nativeReviewOutcome: nativeReview
+      ...(stageReviewOutcome ? {nativeReviewOutcome:stageReviewOutcome} : reviewContext ? { nativeReviewOutcome: nativeReview
         ? nativeReview.interaction.status === "pending" ? "pending" as const : "resolved" as const
         : "stale" as const } : {}),
       assessment,
