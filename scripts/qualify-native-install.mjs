@@ -38,6 +38,32 @@ export function diagnosticCodes(output, token) {
   for (const code of redacted.match(/\b(?:TS\d{4}|E\d{4})\b/g) ?? []) codes.add(code);
   return { codes: [...codes].sort().slice(0, 32), redactedOutputBytes: Buffer.byteLength(redacted) };
 }
+const ownerChecks = ['owner-session', 'owner-companies', 'anonymous-denied', 'health', 'runtime-info',
+  'runtime-shape', 'runtime-supervisor-pid', 'runtime-process'];
+export const CHECK_IDS = Object.freeze([
+  ...['initial', 'restart', 'start'].flatMap(stage => ownerChecks.map(check => stage + '-' + check)),
+  ...['restart', 'start'].flatMap(stage => ['new-pid', 'database-query', 'table-preservation',
+    'migration-preservation', 'config-preservation'].map(check => stage + '-' + check)),
+  'restart-verifier-db-close', 'restart-command', 'restart-verifier-db-close-after',
+  'stop-command', 'stop-state', 'stop-listener', 'start-command',
+]);
+const failureCodes = new Set(['ERR_ASSERTION', 'ENOENT', 'EACCES', 'ESRCH', 'ECONNRESET', 'ECONNREFUSED',
+  'ETIMEDOUT', 'CONNECTION_CLOSED', 'CONNECTION_ENDED', '57P01', '08003', '08006', '53300', '55000',
+  '42P05', '26000', '0A000']);
+export function checkRecorder(evidence, save) {
+  return async (id, callback) => {
+    assert(CHECK_IDS.includes(id), 'fixed_check_id_required');
+    evidence.currentCheck = id; save();
+    try {
+      const result = await callback();
+      (evidence.checksPassed ??= []).push(id); save(); return result;
+    } catch (error) {
+      evidence.failureCheck = id;
+      evidence.failureCode = failureCodes.has(error?.code) ? error.code : 'UNCLASSIFIED';
+      save(); throw error;
+    }
+  };
+}
 export function validateTarget(env) {
   assert(env.GITHUB_ACTIONS === 'true' && env.RUNNER_OS === 'Linux', 'hosted_linux_only');
   assert.equal(env.GITHUB_REPOSITORY, 'mmdaaboul/paperclip', 'selected_fork_only');
@@ -51,6 +77,11 @@ export function assertHealth(h, sha, bootstrapStatus) {
   assert.equal(h.status, 'ok'); assert.equal(h.commit, sha);
   assert.equal(h.deploymentMode, 'authenticated'); assert.equal(h.deploymentExposure, 'private');
   assert.equal(h.bootstrapStatus, bootstrapStatus);
+}
+export function healthFacts(h, sha, bootstrapStatus) {
+  return { statusOk: h.status === 'ok', sourceMatches: h.commit === sha,
+    authenticated: h.deploymentMode === 'authenticated', private: h.deploymentExposure === 'private',
+    bootstrapMatches: h.bootstrapStatus === bootstrapStatus };
 }
 export function workspaceClosure(packages) {
   const byName = new Map(packages.map(p => [p.name, p]));
@@ -91,6 +122,7 @@ async function qualify() {
     bootstrapVersion: BOOTSTRAP.version, bootstrapIntegrity: BOOTSTRAP.integrity,
     status: 'running', phase: 'preflight', completed: [], retry: false };
   const save = () => writeFileSync(join(root, 'evidence.json'), JSON.stringify(evidence, null, 2) + '\n', { mode: 0o600 });
+  const check = checkRecorder(evidence, save);
   const phase = name => { evidence.phase = name; save(); console.log('Qualification phase: ' + name); };
   const done = name => { evidence.completed.push(name); save(); };
   const pc = join(root, 'paperclip'), tmp = join(root, 'tmp');
@@ -124,17 +156,26 @@ async function qualify() {
     const deadline = Date.now() + 120000;
     while (Date.now() < deadline) {
       let r; try { r = await http('/api/health'); } catch { /* native startup readiness poll */ }
-      if (r?.ok) { const h = await r.json(); assertHealth(h, sha, status); return h; }
+      if (r?.ok) {
+        const h = await r.json(); evidence.healthChecks = { phase: evidence.phase,
+          check: evidence.currentCheck ?? null, ...healthFacts(h, sha, status) }; save();
+        assertHealth(h, sha, status); return h;
+      }
       await new Promise(r => setTimeout(r, 1000));
     }
     throw new Error('native_health_deadline');
   }
-  function runtime() {
-    const r = JSON.parse(readFileSync(join(pc, 'instances/f03qualification/runtime-info.json'), 'utf8'));
-    assert.equal(r.schemaVersion, 1); assert.equal(r.instanceId, 'f03qualification');
-    assert.equal(r.host, '127.0.0.1'); assert.equal(r.port, 4311); assert(Number.isSafeInteger(r.pid) && r.pid > 0);
-    const pid = Number(systemctl(['show', unit, '--property=MainPID', '--value']).trim());
-    assert.equal(pid, r.pid, 'service_pid_must_serve'); process.kill(pid, 0); return r;
+  async function runtime(stage) {
+    const r = await check(stage + '-runtime-info', () => JSON.parse(readFileSync(join(pc, 'instances/f03qualification/runtime-info.json'), 'utf8')));
+    await check(stage + '-runtime-shape', () => {
+      assert.equal(r.schemaVersion, 1); assert.equal(r.instanceId, 'f03qualification');
+      assert.equal(r.host, '127.0.0.1'); assert.equal(r.port, 4311); assert(Number.isSafeInteger(r.pid) && r.pid > 0);
+    });
+    const pid = await check(stage + '-runtime-supervisor-pid', () => {
+      const value = Number(systemctl(['show', unit, '--property=MainPID', '--value']).trim());
+      assert.equal(value, r.pid, 'service_pid_must_serve'); return value;
+    });
+    await check(stage + '-runtime-process', () => process.kill(pid, 0)); return r;
   }
   async function absentListener() {
     let response; try { response = await http('/api/health'); } catch { return; }
@@ -212,7 +253,7 @@ async function qualify() {
     assert.equal(config.server.host, '127.0.0.1'); assert.equal(config.server.port, 4311);
     assert.equal(config.database.mode, 'embedded-postgres'); assert.equal(config.database.embeddedPostgresPort, 54329);
     assert(readFileSync(definition, 'utf8').includes(pc), 'native_service_home_binding');
-    await healthy('bootstrap_pending'); const initial = runtime();
+    await healthy('bootstrap_pending'); const initial = await runtime('initial');
     const asset = index.match(/(?:src|href)="(\/assets\/[^"?#]+\.js)"/); assert(asset, 'ui_js_asset_required');
     const ui = await http('/'); assert(ui.ok); assert((await ui.text()).includes(asset[1]), 'served_native_ui_asset_reference');
     const servedAsset = await http(asset[1]); assert(servedAsset.ok, 'ui_static_asset');
@@ -226,20 +267,29 @@ async function qualify() {
     const userId = signupBody.user?.id; assert(typeof userId === 'string' && userId.length > 0);
     const claim = await http('/api/bootstrap/claim', { method: 'POST', body: {}, cookie }); assert(claim.ok);
     assert.deepEqual(await claim.json(), { claimed: true, userId });
-    async function ownerProof() {
-      const session = await http('/api/auth/get-session', { cookie }); assert(session.ok);
-      assert.equal((await session.json()).user?.id, userId);
-      const companies = await http('/api/companies', { cookie }); assert(companies.ok); assert.deepEqual(await companies.json(), []);
-      const anonymous = await http('/api/companies'); assert([401, 403].includes(anonymous.status), 'anonymous_board_denied');
-      await healthy('ready');
+    async function ownerProof(stage) {
+      await check(stage + '-owner-session', async () => {
+        const session = await http('/api/auth/get-session', { cookie }); evidence.lastHttpStatus = { check: evidence.currentCheck, status: session.status }; assert(session.ok);
+        assert.equal((await session.json()).user?.id, userId);
+      });
+      await check(stage + '-owner-companies', async () => {
+        const companies = await http('/api/companies', { cookie }); evidence.lastHttpStatus = { check: evidence.currentCheck, status: companies.status };
+        assert(companies.ok); assert.deepEqual(await companies.json(), []);
+      });
+      await check(stage + '-anonymous-denied', async () => {
+        const anonymous = await http('/api/companies'); evidence.lastHttpStatus = { check: evidence.currentCheck, status: anonymous.status };
+        assert([401, 403].includes(anonymous.status), 'anonymous_board_denied');
+      });
+      await check(stage + '-health', () => healthy('ready'));
     }
-    await ownerProof(); done('native-first-owner');
+    await ownerProof('initial'); done('native-first-owner');
     phase('fresh-database-proof');
     const require = createRequire(join(server, 'package.json')), postgres = require('postgres');
     sql = postgres('postgres://paperclip:paperclip@127.0.0.1:54329/paperclip', { max: 1 });
     const snapshot = async () => ({
       tables: (await sql`select tablename from pg_tables where schemaname='public' order by tablename`).map(r => r.tablename),
-      migrations: await sql`select hash, created_at from drizzle.__drizzle_migrations order by created_at`,
+      migrations: (await sql`select hash, created_at from drizzle.__drizzle_migrations order by created_at`)
+        .map(({ hash, created_at }) => ({ hash, created_at })),
     });
     const baseline = await snapshot(); assert.equal(baseline.tables.length, 327); assert.equal(baseline.migrations.length, 451);
     for (const table of ['agent_reference_folder_configs', 'agent_reviewer_policies', 'github_push_operation_receipts',
@@ -247,17 +297,31 @@ async function qualify() {
       assert(baseline.tables.includes(table), 'custom_foundation_missing_' + table);
     evidence.database = { publicTables: baseline.tables.length, migrations: baseline.migrations.length }; done('fresh-database-proof');
     phase('native-service-restart');
-    cli(['service', 'restart', '--instance', 'f03qualification', '--wait', '--json'], 180000);
-    await ownerProof(); const restarted = runtime(); assert.notEqual(restarted.pid, initial.pid);
-    assert.deepEqual(await snapshot(), baseline); assert.deepEqual(readFileSync(configPath), configBytes);
-    done('native-service-restart'); await sql.end(); sql = undefined;
-    phase('native-service-stop-start');
-    cli(['service', 'stop', '--instance', 'f03qualification', '--json']);
-    assert.equal(systemctl(['show', unit, '--property=ActiveState', '--value']).trim(), 'inactive'); await absentListener();
-    cli(['service', 'start', '--instance', 'f03qualification', '--json']);
-    await ownerProof(); const started = runtime(); assert.notEqual(started.pid, restarted.pid);
+    // The verifier owns this client, not the service's embedded cluster. Never carry
+    // its connection across the cluster lifecycle being tested; retain exact data checks.
+    await check('restart-verifier-db-close', () => sql.end({ timeout: 5 })); sql = undefined;
+    await check('restart-command', () => cli(['service', 'restart', '--instance', 'f03qualification', '--wait', '--json'], 180000));
+    await ownerProof('restart'); const restarted = await runtime('restart');
+    await check('restart-new-pid', () => assert.notEqual(restarted.pid, initial.pid));
     sql = postgres('postgres://paperclip:paperclip@127.0.0.1:54329/paperclip', { max: 1 });
-    assert.deepEqual(await snapshot(), baseline); assert.deepEqual(readFileSync(configPath), configBytes);
+    const afterRestart = await check('restart-database-query', snapshot);
+    await check('restart-table-preservation', () => assert.deepEqual(afterRestart.tables, baseline.tables));
+    await check('restart-migration-preservation', () => assert.deepEqual(afterRestart.migrations, baseline.migrations));
+    await check('restart-config-preservation', () => assert.deepEqual(readFileSync(configPath), configBytes));
+    done('native-service-restart');
+    await check('restart-verifier-db-close-after', () => sql.end({ timeout: 5 })); sql = undefined;
+    phase('native-service-stop-start');
+    await check('stop-command', () => cli(['service', 'stop', '--instance', 'f03qualification', '--json']));
+    await check('stop-state', () => assert.equal(systemctl(['show', unit, '--property=ActiveState', '--value']).trim(), 'inactive'));
+    await check('stop-listener', absentListener);
+    await check('start-command', () => cli(['service', 'start', '--instance', 'f03qualification', '--json']));
+    await ownerProof('start'); const started = await runtime('start');
+    await check('start-new-pid', () => assert.notEqual(started.pid, restarted.pid));
+    sql = postgres('postgres://paperclip:paperclip@127.0.0.1:54329/paperclip', { max: 1 });
+    const afterStart = await check('start-database-query', snapshot);
+    await check('start-table-preservation', () => assert.deepEqual(afterStart.tables, baseline.tables));
+    await check('start-migration-preservation', () => assert.deepEqual(afterStart.migrations, baseline.migrations));
+    await check('start-config-preservation', () => assert.deepEqual(readFileSync(configPath), configBytes));
     evidence.lifecycle = { correlatedPid: true, restartNewPid: true, stopNoListener: true, startNewPid: true,
       sameSource: true, sameSchema: true, sameConfig: true, ownerSessionPreserved: true };
     done('native-service-stop-start'); evidence.status = 'passed';
