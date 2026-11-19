@@ -36,7 +36,8 @@ import {
   initializeRunIdentity,
   captureRunIdentity,
 } from "../services/run-identity.js";
-import { resolveGitHubOperationCredentials } from "../services/github-operation-credentials.js";
+import { prepareNativeControllerGitAdmission,nativeControllerGitState } from "../services/github-controller-policy.js";
+import { resolveGitHubOperationCredentials,resolveNativeControllerGitHubCredentials } from "../services/github-operation-credentials.js";
 import {
   filterResolvedGitHubConnectionsForRun,
   resolveManagedGitHubIdentitySelection,
@@ -874,5 +875,32 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
         (await post().set("Authorization", `Bearer ${token}`)).status,
       ).toBe(403);
     });
+    it("recorded mode withholds raw credentials before admission, privately resolves after admission and stays restrictive after disable",async()=>{
+      const input=await seed();await grant(input,"A");
+      await db.update(agents).set({adapterConfig:{githubWriteMode:"native_controller"}}).where(eq(agents.id,input.agentId));
+      const calls=vault.resolveUserSecretValue.mock.calls.length;
+      const raw=await resolveGitHubOperationCredentials(db,input);expect(raw.status).toBe("unavailable");expect(raw.env).not.toHaveProperty("PAPERCLIP_GIT_TOKEN");expect(raw.attribution).toMatchObject({agentId:input.agentId,runId:input.runId});expect(vault.resolveUserSecretValue.mock.calls.length).toBe(calls);
+      await prepareNativeControllerGitAdmission(db,input,true);await db.update(heartbeatRuns).set({runtimeMode:"native",nativeIssueId:input.issueId}).where(eq(heartbeatRuns.id,input.runId));
+      expect(await resolveNativeControllerGitHubCredentials(db,input)).toMatchObject({status:"available",env:{PAPERCLIP_GIT_TOKEN:"test-token-A"}});
+      await db.update(agents).set({adapterConfig:{}}).where(eq(agents.id,input.agentId));
+      expect((await resolveGitHubOperationCredentials(db,input)).env).not.toHaveProperty("PAPERCLIP_GIT_TOKEN");
+      await expect(resolveNativeControllerGitHubCredentials(db,input)).rejects.toMatchObject({status:403});
+    });
+    it("mode selected while native token IO waits cannot release that token",async()=>{
+      const input=await seed();await grant(input,"A");
+      vault.resolveUserSecretValue.mockImplementationOnce(async()=>{await db.update(agents).set({adapterConfig:{githubWriteMode:"native_controller"}}).where(eq(agents.id,input.agentId));return {value:"test-token-A"};});
+      const result=await resolveGitHubOperationCredentials(db,input);expect(result.status).toBe("unavailable");expect(result.env).not.toHaveProperty("PAPERCLIP_GIT_TOKEN");
+    });
+    it("old saved native input never gains recorded-write admission, and unsupported new runtime refuses without mutation",async()=>{
+      const input=await seed();await db.update(agents).set({adapterConfig:{githubWriteMode:"native_controller"}}).where(eq(agents.id,input.agentId));
+      const before=(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,input.runId)))[0].runnerProfileJson;
+      await expect(prepareNativeControllerGitAdmission(db,input,false)).rejects.toThrow("native_github_write_runtime_unsupported");
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,input.runId)))[0].runnerProfileJson).toEqual(before);
+      await db.update(heartbeatRuns).set({runnerProfileJson:{nativeExecutionInput:{schema:"old-saved-shape"}}}).where(eq(heartbeatRuns.id,input.runId));
+      await expect(prepareNativeControllerGitAdmission(db,input,true)).rejects.toThrow("native_github_write_new_run_required");
+      await db.update(heartbeatRuns).set({runnerProfileJson:{nativeGithubWriteAdmission:null}}).where(eq(heartbeatRuns.id,input.runId));
+      await expect(nativeControllerGitState(db,input)).rejects.toThrow("native_github_write_admission_incompatible");
+    });
+
   },
 );

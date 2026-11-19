@@ -1647,6 +1647,14 @@ export function AgentConfigForm(props: AgentConfigFormProps) {
         </div>
       ) : null}
     <ConfigSections order={props.sectionOrder} hidden={props.hiddenSections} className={cn("relative", panels ? "agent-config-panels" : cards && "space-y-6")}>
+      {!isCreate ? <div data-config-section="github-writes" className={cn(cards ? "rounded-lg border border-border p-4" : "border-b border-border px-4 py-4")}>
+        <label htmlFor="github-write-mode" className="text-sm font-medium">GitHub writes</label>
+        <select id="github-write-mode" value={String(eff("adapterConfig","githubWriteMode",config.githubWriteMode ?? "native"))}
+          disabled={props.isSaving} onChange={event=>mark("adapterConfig","githubWriteMode",event.target.value)} className="ml-3 rounded border bg-background p-2 text-sm">
+          <option value="native">Native connection tools</option><option value="native_controller">Recorded agent pushes and PR comments</option>
+        </select>
+        <p className="mt-2 text-sm text-muted-foreground">Recorded writes include the Paperclip agent name and require a managed fork installation, isolated local native Codex, standard tasks and a managed GitHub connection. Start a new run after changing this setting. General GitHub tools and shell credentials are unavailable in this mode. Reviewer permissions remain separate.</p>
+      </div> : null}
       {!isCreate ? <div data-config-section="reviewer-policy" className={cn(!cards && "border-b border-border")}>
         <div className={cn(cards ? "rounded-lg border border-border p-4" : "px-4 py-4")}>
           <AgentReviewerPolicyCard key={props.agent.id} agentId={props.agent.id} companyId={props.agent.companyId}

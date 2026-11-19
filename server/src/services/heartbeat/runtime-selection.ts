@@ -1,3 +1,4 @@
+import { prepareNativeControllerGitAdmission } from "../github-controller-policy.js";
 import { getNativeStageReviewAssignment, readNativeStageReviewContext } from "../native-runtime/native-stage-review.js";
 import { buildNativeStageReviewRequest } from "../native-runtime/native-review-prompt.js";
 import { reviewerActorRestricted } from "../reviewer-role.js";
@@ -1032,7 +1033,11 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
       ) {
         throw new Error("native_runtime_mode_conflict");
       }
-      const lockedProfile = parseObject(lockedRun.runnerProfileJson);
+      const writeAdmission=stopRecovery?undefined:await prepareNativeControllerGitAdmission(tx as unknown as Db,
+        {companyId:lockedRun.companyId,agentId:lockedRun.agentId,runId:lockedRun.id},
+        nativeExecution?.provider.kind==="codex" && nativeExecution.task.workMode==="standard" && executionTarget?.kind!=="remote"
+          && !("homeMode" in nativeExecution && nativeExecution.homeMode==="preconfigured"));
+      const lockedProfile:Record<string,unknown> = {...parseObject(lockedRun.runnerProfileJson),...(writeAdmission?{nativeGithubWriteAdmission:writeAdmission}:{})};
       const runtimeSkillPreservation = await bindStagedNativeRuntimeSkillAssets(tx as unknown as Db, {
         companyId: lockedRun.companyId, agentId: lockedRun.agentId, runId: lockedRun.id, issueId: issueRef.id,
         execution: (lockedProfile.nativeExecutionInput ?? nativeExecution) as NativeExecutionInput, staged: stagedRuntimeSkills,

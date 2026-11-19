@@ -1,3 +1,4 @@
+import { githubAttributionLauncherHelpers } from "./github-agent-attribution.js";
 import { isAbsolute } from "node:path";
 
 /** Standalone source for local, SSH, and sandbox runtimes. No secrets in files. */
@@ -11,6 +12,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const { spawn } = require('node:child_process');
+${githubAttributionLauncherHelpers()}
 // A PATH shim can capture this launcher's absolute path and call it again.
 // Reject that cycle before resolving another executable or capturing authority.
 if (process.env.PAPERCLIP_GITHUB_OPERATION_ACTIVE) {
@@ -68,6 +70,7 @@ ${options.brokerFile ? String.raw`
 ` : ''}
   const diagnostic = (code) => process.stderr.write('Paperclip: GitHub ' + code + '; continuing without managed credentials.\n');
   let connected = false;
+  let operationAttribution = null;
   const configRoot = env.GH_CONFIG_DIR || os.tmpdir();
   // A missing/unwritable scratch directory must not break local Git. The
   // fallback deliberately cannot load the host's gh authentication files.
@@ -139,6 +142,8 @@ ${options.brokerFile ? String.raw`
           : 'Check the GitHub connection in Paperclip';
         process.stderr.write('Paperclip: GitHub access unavailable: ' + reason + '. Continuing without GitHub credentials.\n');
       }
+      operationAttribution = result.attribution || null;
+      if(paperclipAttributionValid(operationAttribution))for(const key of ['GIT_AUTHOR_NAME','GIT_COMMITTER_NAME'])if(typeof result.env?.[key] === 'string')env[key]=result.env[key];
       connected = result.status === 'available';
       if (result.status === 'available' && configReady) {
         for (const [key, value] of Object.entries(result.env || {})) {
@@ -166,7 +171,8 @@ ${options.brokerFile ? String.raw`
   env.ZDOTDIR = configDirectory;
   env.BASH_ENV = '/dev/null';
   env.GIT_SSH_COMMAND = 'ssh -F /dev/null -o IdentityAgent=none -o IdentitiesOnly=yes -o IdentityFile=none -o BatchMode=yes';
-  const child = spawn(executable, process.argv.slice(2), { env, stdio: 'inherit' });
+  const childArgs = program === 'git' ? paperclipCommitArguments(process.argv.slice(2), operationAttribution) : process.argv.slice(2);
+  const child = spawn(executable, childArgs, { env, stdio: 'inherit' });
   for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(signal, () => child.kill(signal));
   child.once('error', () => { process.stderr.write('Paperclip: GitHub command could not start.\n'); process.exitCode = 1; });
   child.once('exit', (code, signal) => { process.exitCode = code === null ? 128 : code; });

@@ -1,3 +1,6 @@
+import { nativeControllerGitState } from "./github-controller-policy.js";
+import { createGitAgentAttribution, applyGitAgentIdentity, type GitAgentAttribution } from "@paperclipai/adapter-utils/github-agent-attribution";
+import { boundRunIssueId } from "./run-task-binding.js";
 import { reviewerExecutionRestrictsCredentials } from "./reviewer-role.js";
 import { isDeepStrictEqual } from "node:util";
 import { and, eq } from "drizzle-orm";
@@ -31,7 +34,7 @@ export type GitHubCredentialSummary = {
 };
 
 /** A raw GitHub token cannot enforce the low-trust read-only tool boundary. */
-async function allowsGitHubCredentialExport(
+async function allowsNativeGitHubOperation(
   db: Db,
   run: typeof heartbeatRuns.$inferSelect,
 ) {
@@ -120,24 +123,46 @@ async function saveGitHubSummary(
     .where(eq(runIdentityContexts.id, context.id));
 }
 
+/** Private controller use never creates a raw export capability. */
+export async function allowsGitHubCredentialExport(db:Db,run:typeof heartbeatRuns.$inferSelect) {
+  return await allowsNativeGitHubOperation(db,run) && !(await nativeControllerGitState(db,{companyId:run.companyId,agentId:run.agentId,runId:run.id})).restrictExport;
+}
+export async function resolveGitHubOperationCredentials(db:Db,input:{companyId:string;agentId:string;runId:string}) {
+  return resolveBoundGitHubCredentials(db,input,false);
+}
+export async function resolveNativeControllerGitHubCredentials(db:Db,input:{companyId:string;agentId:string;runId:string}) {
+  if(!(await nativeControllerGitState(db,input)).admitted)throw forbidden("Native recorded-write admission required");
+  return resolveBoundGitHubCredentials(db,input,true);
+}
 /** No company secrets or ambient credentials are consulted by this path. */
-export async function resolveGitHubOperationCredentials(
+async function resolveBoundGitHubCredentials(
   db: Db,
   input: {
     companyId: string;
     agentId: string;
     runId: string;
   },
+  controllerOnly:boolean,
 ) {
   const { run, context } = await captureRunIdentity(db, input, { readScope: "github_credentials" });
   if (!context) throw forbidden("This run predates managed GitHub credentials");
   let summary: GitHubCredentialSummary;
   let env: Record<string, string> = {};
+  let attribution:GitAgentAttribution|undefined;
+  const nativeAllowed=await allowsNativeGitHubOperation(db,run);
+  const mode=await nativeControllerGitState(db,input);
+  const recordedOnly=nativeAllowed && !controllerOnly && mode.restrictExport;
+  const creator=async()=>{
+    const [agent]=await db.select({name:agents.name}).from(agents).where(and(eq(agents.id,run.agentId),eq(agents.companyId,run.companyId)));
+    if(!agent)throw forbidden("Run agent unavailable");
+    return createGitAgentAttribution({agentId:run.agentId,runId:run.id,issueId:boundRunIssueId(run),nameAtTime:agent.name});
+  };
   // A sponsored guest's responsible person is an internal accountability field,
   // not authorization to export that person's (or a dedicated bot's) token.
   // Re-read every policy source for each operation, including a run's retained
   // boundary after task policy edits. Deny before touching the credential store.
-  if (!(await allowsGitHubCredentialExport(db, run))) {
+  if (!nativeAllowed || recordedOnly || controllerOnly && !mode.admitted) {
+    if(recordedOnly){attribution=await creator();env=applyGitAgentIdentity({},attribution);}
     summary = {
       status: "unavailable",
       reason:
@@ -149,6 +174,7 @@ export async function resolveGitHubOperationCredentials(
       revision: context.revision,
       ...summary,
       env,
+      ...(attribution?{attribution}:{}),
     };
   }
   try {
@@ -179,7 +205,8 @@ export async function resolveGitHubOperationCredentials(
         grantId: resolved.credential.grantId,
         authenticationMode: "managed",
       };
-      env = buildGitAuthInvocation(resolved.credential).env;
+      attribution=await creator();
+      env = applyGitAgentIdentity(buildGitAuthInvocation(resolved.credential).env,attribution);
     } else {
       summary = {
         status: resolved.configured ? "unavailable" : "absent",
@@ -194,11 +221,22 @@ export async function resolveGitHubOperationCredentials(
       reason: "GitHub credentials are temporarily unavailable",
     };
   }
+  // Re-read the optimized native identity and policy after secret/grant IO.
+  // A changed steering identity, mode, role or trust boundary cannot leak a token.
+  const current=await captureRunIdentity(db,input,{readScope:"github_credentials"});
+  const finalMode=await nativeControllerGitState(db,input);
+  if(current.context?.id!==context.id || current.context.revision!==context.revision
+    || !await allowsNativeGitHubOperation(db,current.run)
+    || (controllerOnly?!finalMode.admitted:finalMode.restrictExport)) {
+    summary={status:"unavailable",reason:"GitHub permissions changed during credential acquisition"};
+    env=attribution?applyGitAgentIdentity({},attribution):{};
+  }
   if (context) await saveGitHubSummary(db, context, summary);
   return {
     identityContextId: context?.id ?? null,
     revision: context?.revision ?? null,
     ...summary,
     env,
+    ...(attribution?{attribution}:{}),
   };
 }

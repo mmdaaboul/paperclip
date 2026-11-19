@@ -1,3 +1,7 @@
+import { bindNativeControllerGitSession } from "./native-controller-github-session.js";
+import { createNativeControllerGitActions } from "./native-controller-github.js";
+import { createNativeAttributedGitScope } from "./native-attributed-git-scope.js";
+import { nativeControllerGitState,controllerGitProviderEnvironment } from "../github-controller-policy.js";
 import { getNativeStageReviewAssignment, readNativeStageReviewContext } from "./native-stage-review.js";
 import { providerDrainStateFromSnapshot } from "../../vendor/paperclip-runner/index.js";
 import type { WorkspaceAccessSnapshot } from "../../vendor/paperclip-runner/index.js";
@@ -1999,6 +2003,8 @@ class SessionAuthorityEpoch {
     this.#revoked = true;
     this.#authority.close();
   }
+
+  async settle(){await this.#authority.settle();}
 
   #assertCurrent(): void {
     if (this.#revoked) {
@@ -9545,6 +9551,8 @@ export async function executePaperclipNativeSession(input: {
       throw new NativeProviderStateIncompatibleError("workspace_policy_requires_isolated_local_runner");
     }
     input = { ...input, workspaceAccess, ...(stopLease || workspaceAccess?.policy.readOnlyWorkspace ? { managedGitHub: false } : {}) };
+    if((await nativeControllerGitState(input.db,input.execution.binding)).restrictExport)input={...input,
+      runnerEnvironment:controllerGitProviderEnvironment(resolveNativeProviderEnvironment(input.execution.provider,input.runnerEnvironment))};
     preparedInput = input;
     if (physicalIngressKey) {
       const retained = warmNativeSessions.get(nativeSessionScopeKey(input.execution));
@@ -11449,6 +11457,7 @@ async function executePaperclipNativeSessionAttempt(
               );
             },
             onSession: async (session) => {
+              if (session) runnerdBackend?.bindControllerSession?.(session);
               if (session) runnerdBackend?.bindDiagnosticSession?.(session);
               if (session && input.runnerExecutionTarget?.kind === "remote"
                 && input.runnerExecutionTarget.transport === "sandbox") {
@@ -14512,6 +14521,7 @@ export async function createRunnerdBackend(input: {
     const authority = sessionToolAuthorityEpochs.get(sessionScopeId);
     if (input.executionContext?.signal.aborted && authority?.runId === input.execution.binding.runId) {
       authority.revoke();
+      await authority.settle();
       sessionToolAuthorityEpochs.delete(sessionScopeId);
     }
     throw error;
@@ -14631,6 +14641,7 @@ async function prepareRemoteExternalRunner({ input, target, runner, root, identi
 
 type ManagedRunnerdBackend = NativeSessionBackend & {
   bindManagedSession(session: NativeSession, options?: { releaseResumeOnly: true }): NativeSession;
+  bindControllerSession?(session:NativeSession):void;
   bindDiagnosticSession?(session: NativeSession): void;
   sessionCheckpointPersisted?(snapshot: PersistedNativeSession): void;
   providerAdmissionPersisted?(): Promise<void>;
@@ -14745,7 +14756,17 @@ async function createRunnerdBackendWithinSessionClaim(
     execution: input.execution, workspaceAccess: input.workspaceAccess!,
     onUnavailable: message => input.onLog?.("stderr", `[paperclip] Reviewer PR discussion unavailable: ${message}\n`) ?? Promise.resolve(),
   }) : undefined;
+  const controllerGitScope=createNativeAttributedGitScope();
+  const controllerRoot=resolve(resolvePaperclipInstanceRoot(),"runtime","paperclip-runner");
+  const controllerEnvironment=resolveNativeProviderEnvironment(input.execution.provider,input.runnerEnvironment);
+  const controllerGit=!noExternalTools && !nativeReview && !nativeStageReview ? await createNativeControllerGitActions({
+    db:input.db,execution:input.execution,workspaceAccess:input.workspaceAccess,targetKind:target.kind,scope:controllerGitScope,
+    runtimeDirectory:resolve(controllerRoot,"recorded-controller-git"),
+    protectedPaths:[controllerRoot,...[input.managedAiCredentialHome,"runtimeContext" in input.execution?input.execution.runtimeContext.instructions.workingCopy?.rootPath:undefined].filter((path):path is string=>typeof path==="string"&&path.startsWith("/"))],
+    filesystemEnvironment:{PAPERCLIP_GIT_METADATA_ROOTS:controllerEnvironment?.PAPERCLIP_GIT_METADATA_ROOTS,PAPERCLIP_RUNNER_NETWORK_ACCESS:controllerEnvironment?.PAPERCLIP_RUNNER_NETWORK_ACCESS,PAPERCLIP_RUNNER_NETWORK_ROOTS:controllerEnvironment?.PAPERCLIP_RUNNER_NETWORK_ROOTS},
+  }):undefined;
   const authority = new PaperclipRunnerToolAuthority(input.db, {
+    controllerGitActions:controllerGit,
     reviewerRole: protectedReviewer,
     reviewerGitHubTools,
     apiUrl: resolveLocalRuntimeApiUrl(),
@@ -14803,6 +14824,7 @@ async function createRunnerdBackendWithinSessionClaim(
     input.executionContext?.signal.throwIfAborted();
   } catch (error) {
     authorityEpoch.revoke();
+    await authorityEpoch.settle();
     throw error;
   }
   const { root, durableIdentity, durableBinding } = durableState ??= readDurableState();
@@ -15040,7 +15062,8 @@ async function createRunnerdBackendWithinSessionClaim(
       }).transport,
     });
     input.executionContext?.signal.throwIfAborted();
-    sessionToolAuthorityEpochs.get(sessionScopeId)?.revoke();
+    const previousAuthority=sessionToolAuthorityEpochs.get(sessionScopeId);
+    if(previousAuthority){previousAuthority.revoke();await previousAuthority.settle();}
     sessionToolAuthorityEpochs.set(sessionScopeId, authorityEpoch);
     return { ...backend, descriptor: () => backend.descriptor(), openSession: session => backend.openSession(session),
       recoverSession: (snapshot, options) => backend.recoverSession!(snapshot, options),
@@ -15089,7 +15112,7 @@ async function createRunnerdBackendWithinSessionClaim(
     const backend = externalExecution.schema === "paperclip.native-execution-input.v8"
       ? createNativeSessionBackend(externalExecution, { ...backendOptions, museRunnerOptions: { ...externalOptions, port: museRunnerBroker(input.db).port(externalExecution) } })
       : createNativeSessionBackend(externalExecution, { ...backendOptions, dotRunnerOptions: { ...externalOptions, port: dotRunnerBroker(input.db).port(externalExecution) } });
-    const prior = sessionToolAuthorityEpochs.get(sessionScopeId); if (prior) prior.revoke();
+    const prior = sessionToolAuthorityEpochs.get(sessionScopeId); if (prior) {prior.revoke();await prior.settle();}
     sessionToolAuthorityEpochs.set(sessionScopeId, authorityEpoch);
     return { ...backend, descriptor: () => backend.descriptor(), openSession: input => backend.openSession(input),
       recoverSession: (snapshot, options) => backend.recoverSession!(snapshot, options), bindManagedSession: session => session };
@@ -16318,6 +16341,7 @@ async function createRunnerdBackendWithinSessionClaim(
     lifecycleMode: input.execution.session.lifecyclePolicy.mode,
   }) : null;
   if (antigravityCredential) effectiveRunnerEnvironmentBase = antigravityCredential.environment;
+  if((await nativeControllerGitState(input.db,input.execution.binding)).restrictExport)effectiveRunnerEnvironmentBase=controllerGitProviderEnvironment(effectiveRunnerEnvironmentBase);
   if (protectedReviewer) effectiveRunnerEnvironmentBase.TMPDIR = input.workspaceAccess!.policy.scratchDirectory!;
   if (relayAssignedMcp || noExternalTools) {
     // The server-held tool authority owns this credential. Do not deliver a
@@ -16930,6 +16954,7 @@ async function createRunnerdBackendWithinSessionClaim(
   const priorAuthorityEpoch = sessionToolAuthorityEpochs.get(sessionScopeId);
   if (priorAuthorityEpoch && priorAuthorityEpoch !== authorityEpoch) {
     priorAuthorityEpoch.revoke();
+    await priorAuthorityEpoch.settle();
   }
   sessionToolAuthorityEpochs.set(sessionScopeId, authorityEpoch);
   const recordAdmittedProviderPack = async (session: NativeSession, identity: Parameters<NativeSessionBackend["openSession"]>[0]["identity"], retained: boolean) => {
@@ -16954,6 +16979,7 @@ async function createRunnerdBackendWithinSessionClaim(
   };
   return {
     bindManagedSession: wrapManagedSession,
+    bindControllerSession:controllerGit?session=>bindNativeControllerGitSession(session,()=>sessionToolAuthorityEpochs.get(sessionScopeId)):undefined,
     providerAdmissionRequired: () => Boolean(artifactStorage
       && (providerArtifacts || !legacyProviderContinuity && !liveProviderRecovery)),
     providerAdmissionPersisted: artifactStorage ? async () => {
@@ -16994,6 +17020,7 @@ async function createRunnerdBackendWithinSessionClaim(
       cursorCloudRuntime?.register();
       try {
         const session = await backend.openSession(sessionInput);
+        if(controllerGit)bindNativeControllerGitSession(session,()=>sessionToolAuthorityEpochs.get(sessionScopeId));
         const managed = wrapManagedSession(session);
         await recordAdmittedProviderPack(managed, sessionInput.identity, Boolean(adoptedProcess));
         return managed;
@@ -17003,6 +17030,7 @@ async function createRunnerdBackendWithinSessionClaim(
       cursorCloudRuntime?.register({ cleanupOnly: true });
       try {
         const result = backend.recoverSession ? await backend.recoverSession(snapshot, options) : { recovered: false, reason: "driver does not support recovery" };
+        if(result.session && controllerGit)bindNativeControllerGitSession(result.session,()=>sessionToolAuthorityEpochs.get(sessionScopeId));
         const session = result.session ? wrapManagedSession(result.session) : undefined;
         if (result.recovered && session) await recordAdmittedProviderPack(session, snapshot.identity, Boolean(adoptedProcess));
         if (!result.recovered || !session) cursorCloudRuntime?.unregister();
@@ -17019,6 +17047,7 @@ async function createRunnerdBackendWithinSessionClaim(
       cursorCloudRuntime?.register();
       try {
         const session = await backend.openSession(sessionInput);
+        if(controllerGit)bindNativeControllerGitSession(session,()=>sessionToolAuthorityEpochs.get(sessionScopeId));
         const managed = wrapManagedSession(session);
         await recordAdmittedProviderPack(managed, sessionInput.identity, false);
         return managed;

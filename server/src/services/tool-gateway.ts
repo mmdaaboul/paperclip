@@ -1,3 +1,4 @@
+import { assertNoControllerGitGateway,nativeControllerGitState } from "./github-controller-policy.js";
 import { reviewerActorRestricted } from "./reviewer-role.js";
 import { isNewHumanIntentAfterToolRejection } from "./tool-action-replay-intent.js";
 import { notifyChatRunMilestones } from "./chat-run-milestone-notifications.js";
@@ -3013,6 +3014,12 @@ export function createToolGatewayService(
         { tool: toolName },
       );
     }
+    if(tool.providerType==="paperclip_github_chat")await assertNoControllerGitGateway(db,session);
+    if(session.agentId && session.runId && tool.connectionId) {
+      const [recordedConnection]=await db.select({config:toolConnections.config,transportConfig:toolConnections.transportConfig}).from(toolConnections)
+        .where(and(eq(toolConnections.id,tool.connectionId),eq(toolConnections.companyId,session.companyId)));
+      if(recordedConnection?.config?.sourceTemplateKey==="github" || recordedConnection?.transportConfig?.sourceTemplateKey==="github")await assertNoControllerGitGateway(db,session);
+    }
     const guestBotConnection = await githubGuestBotConnectionForSession(db, session);
     if (guestBotConnection && tool.connectionId && (tool.connectionId !== guestBotConnection || tool.providerType !== "paperclip_github_chat"))
       throw new ToolGatewayHttpError(403, "Sponsored GitHub runs can only use their bot's governed connection; sponsorship does not grant personal credentials", "guest_connection_denied");
@@ -3215,7 +3222,8 @@ export function createToolGatewayService(
 
   /** Shared connection descriptors and task restrictions; no provider calls. */
   async function connectionToolsForContext(session: ToolGatewaySession): Promise<ToolGatewayDescriptor[]> {
-    const guestBotConnection = await measureRunPhase("connectors.discovery.github", () => githubGuestBotConnectionForSession(db, session));
+    const recorded=!!session.agentId && !!session.runId && (await nativeControllerGitState(db,{companyId:session.companyId,agentId:session.agentId,runId:session.runId})).restrictExport;
+    const guestBotConnection = recorded?null:await measureRunPhase("connectors.discovery.github", () => githubGuestBotConnectionForSession(db, session));
     let connectedTools = (await measureRunPhase("connectors.discovery.connections", () => connectedMcpToolsForCompany(session.companyId)))
       .filter(tool => !guestBotConnection || !tool.connectionId || (tool.connectionId === guestBotConnection && tool.providerType === "paperclip_github_chat"));
     const connectionIds = [...new Set(connectedTools.flatMap((tool) => tool.connectionId ? [tool.connectionId] : []))];
@@ -3223,6 +3231,7 @@ export function createToolGatewayService(
       const connections = await db.select().from(toolConnections).where(and(
         eq(toolConnections.companyId, session.companyId), inArray(toolConnections.id, connectionIds),
       ));
+      if(recorded){const githubIds=new Set(connections.filter(c=>c.config.sourceTemplateKey==="github" || c.transportConfig?.sourceTemplateKey==="github").map(c=>c.id));connectedTools=connectedTools.filter(tool=>!tool.connectionId || !githubIds.has(tool.connectionId));}
       for (const connection of connections.filter((item) => item.config.sourceTemplateKey === "google-workspace")) {
         let scopes: string[] = [];
         try { scopes = googleWorkspaceGrantedScopes(await resolveConnectionGrant(session, connection, false)); }
@@ -3232,7 +3241,7 @@ export function createToolGatewayService(
       }
     }
     return [
-      ...await measureRunPhase("connectors.discovery.github", () => githubBotToolsForSession(db, session)),
+      ...(recorded?[]:await measureRunPhase("connectors.discovery.github", () => githubBotToolsForSession(db, session))),
       ...await measureRunPhase("connectors.discovery.slack", () => slackToolsForSession(db, session)),
       ...await measureRunPhase("connectors.discovery.speko", () => spekoToolsForSession(db, session)),
       ...connectedTools,

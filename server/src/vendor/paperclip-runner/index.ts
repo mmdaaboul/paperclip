@@ -238,3 +238,7 @@ export const resolveCodexWorkspaceAccessPolicy = runner.resolveCodexWorkspaceAcc
 export const validateCodexReferenceDirectory = runner.validateCodexReferenceDirectory;
 export const inspectReadonlyReviewerCandidate = runner.inspectReadonlyReviewerCandidate;
 export const providerDrainStateFromSnapshot = runner.providerDrainStateFromSnapshot;
+
+export const createIsolatedCodexAppServerArgs = runner.createIsolatedCodexAppServerArgs;
+export const CODEX_SKILLLESS_PERMISSION_PROFILE = runner.CODEX_SKILLLESS_PERMISSION_PROFILE;
+export const codexExecutableReadOnlyRoots = runner.codexExecutableReadOnlyRoots;

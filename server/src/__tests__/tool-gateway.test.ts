@@ -41,6 +41,7 @@ import {
   toolProfiles,
   toolStdioCommandTemplates,
   toolRuntimeSlots,
+  runIdentityContexts,
   secretAccessEvents,
   userSecretDeclarations,
   userSecretDefinitions,
@@ -6284,4 +6285,22 @@ rl.on("line", (line) => {
       (error) => expectGatewayError(error, 403, "run_context_mismatch"),
     );
   });
+  it.each(["config","transportConfig"] as const)("recorded GitHub mode denies template gateway without identity context via %s",async location=>{
+    const company=await createCompany(db),agent=await createAgent(db,company.id),{run}=await createIssueAndRun(db,company.id,agent.id);
+    const {connection,catalogEntry,application}=await createRemoteMcpTool(db,company.id,{url:"http://127.0.0.1:9/mcp",toolName:"recorded_write_probe",connectionConfig:{}});
+    await db.update(toolConnections).set({[location]:{url:"http://127.0.0.1:9/mcp",sourceTemplateKey:"github"}}).where(eq(toolConnections.id,connection.id));
+    await allowAllToolsForAgent(db,company.id,agent.id);
+    const remote=vi.fn(async()=>{throw Error("Recorded mode must refuse before provider transport");});
+    const gateway=createTestToolGatewayService(db,{remoteHttpRequest:remote});
+    const session=await gateway.createSession({companyId:company.id,agentId:agent.id,runId:run.id});
+    expect(await db.select({id:runIdentityContexts.id}).from(runIdentityContexts).where(eq(runIdentityContexts.runId,run.id))).toHaveLength(0);
+    await db.update(agents).set({adapterConfig:{githubWriteMode:"native_controller"}}).where(eq(agents.id,agent.id));
+    const tool=expectedConnectedToolName({applicationKey:application.applicationKey,connectionId:connection.id,toolName:catalogEntry.toolName});
+    expect((await gateway.listToolsForSession(session.token)).map(item=>item.name)).not.toContain(tool);
+    await expect(gateway.executeTool({sessionToken:session.token,tool,parameters:{key:"synthetic",value:"synthetic"}})).rejects.toMatchObject({status:403});expect(remote).not.toHaveBeenCalled();
+    await db.update(heartbeatRuns).set({runnerProfileJson:{nativeGithubWriteAdmission:{schema:"paperclip.native-github-write-admission.v1",mode:"native_controller",companyId:company.id,agentId:agent.id,runId:run.id}}}).where(eq(heartbeatRuns.id,run.id));
+    await db.update(agents).set({adapterConfig:{}}).where(eq(agents.id,agent.id));
+    await expect(gateway.executeTool({sessionToken:session.token,tool,parameters:{key:"synthetic",value:"synthetic"}})).rejects.toMatchObject({status:403});expect(remote).not.toHaveBeenCalled();
+  });
+
 });

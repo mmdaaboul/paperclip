@@ -197,6 +197,7 @@ type NativeDocumentContent = { id: string | null; documentId: string; body: stri
 const UNKNOWN_DOCUMENT_REVISION_BODY = "[Document revision content omitted: historical source trust could not be established.]";
 
 type Binding = {
+  controllerGitActions?: import("./native-controller-github.js").NativeControllerGitActions;
   nativeStageReview?: {nativeStageDecisionId:string;nativeStageAdmissionId:string;nativeStageStatusVersion:number};
   /** Controller-admitted optional role, not model/adapter configuration. */
   reviewerRole?: boolean;
@@ -337,7 +338,8 @@ function hireAgentResult(value: unknown, provider: unknown) {
 export class PaperclipRunnerToolAuthority {
   #taskAttachmentCache = new TaskAttachmentReadCache();
   #skillLibraryCache = new SkillLibraryReadCache();
-  close() { this.#taskAttachmentCache.close(); this.#skillLibraryCache.close(); }
+  close() { this.binding.controllerGitActions?.abort();this.#taskAttachmentCache.close(); this.#skillLibraryCache.close(); }
+  async settle(){await this.binding.controllerGitActions?.retire();}
   constructor(readonly db: Db, readonly binding: Binding) {}
 
   definitions(): Array<Record<string, unknown>> {
@@ -429,6 +431,7 @@ export class PaperclipRunnerToolAuthority {
       && this.binding.workspaceRoot && runnerApiToolsEnabled(this.binding.companyId, this.binding.apiToolsEnabled)
       && (this.binding.executionTargetKind === "remote" ? this.binding.installRemoteArtifact : process.platform === "linux")) definitions.push(DOWNLOAD_ARTIFACT_DEFINITION);
     if (this.#imageGenerationAdvertised(workMode)) definitions.push(GENERATE_IMAGE_DEFINITION);
+    if(workMode==="standard" && !this.binding.firstPartyOnly && !this.binding.museRuntime && this.binding.controllerGitActions)definitions.push(this.binding.controllerGitActions.push.definition,this.binding.controllerGitActions.comment.definition);
     definitions.push(READ_CURRENT_WAKE_COMMENTS_TOOL_DEFINITION);
     definitions.push(LIST_CHAT_ATTACHMENTS_TOOL_DEFINITION);
     definitions.push(REUSE_CHAT_ATTACHMENT_TOOL_DEFINITION);
@@ -448,6 +451,7 @@ export class PaperclipRunnerToolAuthority {
 
   async recover(call: Parameters<PaperclipRunnerToolAuthority["execute"]>[0]): Promise<{ result: unknown; isError?: boolean } | null> {
     await this.#assertReviewerBoundary(call.tool);
+    if(call.tool==="push_git_commit" || call.tool==="comment_github_pull_request") {await this.#assertToolScope(call.tool);return null;} // Closed ledger owns replay/uncertainty, never an implicit second external write.
     if (this.binding.reviewerGitHubTools?.has(call.tool)) return null; // Closed action ledger owns retry/uncertainty.
     await this.#assertToolScope(call.tool);
     if(this.binding.nativeStageReview && call.tool==="resolve_stage_review")return {result:await this.#resolveStageReview(call.arguments,true)};
@@ -615,6 +619,12 @@ export class PaperclipRunnerToolAuthority {
     arguments: unknown;
   }): Promise<unknown> {
     await this.#assertReviewerBoundary(call.tool); // Before native early mutation shortcuts.
+    if(call.tool==="push_git_commit" || call.tool==="comment_github_pull_request"){
+      await this.#assertToolScope(call.tool);
+      const actions=this.binding.controllerGitActions;
+      if(!actions || !this.definitions().some(tool=>tool.name===call.tool))throw forbidden("Recorded GitHub action unavailable to this run");
+      return actions[call.tool==="push_git_commit"?"push":"comment"].execute(call.arguments,()=>this.#boundGitHubWriteContext(call.tool));
+    }
     if(this.binding.nativeStageReview) {
       await this.#assertToolScope(call.tool);
       if(call.tool==="resolve_stage_review")return this.#resolveStageReview(call.arguments);
@@ -1786,6 +1796,15 @@ export class PaperclipRunnerToolAuthority {
     if (!privacy.allowed) throw forbidden("The task is no longer available to this run");
     if (options.tool) assertNativeSkillTestTool(this.#apiScope(row), options.tool);
     return row;
+  }
+
+  async #boundGitHubWriteContext(tool:string) {
+    const current=await this.#boundContext({tool});
+    const mutation=await authorizationService(this.db).decide({actor:this.#privacyActor(current.run),action:"issue:mutate",
+      resource:{type:"issue",companyId:this.binding.companyId,issueId:current.issue.id,projectId:current.issue.projectId,
+        assigneeAgentId:current.issue.assigneeAgentId,assigneeUserId:current.issue.assigneeUserId}});
+    if(!mutation.allowed)throw forbidden("Current delegated GitHub write authority is unavailable");
+    return current;
   }
 
   async #resolveStageReview(value:unknown,receiptOnly=false) {

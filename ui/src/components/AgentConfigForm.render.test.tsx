@@ -1234,9 +1234,23 @@ describe("AgentConfigForm environment selector", () => {
     await clickByText(result.container,"Disable Reviewer and clear all scopes");await flushUntil(()=>optionalPolicyApi.saveReviewer.mock.calls.length>0);
     expect(optionalPolicyApi.saveReviewer).toHaveBeenCalledWith("agent-1","company-1",{expectedRevision:1,enabled:false,scopes:[]});expect(name.value).toBe("Other unsaved name");expect(result.onSave).not.toHaveBeenCalled();
   });
+  it("recorded GitHub mode defaults off and saves through the existing parent draft",async()=>{
+    const result=await renderForm([],{adapterType:"paperclip_runner",adapterConfig:{provider:"codex",model:"kept-model"}});roots.push(result.root);
+    const select=result.container.querySelector<HTMLSelectElement>('#github-write-mode')!;expect(select.value).toBe("native");
+    expect(result.container.textContent).toContain("Start a new run after changing this setting");
+    await act(async()=>{select.value="native_controller";select.dispatchEvent(new Event("change",{bubbles:true}));});await flushReact();
+    await act(async()=>setInputValue(result.container.querySelector<HTMLInputElement>('input[placeholder="Agent name"]')!,"Kept parent name"));await flushReact();
+    await clickByText(result.container,"Save");expect(result.onSave).toHaveBeenCalledWith(expect.objectContaining({name:"Kept parent name",adapterConfig:expect.objectContaining({provider:"codex",model:"kept-model",githubWriteMode:"native_controller"})}));
+  });
+  it("disabling recorded GitHub mode preserves the remaining saved configuration",async()=>{
+    const result=await renderForm([],{adapterType:"paperclip_runner",adapterConfig:{provider:"codex",githubWriteMode:"native_controller",model:"kept-model"}});roots.push(result.root);
+    const select=result.container.querySelector<HTMLSelectElement>('#github-write-mode')!;expect(select.value).toBe("native_controller");
+    await act(async()=>{select.value="native";select.dispatchEvent(new Event("change",{bubbles:true}));});await flushReact();await clickByText(result.container,"Save");
+    expect(result.onSave).toHaveBeenCalledWith(expect.objectContaining({adapterConfig:expect.objectContaining({githubWriteMode:"native",model:"kept-model"})}));
+  });
   it("optional policy cards are absent on create and Secrets",async()=>{
     const created=await renderCreateForm([]),secrets=await renderForm([],{}, {content:"secrets"});roots.push(created.root,secrets.root);
-    for(const result of [created,secrets]){expect(result.container.querySelector('[data-config-section="reviewer-policy"]')).toBeNull();expect(result.container.querySelector('[data-config-section="reference-folders"]')).toBeNull();}
+    for(const result of [created,secrets]){expect(result.container.querySelector('[data-config-section="github-writes"]')).toBeNull();expect(result.container.querySelector('[data-config-section="reviewer-policy"]')).toBeNull();expect(result.container.querySelector('[data-config-section="reference-folders"]')).toBeNull();}
     expect(optionalPolicyApi.saveReviewer).not.toHaveBeenCalled();expect(optionalPolicyApi.saveReferences).not.toHaveBeenCalled();
   });
   it.each([false, true])("uses Grok connection verification without native controls (compact: %s)", async compactTestFeedback => {

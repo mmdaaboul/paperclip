@@ -1,0 +1,10 @@
+import { expect, it } from "vitest";
+import { controllerGitConfigured, controllerGitProviderEnvironment, nativeControllerGitState, assertNoControllerGitGateway } from "./github-controller-policy.js";
+// DB rows are explicit component doubles. No real DB/secret/provider/OS command.
+const binding={companyId:"company",agentId:"agent",runId:"run"};
+function db(config:unknown,marker:unknown){let selects=0;return {select:()=>({from:()=>({where:async()=>++selects%2?[{config}]:[{profile:{nativeGithubWriteAdmission:marker},status:"running",mode:"native",cancellation:null}]})})} as unknown as Parameters<typeof nativeControllerGitState>[0];}
+const marker={schema:"paperclip.native-github-write-admission.v1",mode:"native_controller",...binding};
+it("default is native; unknown configured modes refuse rather than silently exporting",()=>{expect(controllerGitConfigured({})).toBe(false);expect(controllerGitConfigured({githubWriteMode:"native_controller"})).toBe(true);expect(()=>controllerGitConfigured({githubWriteMode:"typo"})).toThrow()});
+it("retained recorded mode restricts tokens after disable, with no new write admission",async()=>{expect(await nativeControllerGitState(db({},marker),binding)).toEqual({restrictExport:true,admitted:false});await expect(assertNoControllerGitGateway(db({},marker),binding)).rejects.toThrow()});
+it("malformed retained run binding cannot grant a different run",async()=>{await expect(nativeControllerGitState(db({},{...marker,runId:"other"}),binding)).rejects.toThrow()});
+it("removes token/SSH/host-config bypasses even if no managed broker is prepared",()=>{const env=controllerGitProviderEnvironment({GH_TOKEN:"synthetic",GITHUB_TOKEN:"synthetic",PAPERCLIP_GIT_TOKEN:"synthetic",SSH_AUTH_SOCK:"old",GIT_SSH_COMMAND:"bad",PAPERCLIP_GITHUB_AUTH_MODE:"host",PATH:"fixed"});expect(env.GH_TOKEN).toBe("");expect(env.GITHUB_TOKEN).toBe("");expect(env.PAPERCLIP_GIT_TOKEN).toBe("");expect(env.SSH_AUTH_SOCK).toBe("");expect(env.GIT_SSH_COMMAND).toBe("");expect(env.PAPERCLIP_GITHUB_AUTH_MODE).toBe("managed");expect(env.PATH).toBe("fixed")});
