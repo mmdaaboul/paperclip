@@ -5,11 +5,27 @@ import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, re
 import { createRequire } from "node:module";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
+import { prepareWorkspacePublishAssets } from './prepare-workspace-publish-assets.mjs';
+import { getReleasePackages } from './release-package-map.mjs';
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const nativeTargets = ["linux-x64", "darwin-arm64", "darwin-x64"];
 
-export function materializePublishManifest(pkg) {
+export function sourceWorkspaceVersions() {
+  const versions = new Map();
+  for (const { name, version } of getReleasePackages()) {
+    if (versions.has(name) || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(version ?? '')) {
+      throw new Error(`Native workspace version requires compatibility review: ${name}`);
+    }
+    versions.set(name, version);
+  }
+  return versions;
+}
+
+export function materializePublishManifest(pkg, { workspaceVersions } = {}) {
+  if (workspaceVersions !== undefined && !(workspaceVersions instanceof Map)) {
+    throw new Error('Native workspace versions must be the exact source package map');
+  }
   const publishConfig = pkg.publishConfig ?? {};
   const publishManifest = { ...pkg };
 
@@ -24,7 +40,15 @@ export function materializePublishManifest(pkg) {
         if (typeof specifier !== "string" || !specifier.startsWith("workspace:")) return [name, specifier];
         const range = specifier.slice("workspace:".length);
         const prefix = range === "^" || range === "~" ? range : "";
-        return [name, `${prefix}${pkg.version}`];
+        if (workspaceVersions === undefined) return [name, `${prefix}${pkg.version}`];
+        if (!["", "*", "^", "~"].includes(range) || !workspaceVersions.has(name)) {
+          throw new Error(`Native workspace dependency requires compatibility review: ${name} ${specifier}`);
+        }
+        const target = workspaceVersions.get(name);
+        if (typeof target !== 'string' || !/^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/.test(target)) {
+          throw new Error(`Invalid native target workspace version: ${name}`);
+        }
+        return [name, `${prefix}${target}`];
       }),
     );
   }
@@ -374,7 +398,19 @@ export function applyBundledDependencyPatches(destinationDir, bundledDependencie
   }
 }
 
-export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = repoRoot } = {}) {
+export function materializeBundledPublishManifest(pkg, { omitSourcePackHooks = false, workspaceVersions } = {}) {
+  const manifest = materializePublishManifest(pkg, { workspaceVersions });
+  if (omitSourcePackHooks && manifest.scripts) {
+    if (manifest.scripts.prepare) throw new Error('Bundled prepare hook requires native packaging compatibility review');
+    manifest.scripts = { ...manifest.scripts };
+    delete manifest.scripts.prepack;
+    delete manifest.scripts.postpack;
+    if (!Object.keys(manifest.scripts).length) delete manifest.scripts;
+  }
+  return manifest;
+}
+
+export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = repoRoot, omitSourcePackHooks = false, workspaceVersions } = {}) {
   const sourcePackagePath = resolve(sourceDir, "package.json");
   const sourcePackage = JSON.parse(readFileSync(sourcePackagePath, "utf8"));
   const bundledDependencies = sourcePackage.bundleDependencies ?? sourcePackage.bundledDependencies ?? [];
@@ -394,7 +430,7 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
   }
 
   const deployedPackagePath = resolve(destinationDir, "package.json");
-  const publishManifest = materializePublishManifest(sourcePackage);
+  const publishManifest = materializeBundledPublishManifest(sourcePackage, { omitSourcePackHooks, workspaceVersions });
   const rootPackage = JSON.parse(readFileSync(resolve(sourceRoot, "package.json"), "utf8"));
   const profileData = bundledDependencies.includes("@agentclientprotocol/codex-acp")
     ? JSON.parse(readFileSync(resolve(sourceRoot, "packages/paperclip-runner/acpx-profiles.json"), "utf8")) : undefined;
@@ -459,10 +495,19 @@ export function prepareBundledPackage(sourceDir, destinationDir, { sourceRoot = 
 }
 
 if (process.argv[1] === fileURLToPath(import.meta.url)) {
-  const [sourceDir, destinationDir] = process.argv.slice(2);
-  if (!sourceDir || !destinationDir) {
-    console.error("Usage: prepare-bundled-package.mjs <source-dir> <destination-dir>");
+  const [sourceDir, destinationDir, assetMode, ...extra] = process.argv.slice(2);
+  if (!sourceDir || !destinationDir || extra.length || (assetMode && assetMode !== '--assets-prepared')) {
+    console.error("Usage: prepare-bundled-package.mjs <source-dir> <destination-dir> [--assets-prepared]");
     process.exit(1);
   }
-  prepareBundledPackage(resolve(sourceDir), resolve(destinationDir));
+  const source = resolve(sourceDir);
+  // The published bootstrap invokes this source CLI directly. Preparing assets
+  // here fixes that first installation too, without replacing the bootstrap.
+  const workspaceSource = ['packages/adapter-utils', 'packages/db', 'server']
+    .some(dir => source === resolve(repoRoot, dir));
+  if (workspaceSource) prepareWorkspacePublishAssets(repoRoot, { prepared: assetMode === '--assets-prepared' });
+  prepareBundledPackage(source, resolve(destinationDir), {
+    omitSourcePackHooks: true,
+    workspaceVersions: workspaceSource ? sourceWorkspaceVersions() : undefined,
+  });
 }

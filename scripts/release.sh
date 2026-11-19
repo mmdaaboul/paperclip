@@ -299,11 +299,7 @@ elif [ "$dry_run" = false ]; then
   release_fail "Public releases require the four hosted runner daemon artifacts; use the supported Release workflow."
 fi
 node "$REPO_ROOT/scripts/build-standalone-public-packages.mjs"
-bash "$REPO_ROOT/scripts/prepare-server-ui-dist.sh"
-for pkg_dir in server packages/adapters/claude-local packages/adapters/codex-local; do
-  rm -rf "$REPO_ROOT/$pkg_dir/skills"
-  cp -r "$REPO_ROOT/skills" "$REPO_ROOT/$pkg_dir/skills"
-done
+node "$REPO_ROOT/scripts/prepare-workspace-publish-assets.mjs" "$REPO_ROOT"
 release_info "  ✓ Workspace build complete"
 
 release_info ""
@@ -364,7 +360,7 @@ if [ "$dry_run" = true ]; then
       publish_tool="$(package_publish_tool)"
       if [ "$publish_tool" = "npm" ]; then
         publish_dir="$(mktemp -d "${TMPDIR:-/tmp}/paperclip-release-package.XXXXXX")"
-        node "$REPO_ROOT/scripts/prepare-bundled-package.mjs" "$REPO_ROOT/$pkg_dir" "$publish_dir"
+        node "$REPO_ROOT/scripts/prepare-bundled-package.mjs" "$REPO_ROOT/$pkg_dir" "$publish_dir" --assets-prepared
         cd "$publish_dir"
         run_bundled_npm_pack pack --pack-destination "$publish_dir" 2>&1 | tail -3
         rm -rf "$publish_dir"
@@ -399,7 +395,7 @@ else
     publish_tool="$(package_publish_tool)"
     if [ "$publish_tool" = "npm" ]; then
       publish_dir="$(mktemp -d "${TMPDIR:-/tmp}/paperclip-release-package.XXXXXX")"
-      node "$REPO_ROOT/scripts/prepare-bundled-package.mjs" "$REPO_ROOT/$pkg_dir" "$publish_dir"
+      node "$REPO_ROOT/scripts/prepare-bundled-package.mjs" "$REPO_ROOT/$pkg_dir" "$publish_dir" --assets-prepared
       cd "$publish_dir"
     fi
     if ! publish_package_to_npm \
