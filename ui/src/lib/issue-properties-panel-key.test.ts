@@ -6,6 +6,7 @@ function createIssue(overrides: Partial<Issue> = {}) {
   return {
     id: "issue-1",
     status: "in_progress" as const,
+    statusVersion: 0,
     priority: "medium" as const,
     assigneeAgentId: "agent-1",
     assigneeUserId: null,
@@ -30,6 +31,19 @@ function createIssue(overrides: Partial<Issue> = {}) {
 }
 
 describe("buildIssuePropertiesPanelKey", () => {
+  it("changes after ownership moves away and back to the same pending human", () => {
+    expect(buildIssuePropertiesPanelKey(createIssue({ statusVersion: 2 }), [])).not.toBe(
+      buildIssuePropertiesPanelKey(createIssue({ statusVersion: 0 }), []));
+  });
+  it("changes between consecutive stages for the same human and stage type", () => {
+    const state: NonNullable<Issue["executionState"]> = { status: "pending", currentStageId: "stage-1", currentStageIndex: 0,
+      currentStageType: "approval", currentParticipant: { type: "user", userId: "user-1", agentId: null },
+      returnAssignee: null, reviewRequest: null, completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null };
+    const first = buildIssuePropertiesPanelKey(createIssue({ executionState: state }), []);
+    const second = buildIssuePropertiesPanelKey(createIssue({ executionState: { ...state, currentStageId: "stage-2", currentStageIndex: 1,
+      completedStageIds: ["stage-1"], lastDecisionId: "decision-1", lastDecisionOutcome: "approved" } }), []);
+    expect(second).not.toBe(first);
+  });
   it("ignores plain updatedAt churn", () => {
     const first = buildIssuePropertiesPanelKey(createIssue(), []);
     const second = buildIssuePropertiesPanelKey(

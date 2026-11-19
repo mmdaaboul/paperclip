@@ -1,4 +1,5 @@
 import { isLockedIssueStub } from "@/components/LockedIssueChip";
+import { IssueExecutionDecision } from "../IssueExecutionDecision";
 import { IssuePullRequestLinks } from "../IssuePullRequestLinks";
 import { useIssueWorkProducts } from "../../hooks/useIssueWorkProducts";
 import { getIssuePullRequests, pullRequestHref, pullRequestIdentity } from "../../lib/issue-pull-requests";
@@ -2713,6 +2714,8 @@ export function IssueProperties({
             <span className="text-sm truncate min-w-0" title={currentExecutionLabel}>{currentExecutionLabel}</span>
           </PropertyRow>
         )}
+
+        {policyAvailable && <IssueExecutionDecision issue={issue} currentUserId={currentUserId} />}
 
         {showScheduledRetryRow && scheduledRetry?.scheduledRetryReason === "workspace_busy" ? (
           <PropertyRow label="Workspace">

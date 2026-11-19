@@ -975,6 +975,12 @@ export const updateIssueSchema = objectWithoutDefaults(
     expectedStatusVersion: z.number().int().nonnegative().optional(),
     /** Reject a policy write if the policy changed after the caller read it. */
     expectedExecutionPolicy: z.record(z.string(), z.unknown()).optional().nullable(),
+    /** Opt-in human decision snapshot, rechecked under the issue lock with its comment. */
+    expectedExecutionDecision: z.object({
+      statusVersion: z.number().int().nonnegative(),
+      executionPolicy: issueExecutionPolicySchema,
+      executionState: issueExecutionStateSchema,
+    }).strict().optional(),
     requestDepth: issueRequestDepthInputSchema.optional(),
     assigneeAgentId: z.string().trim().min(1).optional().nullable(),
     comment: multilineTextSchema.pipe(z.string().min(1)).optional(),

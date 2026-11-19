@@ -12,6 +12,7 @@ import { INBOX_MINE_ISSUE_STATUS_FILTER, latestFailedRunsByAgent } from "@paperc
 import { getHeartbeatRunReadDecisions, redactHeartbeatRunListRow } from "../services/heartbeat-run-privacy.js";
 import { taskInterruptionPresentation, taskInterruptionPresentations } from "../services/task-interruption-presentation.js";
 import { parseObject } from "../adapters/utils.js";
+import { assertHumanExecutionDecisionSnapshot } from "../services/human-execution-decision.js";
 import { prepareRestrictedWorkspaceRetry } from "../services/restricted-workspace-retry.js";
 import { issueSummariesQuerySchema, type IssueSummary } from "@paperclipai/shared";
 import { listIssueSummaries } from "../services/issue-summaries.js";
@@ -14390,6 +14391,11 @@ export function issueRoutes(
       )) {
         throw unprocessable("expectedExecutionPolicy requires a policy-only update");
       }
+      if (req.body.expectedExecutionDecision !== undefined && (
+        !["done", "in_progress"].includes(req.body.status ?? "") ||
+        typeof req.body.comment !== "string" || !req.body.comment.trim() ||
+        Object.keys(req.body).some(key => !["status", "comment", "commentClientRequestId", "expectedExecutionDecision"].includes(key))
+      )) throw unprocessable("A guarded human decision requires only a decision status, comment and execution snapshot");
       const id = req.params.id as string;
       const existing = await getAccessibleResource(
         req,
@@ -14399,6 +14405,10 @@ export function issueRoutes(
       );
       if (!existing) return;
       if (!(await assertIssueReadAllowed(req, res, existing))) return;
+      if (req.body.expectedExecutionDecision !== undefined) {
+        assertHumanExecutionDecisionSnapshot(existing, req.body.expectedExecutionDecision,
+          req.actor.type === "board" && req.actor.source !== "mcp_oauth" ? req.actor.userId ?? null : null);
+      }
       await assertNativeRunKeepsOwnExecutionLock(req, existing);
       if (req.body.expectedStatusVersion !== undefined && (
         existing.statusVersion !== req.body.expectedStatusVersion || existing.status !== "backlog"
@@ -14486,6 +14496,7 @@ export function issueRoutes(
         hiddenAt: hiddenAtRaw,
         expectedExecutionPolicy,
         expectedStatusVersion,
+        expectedExecutionDecision,
         onBehalfOfUserId: _requestedOnBehalfOfUserId,
         ...updateFields
       } = req.body;
@@ -14923,12 +14934,16 @@ export function issueRoutes(
           agentId: actor.agentId ?? null,
           userId: actor.actorType === "user" ? actor.actorId : null,
         },
-        allowBoardOverride: req.actor.type === "board" && req.actor.source !== "mcp_oauth",
+        allowBoardOverride: expectedExecutionDecision === undefined && req.actor.type === "board" && req.actor.source !== "mcp_oauth",
         commentBody,
         reviewRequest: reviewRequest === undefined ? undefined : reviewRequest,
         monitorExplicitlyUpdated:
           req.body.executionPolicy !== undefined && monitorChanged,
       });
+      if (expectedExecutionDecision !== undefined && (!transition.decision ||
+        transition.decision.outcome !== (req.body.status === "done" ? "approved" : "changes_requested"))) {
+        throw conflict("The task execution stage changed. Read its latest state before deciding.", { code: "execution_decision_changed" });
+      }
       const decisionId = transition.decision ? randomUUID() : null;
       if (decisionId) {
         const nextExecutionState = transition.patch.executionState;
@@ -15472,7 +15487,8 @@ export function issueRoutes(
       const commentWithAdapterOverrides = Boolean(
         commentBody && updateFields.assigneeAdapterOverrides !== undefined,
       );
-      const transactionalCommentSourceTrust = commentAttachmentIds?.length || commentWithAdapterOverrides
+      const transactionalHumanDecision = expectedExecutionDecision !== undefined;
+      const transactionalCommentSourceTrust = commentAttachmentIds?.length || commentWithAdapterOverrides || transactionalHumanDecision
         ? await sourceTrustForActorWrite(existing, actor)
         : undefined;
       const shouldUseTransactionalIssueUpdate =
@@ -15485,6 +15501,15 @@ export function issueRoutes(
       try {
         if (shouldUseTransactionalIssueUpdate) {
           issue = await db.transaction(async (tx) => {
+            if (expectedExecutionDecision !== undefined) {
+              const locked = await svc.getByIdForUpdate(id, tx);
+              if (!locked) return null;
+              if (locked.companyId !== existing.companyId) {
+                throw conflict("The task changed. Read its latest state before deciding.", { code: "execution_decision_changed" });
+              }
+              assertHumanExecutionDecisionSnapshot(locked, expectedExecutionDecision,
+                req.actor.type === "board" && req.actor.source !== "mcp_oauth" ? req.actor.userId ?? null : null);
+            }
             if (
               reviewPolicySensitiveMutationRequested &&
               !(await assertLockedReviewPolicyAllowsMutation(tx))
@@ -15492,7 +15517,7 @@ export function issueRoutes(
               return null;
             const updated = await updateIssue(tx);
             if (!updated) return null;
-            if (commentAttachmentIds?.length || commentWithAdapterOverrides) {
+            if (commentAttachmentIds?.length || commentWithAdapterOverrides || transactionalHumanDecision) {
               // Adapter settings, reassignment, comment and upload binding commit together.
               // A failed comment or invalid receipt rolls back the issue update.
               transactionalComment = await svc.addComment(

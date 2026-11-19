@@ -2954,6 +2954,24 @@ describe("IssueProperties", () => {
     act(() => root.unmount());
   });
 
+  it.each(["user-1", "someone-else"])("mounts human decision controls only for the current participant (%s)", async (userId) => {
+    const { root, queryClient } = renderPropertiesWithQueryClient(container, {
+      issue: createIssue({ status: "in_review", statusVersion: 0, assigneeAgentId: null, assigneeUserId: userId,
+        executionPolicy: createExecutionPolicy({ stages: [{ id: "00000000-0000-4000-8000-000000000010", type: "approval", approvalsNeeded: 1,
+          participants: [{ id: "00000000-0000-4000-8000-000000000012", type: "user", userId, agentId: null }] }] }),
+        executionState: createExecutionState({ status: "pending", currentStageType: "approval",
+          currentStageId: "00000000-0000-4000-8000-000000000010",
+          currentParticipant: { type: "user", userId, agentId: null }, lastDecisionOutcome: null }) }),
+      childIssues: [], onUpdate: vi.fn(),
+    });
+    await waitForAssertion(() => expect(queryClient.getQueryData(queryKeys.auth.session)).toMatchObject({ user: { id: "user-1" } }));
+    await waitForAssertion(() => {
+      const approve = [...container.querySelectorAll("button")].find(button => button.textContent === "Approve");
+      expect(Boolean(approve), container.textContent ?? "").toBe(userId === "user-1");
+    });
+    act(() => root.unmount());
+  });
+
   it("renders monitor controls and clears an existing monitor", async () => {
     const dateNowSpy = vi.spyOn(Date, "now").mockReturnValue(new Date("2026-04-11T10:00:00.000Z").getTime());
     const onUpdate = vi.fn();
