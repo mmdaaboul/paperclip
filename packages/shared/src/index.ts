@@ -2904,3 +2904,8 @@ export {
   TASK_IDENTITY_CHANGED_FIELD,
   issueActivityChangesTaskIdentity,
 } from "./issue-activity-identity.js";
+
+// Contracts for optional custom workflow storage.
+export * from "./agent-reference-folders.js";
+export * from "./agent-reviewer-policy.js";
+export * from "./scoped-review.js";

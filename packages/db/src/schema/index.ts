@@ -281,3 +281,11 @@ export { issueThreadInteractionIdempotencyKeys } from "./issue_thread_interactio
 export { projectTaskExecutionPolicies, executionAdmissions, executionAdmissionProjectCharges } from "./execution_admissions.js";
 export { budgetEvaluationWork } from "./budget_evaluation_work.js";
 export { nativeProviderArtifacts, nativeProviderArtifactReferences } from "./native_provider_artifacts.js";
+
+// Optional custom workflow storage; routes and enforcement are integrated separately.
+export { agentReferenceFolderConfigs } from "./agent_reference_folder_configs.js";
+export { agentReviewerPolicies } from "./agent_reviewer_policies.js";
+export { githubPushOperationReceipts } from "./github_push_operation_receipts.js";
+export { reviewerGithubOperations, reviewerGithubEvents } from "./reviewer_github_operations.js";
+export { issueReviewCycleBudgets } from "./issue_review_cycle_budgets.js";
+export { issueScopedReviews } from "./issue_scoped_reviews.js";
