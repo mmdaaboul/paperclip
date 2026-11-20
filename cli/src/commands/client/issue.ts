@@ -1,3 +1,4 @@
+import {registerSelectedPolicyReads} from "./selected-policy.js";
 import { Command } from "commander";
 import { readFile, writeFile } from "node:fs/promises";
 import {
@@ -171,6 +172,7 @@ interface TreeHoldListOptions extends BaseClientOptions {
 
 export function registerIssueCommands(program: Command): void {
   const issue = program.command("issue").description("Issue operations");
+  registerSelectedPolicyReads(issue,"issue");
 
   addCommonClientOptions(
     issue

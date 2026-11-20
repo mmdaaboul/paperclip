@@ -1,3 +1,4 @@
+import {registerSelectedPolicyReads} from "./selected-policy.js";
 import { Command } from "commander";
 import {
   agentSkillSyncSchema,
@@ -224,6 +225,7 @@ function buildAgentEnvExports(input: {
 
 export function registerAgentCommands(program: Command): void {
   const agent = program.command("agent").description("Agent operations");
+  registerSelectedPolicyReads(agent,"agent");
 
   addCommonClientOptions(
     agent
@@ -342,6 +344,7 @@ export function registerAgentCommands(program: Command): void {
           handleCommandError(err);
         }
       }),
+    {includeCompany:true},
   );
 
   addCommonClientOptions(

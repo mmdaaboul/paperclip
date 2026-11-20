@@ -4,6 +4,20 @@ import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 
 export type TaskDrainState = { startedAt: Date; expiresAt: Date | null; ownerId?: string };
 let taskDrainState: TaskDrainState | null = null;
+let persistentDrain:(()=>TaskDrainState|null)|undefined;
+let observedPersistentOwner:string|null=null;
+/** Local native maintenance owner only; no request/model controls this reader. */
+export function installPersistentTaskDrain(reader:()=>TaskDrainState|null){
+ if(persistentDrain)throw new Error("native_maintenance_provider_already_installed");
+ reader();persistentDrain=reader;notifyDrainChanged();
+ return ()=>{if(persistentDrain===reader){persistentDrain=undefined;observedPersistentOwner=null;notifyDrainChanged();}};
+}
+function readPersistentTaskDrain(){
+ const drain=persistentDrain?.()??null,owner=drain?.ownerId??(drain?"persistent":null);
+ if(owner!==observedPersistentOwner){observedPersistentOwner=owner;notifyDrainChanged();}
+ return drain;
+}
+
 const expiryListeners = new Set<() => void>();
 const changeListeners = new Set<() => void>();
 
@@ -56,13 +70,14 @@ export function setControllerLeaseQuiesce(quiesced: boolean): void {
 }
 
 export function readTaskDrain(now: Date): TaskDrainState | null {
+  const durable=readPersistentTaskDrain();
   if (taskDrainState?.expiresAt && taskDrainState.expiresAt.getTime() <= now.getTime()) {
     taskDrainState = null;
     for (const listener of expiryListeners) {
       try { listener(); } catch (error) { process.emitWarning(`Task drain expiry notification failed: ${String(error)}`); }
     }
   }
-  return taskDrainState ?? controllerLeaseQuiesce;
+  return durable ?? taskDrainState ?? controllerLeaseQuiesce;
 }
 
 export function computeTaskDrain(opts: { ttlMs?: number | null; purpose?: "idle" } = {}): TaskDrainState {
@@ -72,6 +87,7 @@ export function computeTaskDrain(opts: { ttlMs?: number | null; purpose?: "idle"
 }
 
 export function applyTaskDrain(drain: TaskDrainState): void {
+  if(readPersistentTaskDrain())throw new Error("native_maintenance_hold_active");
   taskDrainState = drain;
   notifyDrainChanged();
 }
@@ -81,6 +97,7 @@ export function startTaskDrain(opts: { ttlMs?: number | null; purpose?: "idle" }
   return drain;
 }
 export function stopTaskDrain(): { wasActive: boolean } {
+  if(readPersistentTaskDrain())throw new Error("native_maintenance_hold_active");
   const wasActive = readTaskDrain(new Date()) !== null && taskDrainState !== null;
   taskDrainState = null;
   notifyDrainChanged();

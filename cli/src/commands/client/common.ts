@@ -1,4 +1,5 @@
 import pc from "picocolors";
+import {resolveDefaultCliAuthPath} from "../../config/home.js";
 import type { Command } from "commander";
 import { getStoredBoardCredential, loginBoardCli } from "../../client/board-auth.js";
 import { buildCliCommandLabel } from "../../client/command-label.js";
@@ -13,6 +14,7 @@ export interface BaseClientOptions {
   profile?: string;
   apiBase?: string;
   apiKey?: string;
+  boardAuthOnly?: boolean;
   runId?: string;
   companyId?: string;
   json?: boolean;
@@ -34,6 +36,7 @@ export function addCommonClientOptions(command: Command, opts?: { includeCompany
     .option("--context <path>", "Path to CLI context file")
     .option("--profile <name>", "CLI context profile name")
     .option("--api-base <url>", "Base URL for the Paperclip API")
+    .option("--board-auth-only", "Use only the selected home’s stored board login; no agent or interactive authentication")
     .option("--api-key <token>", "Bearer token for agent-authenticated calls")
     .option("--run-id <id>", "Heartbeat run id for agent-authenticated mutations (checkout/release/interactions/in-progress update); falls back to $PAPERCLIP_RUN_ID")
     .option("--json", "Output raw JSON");
@@ -49,19 +52,21 @@ export function resolveCommandContext(
   options: BaseClientOptions,
   opts?: { requireCompany?: boolean },
 ): ResolvedClientContext {
-  const context = readContext(options.context);
+  if(options.boardAuthOnly&&(!options.apiBase||options.apiKey||options.runId))throw new Error("Board-only commands require explicit API base and forbid agent credentials/run IDs.");
+  const context = options.boardAuthOnly?{version:2 as const,currentProfile:"board-only",profiles:{"board-only":{}}}:readContext(options.context);
   const { name: profileName, profile } = resolveProfile(context, options.profile);
 
   const apiBase = resolveApiBase(options, profile);
 
-  const resolvedApiKey = resolveApiKey(options, profile);
+  const resolvedApiKey = options.boardAuthOnly?{value:undefined,source:"none" as const}:resolveApiKey(options, profile);
   const explicitApiKey = resolvedApiKey.value;
-  const storedBoardCredential = explicitApiKey ? null : getStoredBoardCredential(apiBase);
+  const storedBoardCredential = explicitApiKey ? null : getStoredBoardCredential(apiBase,options.boardAuthOnly?resolveDefaultCliAuthPath():undefined);
+  if(options.boardAuthOnly&&!storedBoardCredential)throw new Error("Stored native board login required for this origin; authorize privately with native auth login.");
   const apiKey = explicitApiKey || storedBoardCredential?.token;
 
   const companyId =
     options.companyId?.trim() ||
-    process.env.PAPERCLIP_COMPANY_ID?.trim() ||
+    (!options.boardAuthOnly?process.env.PAPERCLIP_COMPANY_ID?.trim():undefined) ||
     profile.companyId;
 
   if (opts?.requireCompany && !companyId) {
@@ -74,13 +79,13 @@ export function resolveCommandContext(
   // in-progress issue) require the X-Paperclip-Run-Id header (the server returns
   // "401 Agent run id required" without it). Source it from --run-id, else the
   // PAPERCLIP_RUN_ID env the adapter/embodiment context already exports.
-  const runId = options.runId?.trim() || process.env.PAPERCLIP_RUN_ID?.trim() || undefined;
+  const runId = options.boardAuthOnly?undefined:options.runId?.trim() || process.env.PAPERCLIP_RUN_ID?.trim() || undefined;
 
   const api = new PaperclipApiClient({
     apiBase,
     apiKey,
     runId,
-    recoverAuth: explicitApiKey || !canAttemptInteractiveBoardAuth()
+    recoverAuth: options.boardAuthOnly || explicitApiKey || !canAttemptInteractiveBoardAuth()
       ? undefined
       : async ({ error }) => {
           const requestedAccess = error.message.includes("Instance admin required")

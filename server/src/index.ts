@@ -1,3 +1,9 @@
+import {NativeMaintenanceHold} from "./services/native-maintenance-hold.js";
+import {startNativeMaintenanceServer} from "./services/native-maintenance-server.js";
+import {resolvePaperclipInstanceRoot,resolvePaperclipInstanceId} from "./home-paths.js";
+import {readBuildCommit} from "./build-commit.js";
+import {getServerInfoSnapshot} from "./server-info.js";
+import {serverVersion} from "./version.js";
 import type { IdleDeadlineOwners } from "./services/idle-deadline-types.js";
 import { closeProcessRunAdmission } from "./services/heartbeat/run-admission.js";
 import { registerOwnershipReconciliationWork } from "./services/native-runtime/native-finalization-reconciler.js";
@@ -66,7 +72,7 @@ import type { createDeliveryWorkCoordinator } from "./services/delivery-work-coo
 import { assertEphemeralServerConfig, assertEphemeralServerData } from "./services/ephemeral-server-contract.js";
 import { deploymentNotifications } from "./services/deployment-notifications.js";
 import { registerTerminalWorkspaceWork, TERMINAL_WORKSPACE_RETRY_MS } from "./services/terminal-workspace-work.js";
-import { isIdleTaskDrainActive, readTaskDrain, beginIdleTrackedWork, trackIdleWork, registerTaskDrainExpiryWork } from "./services/task-admission.js";
+import { installPersistentTaskDrain,isIdleTaskDrainActive, readTaskDrain, beginIdleTrackedWork, trackIdleWork, registerTaskDrainExpiryWork } from "./services/task-admission.js";
 import { markIdleStartupComplete, registerIdleLocalWorkProbe } from "./services/idle-local-work.js";
 import { idleBackupWakeMarker } from "./services/idle-database-backup.js";
 import { createDatabaseBackupOwner } from "./services/database-backup-owner.js";
@@ -316,7 +322,14 @@ async function startServerWithDatabaseTeardown(
   // sentry.ts.
   await sentryReady;
   const startupConfig = isCloudManagedInstance() ? loadCloudBootstrapConfig() : loadConfig();
-  if ("deploymentMode" in startupConfig) {
+  // Read the owner-bound latch before key/config/telemetry and application
+  // construction. Cloud/remote layouts retain their native path, unqualified.
+  const maintenanceRoot=resolvePaperclipInstanceRoot();
+  const maintenanceHold=!isCloudManagedInstance() && existsSync(maintenanceRoot)
+    ? new NativeMaintenanceHold(maintenanceRoot,resolvePaperclipInstanceId()):null;
+  const uninstallMaintenanceDrain=maintenanceHold?installPersistentTaskDrain(()=>maintenanceHold.drain()):()=>{};
+  startupDatabase.close=async()=>{uninstallMaintenanceDrain();};
+  if ("deploymentMode" in startupConfig && !maintenanceHold?.status()) {
     assertEphemeralServerConfig(startupConfig);
     ensureDecisionSigningSecret();
     initializeRuntimeConfigConsumers(startupConfig);
@@ -741,9 +754,35 @@ async function startServerWithDatabaseTeardown(
   const closeDatabaseClients = async () => {
     setSentryRunLinkResolver(null);
     const clients = pluginMigrationDb === db ? [db] : [db, pluginMigrationDb];
-    await Promise.all([...clients.map((client) => endDatabaseClient(client, 5)), closeLivenessDb(db, 5), closeCheckpointDb(db, 5), closeFileStorageDb(db, 5)]);
+    try{await Promise.all([...clients.map((client) => endDatabaseClient(client, 5)), closeLivenessDb(db, 5), closeCheckpointDb(db, 5), closeFileStorageDb(db, 5)]);}finally{uninstallMaintenanceDrain();}
   };
   startupDatabase.close = closeDatabaseClients;
+  if (maintenanceHold?.status()) {
+    if(!("deploymentMode" in startupConfig))throw new Error("native_maintenance_local_configuration_required");
+    const config=startupConfig;
+    assertEphemeralServerConfig(config);
+    const info = getServerInfoSnapshot();
+    const commit = readBuildCommit() ?? (info.git.available ? info.git.fullSha : null);
+    if (!commit || !/^[a-f0-9]{40}$/.test(commit)) throw new Error("native_maintenance_exact_build_identity_required");
+    const maintenance = await startNativeMaintenanceServer({ hold: maintenanceHold, host: config.host,
+      port: config.port, commit, version: serverVersion });
+    const closeMaintenance = async (signal: "SIGINT" | "SIGTERM" = "SIGTERM") => {
+      process.off("SIGINT", onInt); process.off("SIGTERM", onTerm);
+      await finalizeServerShutdown({ signal, shutdownAppServices: async () => {},
+        closeHttpListener: () => closeHttpListenerForShutdown({ server: maintenance.server, signal, log: logger }),
+        drainPendingRunFailureReports: async () => {}, closeDatabase: closeDatabaseClients,
+        stopEmbeddedPostgres: embeddedPostgres && embeddedPostgresStartedByThisProcess
+          ? () => embeddedPostgresSupervisor?.shutdown() ?? embeddedPostgres!.stop() : null,
+        shutdownInstrumentation, shutdownSentry, log: logger });
+    };
+    const onInt = () => { void closeMaintenance("SIGINT").then(() => process.exit(0)); };
+    const onTerm = () => { void closeMaintenance("SIGTERM").then(() => process.exit(0)); };
+    process.once("SIGINT", onInt); process.once("SIGTERM", onTerm);
+    await systemdNotify(["--ready", "--status=Native maintenance active; normal application not started"]);
+    return { server: maintenance.server, host: config.host, listenPort: maintenance.boot.port,
+      apiUrl: `http://${config.host === "::1" ? "[::1]" : config.host}:${maintenance.boot.port}`,
+      databaseUrl: activeDatabaseConnectionString, shutdown: closeMaintenance };
+  }
   setSentryRunLinkResolver(createSentryRunLinkResolver(db));
   await migrateCloudConfiguration(db as any);
   await initializeAdapterSettings(db as any);

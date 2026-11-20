@@ -1,3 +1,4 @@
+import {validatePinnedGitUpdate,assertPinnedGitManifest,assertPinnedGitCache,assertUnchangedPinnedGitSource,assertPinnedGitRollback} from "./update-git-pin.js";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -16,8 +17,8 @@ import { packageVersion } from "../version.js";
 
 const execFileAsync = promisify(execFile);
 export type InstallMode = "managed" | "global-npm" | "npx" | "source" | "unknown";
-export type UpdateOptions = { canary?: boolean; latest?: boolean; version?: string; rollback?: boolean; check?: boolean; dryRun?: boolean; json?: boolean; yes?: boolean; backup?: boolean };
-type Dependencies = { executablePath: string; runCommand: CommandRunner; backup: () => Promise<void>; confirm: (message: string) => Promise<boolean>; now: () => Date; paths: InstallStorePaths; restartActiveService: (expectedVersion: string) => Promise<boolean>; hasInstanceData: () => boolean };
+export type UpdateOptions = { canary?: boolean; latest?: boolean; version?: string; gitSha?:string; expectedCurrentSha?:string; expectedRollbackSha?:string; rollbackOnFailure?:boolean; rollback?: boolean; check?: boolean; dryRun?: boolean; json?: boolean; yes?: boolean; backup?: boolean };
+type Dependencies = { executablePath: string; runCommand: CommandRunner; backup: () => Promise<void>; confirm: (message: string) => Promise<boolean>; now: () => Date; paths: InstallStorePaths; restartActiveService: (expectedVersion: string, expectedCommit?: string) => Promise<boolean>; hasInstanceData: () => boolean };
 
 const DATABASE_UNREACHABLE_CODES = new Set(["ECONNREFUSED", "EHOSTUNREACH", "ENETUNREACH", "ETIMEDOUT"]);
 
@@ -67,11 +68,11 @@ async function runPreUpdateBackup(options: UpdateOptions, backup: () => Promise<
   }
 }
 
-async function restartActiveManagedService(expectedVersion: string): Promise<boolean> {
+async function restartActiveManagedService(expectedVersion: string, expectedCommit?:string): Promise<boolean> {
   const instanceId = resolvePaperclipInstanceId();
   const detection = await detectServiceManager({ instanceId });
   if (!detection.supported || !(await detection.manager.status()).active) return false;
-  await restartManagedService({ instanceId, expectedVersion });
+  await restartManagedService({ instanceId, expectedVersion,expectedCommit });
   return true;
 }
 
@@ -148,13 +149,21 @@ function emit(options: UpdateOptions, value: Record<string, unknown>, message: s
 
 async function rollbackAfterServiceValidationFailure(
   paths: InstallStorePaths,
-  restartActiveService: (expectedVersion: string) => Promise<boolean>,
+  restartActiveService: (expectedVersion: string, expectedCommit?: string) => Promise<boolean>,
   validationError: unknown,
   payloadLabel: string,
+  exactGit?: {candidateSha:string;previous:InstallManifest;candidatePath:string},
 ): Promise<never> {
-  const rolledBack = await withInstallStoreLock(async () => rollbackManagedInstall(paths), paths);
+  const rolledBack = await withInstallStoreLock(async () => {
+    if(exactGit){
+      const current=readInstallManifest(paths);
+      assertPinnedGitRollback(current,{rollback:true,expectedCurrentSha:exactGit.candidateSha,expectedRollbackSha:exactGit.previous.sha});
+      if(!current||current.repo!==exactGit.previous.repo||current.payloadPath!==exactGit.candidatePath||current.previous[0]?.payloadPath!==exactGit.previous.payloadPath)throw new Error("Exact Git automatic rollback source changed; retain current state for recovery.");
+    }
+    return rollbackManagedInstall(paths);
+  }, paths);
   try {
-    await restartActiveService(rolledBack.version);
+    await restartActiveService(rolledBack.version,rolledBack.source==="git"?rolledBack.sha:undefined);
   } catch (restartError) {
     throw new Error(
       `${payloadLabel} failed service validation and was rolled back to ${rolledBack.version}, but the rolled-back service also failed to restart.`,
@@ -165,16 +174,25 @@ async function rollbackAfterServiceValidationFailure(
 }
 
 export async function updateCommand(options: UpdateOptions, overrides: Partial<Dependencies> = {}): Promise<void> {
+  validatePinnedGitUpdate(options);
+  // Keep existing programmatic callbacks compatible; exact Git callers opt in
+  // to the bound commit. The production native service always receives it.
+  const restartSelectedService=(version:string,commit?:string)=>overrides.restartActiveService
+    ? options.gitSha||options.expectedCurrentSha?overrides.restartActiveService(version,commit):overrides.restartActiveService(version)
+    : restartActiveManagedService(version,commit);
   const paths = overrides.paths ?? resolveInstallStorePaths();
   const executablePath = overrides.executablePath ?? process.argv[1] ?? "";
   const runCommand = overrides.runCommand ?? execFileAsync;
   const mode = detectInstallMode(executablePath, paths);
   const manifest = readInstallManifest(paths);
+  if(options.gitSha && mode!=="managed")throw new Error("Exact Git targeting requires an existing managed Git installation.");
+  assertPinnedGitManifest(manifest,options);
   if (options.rollback) {
     if (mode !== "managed") throw new Error("--rollback is only available for managed installs.");
     if (options.dryRun) { emit(options, { mode, action: "rollback", dryRun: true, target: manifest?.previous[0]?.version ?? null }, `Would roll back to ${manifest?.previous[0]?.version ?? "the previous payload"}.`); return; }
-    const next = await withInstallStoreLock(async () => rollbackManagedInstall(paths), paths);
-    const restarted = await (overrides.restartActiveService ?? restartActiveManagedService)(next.version);
+    const next = await withInstallStoreLock(async () => {assertPinnedGitRollback(readInstallManifest(paths),options);return rollbackManagedInstall(paths);}, paths);
+    const restarted = await restartSelectedService(next.version,next.source==="git"?next.sha:undefined);
+    if(options.expectedCurrentSha){const active=readInstallManifest(paths);if(!active||active.sha!==next.sha||active.payloadPath!==next.payloadPath||active.repo!==next.repo)throw new Error("Exact rollback source changed during service validation.");}
     emit(options, { mode, action: "rollback", version: next.version, restarted }, pc.green(`Rolled back to paperclipai ${next.version}${restarted ? " and restarted the active service" : ""}. Database migrations are not reversed; restore the pre-update backup if needed.`));
     return;
   }
@@ -184,8 +202,9 @@ export async function updateCommand(options: UpdateOptions, overrides: Partial<D
   const request = resolveUpdateRequest(mode === "managed" ? manifest : null, options);
   if (mode === "managed" && manifest?.source === "git") {
     if (!manifest.repo || !manifest.ref || !manifest.sha) throw new Error("Managed git install metadata is incomplete.");
-    if (/^[0-9a-f]{7,40}$/i.test(manifest.ref)) { emit(options, { mode, source: "git", pinned: true, sha: manifest.sha }, `Git install is pinned at ${manifest.sha.slice(0, 12)}.`); return; }
-    const targetSha = await resolveGitHubRef(manifest.repo, manifest.ref, runCommand);
+    if (!options.gitSha && /^[0-9a-f]{7,40}$/i.test(manifest.ref)) { emit(options, { mode, source: "git", pinned: true, sha: manifest.sha }, `Git install is pinned at ${manifest.sha.slice(0, 12)}.`); return; }
+    const targetSha = options.gitSha ?? await resolveGitHubRef(manifest.repo, manifest.ref, runCommand);
+    if(options.gitSha)assertPinnedGitCache(manifest,targetSha,paths);
     if (targetSha === manifest.sha) { emit(options, { mode, source: "git", changed: false, sha: targetSha, ref: manifest.ref }, `${manifest.repo}@${manifest.ref} is already at ${targetSha.slice(0, 12)}.`); return; }
     if (options.check || options.dryRun) { emit(options, { mode, source: "git", changed: true, currentSha: manifest.sha, targetSha, ref: manifest.ref, dryRun: Boolean(options.dryRun) }, `Git update available: ${manifest.sha.slice(0, 12)} → ${targetSha.slice(0, 12)}.`); if (options.check) process.exitCode = 10; return; }
     if (options.yes !== true) {
@@ -195,6 +214,8 @@ export async function updateCommand(options: UpdateOptions, overrides: Partial<D
     if (options.backup !== false) await runPreUpdateBackup(options, overrides.backup ?? (() => dbBackupCommand({})), overrides.hasInstanceData);
     const installed = await withInstallStoreLock(async () => {
       assertManagedShimWritable(paths);
+      assertUnchangedPinnedGitSource(readInstallManifest(paths),manifest,options);
+      if(options.gitSha)assertPinnedGitCache(manifest,targetSha,paths);
       const payload = await installGitPayload(manifest.repo!, targetSha, runCommand, paths);
       writeManagedShim(paths);
       const record: InstallRecord = { source: "git", version: payload.version, channel: "pinned", repo: manifest.repo, ref: manifest.ref, sha: targetSha, payloadPath: payload.payloadPath, installedAt: (overrides.now?.() ?? new Date()).toISOString() };
@@ -204,15 +225,18 @@ export async function updateCommand(options: UpdateOptions, overrides: Partial<D
     }, paths);
     let restarted: boolean;
     try {
-      restarted = await (overrides.restartActiveService ?? restartActiveManagedService)(installed.version);
+      restarted = await restartSelectedService(installed.version,targetSha);
     } catch (error) {
+      if(options.rollbackOnFailure===false)throw new Error("Updated Git payload failed service validation; automatic code rollback is disabled. Matching database/files recovery may be required.",{cause:error});
       return rollbackAfterServiceValidationFailure(
         paths,
-        overrides.restartActiveService ?? restartActiveManagedService,
+        restartSelectedService,
         error,
         "Updated git payload",
+        options.gitSha?{candidateSha:targetSha,previous:manifest,candidatePath:installed.payloadPath}:undefined,
       );
     }
+    if(options.gitSha){const active=readInstallManifest(paths);if(active?.sha!==targetSha||active.repo!==manifest.repo||active.payloadPath!==installed.payloadPath)throw new Error("Exact Git source changed during service validation; target success was not proven.");}
     emit(options, { mode, source: "git", changed: true, currentSha: manifest.sha, targetSha, reused: installed.reused, restarted }, pc.yellow(`Updated unreleased git payload ${manifest.sha.slice(0, 12)} → ${targetSha.slice(0, 12)} from ${manifest.repo}@${manifest.ref}${restarted ? " and restarted the active service" : ""}.`));
     return;
   }
@@ -260,11 +284,11 @@ export async function updateCommand(options: UpdateOptions, overrides: Partial<D
   }, paths);
   let restarted: boolean;
   try {
-    restarted = await (overrides.restartActiveService ?? restartActiveManagedService)(targetVersion);
+    restarted = await restartSelectedService(targetVersion);
   } catch (error) {
     return rollbackAfterServiceValidationFailure(
       paths,
-      overrides.restartActiveService ?? restartActiveManagedService,
+      restartSelectedService,
       error,
       "Updated payload",
     );

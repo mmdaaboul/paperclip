@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { registerTaskDrainExpiryWork, readTaskDrain, startTaskDrain, stopTaskDrain } from "../services/task-admission.js";
+import { registerTaskDrainExpiryWork, readTaskDrain, startTaskDrain, stopTaskDrain, installPersistentTaskDrain, setControllerLeaseQuiesce } from "../services/task-admission.js";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { installDatabaseWorkSignals } from "../../../packages/db/src/work-signals.js";
 
@@ -22,6 +22,10 @@ describe("task drain deadline", () => {
     await worker.stop(); await coordinator.stop(); stopTaskDrain(); vi.useRealTimers();
   });
 
+  it("persistent hold preserves native TTL expiry and controller lease ownership without a timer loop",async()=>{
+    startTaskDrain({ttlMs:1000});const durable={startedAt:new Date(),expiresAt:null,ownerId:"maintenance:fixture"};const uninstall=installPersistentTaskDrain(()=>durable);setControllerLeaseQuiesce(true);
+    try{await vi.advanceTimersByTimeAsync(1000);expect(resume).toHaveBeenCalledTimes(1);expect(readTaskDrain(new Date())).toEqual(durable);await vi.advanceTimersByTimeAsync(100000);expect(resume).toHaveBeenCalledTimes(1);expect(vi.getTimerCount()).toBe(0);uninstall();expect(readTaskDrain(new Date())).toMatchObject({expiresAt:null});setControllerLeaseQuiesce(false);expect(readTaskDrain(new Date())).toBeNull();}finally{uninstall();setControllerLeaseQuiesce(false);}
+  });
   it("releases admission once at its deadline without a status read or periodic sweep", async () => {
     startTaskDrain({ ttlMs: 1000 });
     await vi.advanceTimersByTimeAsync(0);

@@ -31,5 +31,5 @@ export async function reviewerNativeTestDatabase(maxConnections: 1 | 2 = 2) {
     await db.$client.end({ timeout: 5 });
     if (--users === 0) await temporary.cleanup();
   }
-  return { db, query, end };
+  return { db, query, end, connectionString:temporary.connectionString };
 }

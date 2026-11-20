@@ -27,6 +27,10 @@ describe("resolveCommandContext", () => {
     process.env = { ...ORIGINAL_ENV };
   });
 
+  it("board-only mode ignores ambient/context agent identity and uses only selected-home origin-bound login",()=>{
+    const home=fs.mkdtempSync(path.join(os.tmpdir(),"paperclip-board-only-"));process.env.PAPERCLIP_HOME=home;process.env.PAPERCLIP_AUTH_STORE=path.join(home,"foreign-auth.json");process.env.PAPERCLIP_API_KEY="ambient-agent";process.env.PAPERCLIP_RUN_ID="foreign-run";process.env.PAPERCLIP_COMPANY_ID="foreign-company";process.env.PAPERCLIP_CONTEXT=path.join(home,"malformed-context.json");fs.writeFileSync(process.env.PAPERCLIP_CONTEXT,"not-json");setStoredBoardCredential({apiBase:"http://127.0.0.1:4310",token:"private-board",storePath:path.join(home,"auth.json")});
+    const resolved=resolveCommandContext({boardAuthOnly:true,apiBase:"http://127.0.0.1:4310"});expect(resolved.api.apiKey).toBe("private-board");expect(resolved.companyId).toBeUndefined();expect(resolved.authSource).toBe("stored_board");expect(()=>resolveCommandContext({boardAuthOnly:true,apiBase:"http://127.0.0.1:4311"})).toThrow("Stored native board login");expect(()=>resolveCommandContext({boardAuthOnly:true,apiBase:"http://127.0.0.1:4310",apiKey:"agent"})).toThrow("forbid agent");fs.rmSync(home,{recursive:true,force:true});
+  });
   it("uses profile defaults when options/env are not provided", () => {
     const contextPath = createTempPath("context.json");
 
