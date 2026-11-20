@@ -27,7 +27,7 @@ import { notifyDecisionTargetWork, notifyDecisionTargetIssueRemoval } from "./de
 import { assertOnboardingFirstTaskCreationAllowed, assertOnboardingFirstTaskDependenciesAllowed } from "./onboarding-first-task-admission.js";
 import { readPersistedConfirmationDecision } from "./confirmation-decision.js";
 import { resolveConnectionIntentContinuationSource, resolveItemVerdictContinuationWake } from "./chat-interaction-continuation.js";
-import { assertReviewBudgetMutationTransaction, withInheritedReviewBudgetMutationTransaction } from "./review-cycle-budget-store.js";
+import { assertReviewBudgetMutationTransaction, readReviewBudgetPreviewContext, withInheritedReviewBudgetMutationTransaction } from "./review-cycle-budget-store.js";
 import { insertIssueComment } from "./issue-comment-writes.js";
 import { measureRunTransaction } from "./execution-transaction-timing.js";
 import { readNativeMonitorSource } from "./native-runtime/native-monitor-delivery.js";
@@ -11601,7 +11601,14 @@ export function issueService(db: Db) {
         }
         if (expectedStatusVersion !== undefined) {
           const policy = normalizeIssueExecutionPolicy(receiptExisting.executionPolicy ?? null);
+          // The outer budget callback already owns task/ledger locks and the
+          // genuine ledger. Reuse it for this second, status-only validation;
+          // the callback guard above still rejects unadapted native setters.
+          const budgetContext = policy?.totalReviewCycles === 5
+            ? await readReviewBudgetPreviewContext(tx, { companyId: receiptExisting.companyId, issueId: id })
+            : {};
           const transition = applyIssueExecutionPolicyTransition({
+            ...budgetContext,
             issue: receiptExisting,
             policy,
             previousPolicy: policy,

@@ -206,6 +206,50 @@ describe("actual normal PATCH + native postgres-js + native issue service (injec
     await import("../routes/issues.js");
   }, 120000);
   afterAll(async () => { await fixture?.end(); });
+  it("guarded total-five promotion retains its real locked ledger and rejects a stale repeat", async () => {
+    const f = await seed();
+    await db.update(issues).set({ status: "backlog" }).where(eq(issues.id, f.issue.id));
+    const before = await f.read();
+    const response = await request(f.board).patch(`/api/issues/${f.issue.id}`)
+      .send({ status: "todo", expectedStatusVersion: before.statusVersion });
+    expect(response.status, JSON.stringify(response.body)).toBe(200);
+    const saved = await f.read();
+    expect(saved.status).toBe("todo");
+    expect(saved.statusVersion).toBe(before.statusVersion + 1);
+    const { normalizeIssueExecutionPolicy } = await import("../services/issue-execution-policy.js");
+    expect(normalizeIssueExecutionPolicy(saved.executionPolicy)).toEqual(normalizeIssueExecutionPolicy(before.executionPolicy));
+    const ledger = await f.ledger();
+    expect(ledger).toMatchObject({ issueId: f.issue.id, initialAllowance: 5, admissions: [], allowances: [] });
+    expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, f.issue.id))).toHaveLength(0);
+    const stale = await request(f.board).patch(`/api/issues/${f.issue.id}`)
+      .send({ status: "todo", expectedStatusVersion: before.statusVersion });
+    expect(stale.status).toBe(409);
+    expect(await f.read()).toEqual(saved);
+    expect(await f.ledger()).toEqual(ledger);
+  });
+  it("guarded total-five concurrent promotions commit only one status change without spending a review", async () => {
+    const f = await seed();
+    await db.update(issues).set({ status: "backlog" }).where(eq(issues.id, f.issue.id));
+    const before = await f.read();
+    const promote = () => request(f.board).patch(`/api/issues/${f.issue.id}`)
+      .send({ status: "todo", expectedStatusVersion: before.statusVersion });
+    const responses = await Promise.all([promote(), promote()]);
+    expect(responses.map(response => response.status).sort()).toEqual([200, 409]);
+    expect((await f.read()).statusVersion).toBe(before.statusVersion + 1);
+    expect((await f.ledger()).admissions).toHaveLength(0);
+    expect(await db.select().from(issueExecutionDecisions).where(eq(issueExecutionDecisions.issueId, f.issue.id))).toHaveLength(0);
+  });
+  it("guarded total-five direct native setter still refuses an unadapted promotion", async () => {
+    const f = await seed();
+    await db.update(issues).set({ status: "backlog" }).where(eq(issues.id, f.issue.id));
+    const before = await f.read();
+    const { issueService } = await import("../services/issues.js");
+    await expect(issueService(db).update(f.issue.id, {
+      status: "todo", expectedStatusVersion: before.statusVersion, actorUserId: f.userId,
+    })).rejects.toThrow("locked task-wide review budget adapter");
+    expect(await f.read()).toEqual(before);
+    expect(await f.ledger()).toBeUndefined();
+  });
   it("scoped draft pins native document revision, workspace and one configured Reviewer; duplicates neither dispatch nor spend", async () => {
     const f=await draftFixture();
     const first=await request(f.app).post(`/api/issues/${f.issue.id}/scoped-reviews`).send(f.requestBody);
