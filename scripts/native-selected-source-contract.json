@@ -157,9 +157,9 @@
       "path": "ui/src/components/AgentConfigForm.render.test.tsx",
       "selection": "exact-full-names",
       "fullNames": [
-        "AgentConfigForm environment selector disabling recorded GitHub mode preserves the remaining saved configuration",
-        "AgentConfigForm environment selector optional policy cards are absent on create and Secrets",
-        "AgentConfigForm environment selector recorded GitHub mode defaults off and saves through the existing parent draft"
+        "AgentConfigForm environment selector > disabling recorded GitHub mode preserves the remaining saved configuration",
+        "AgentConfigForm environment selector > optional policy cards are absent on create and Secrets",
+        "AgentConfigForm environment selector > recorded GitHub mode defaults off and saves through the existing parent draft"
       ]
     },
     {
@@ -167,15 +167,15 @@
       "path": "server/src/services/native-runtime/native-session-executor.test.ts",
       "selection": "exact-full-names",
       "fullNames": [
-        "native Stop semantic revocation and terminal accounting does not make an intentional native self-interruption wait for its own API response",
-        "native Stop semantic revocation and terminal accounting drains exact native usage during cancel while semantic callbacks refuse",
-        "native non-Git tool authority retirement cancel fences and joins the actual epoch before successor ownership",
-        "native non-Git tool authority retirement close fences and joins the actual epoch before successor ownership",
-        "native non-Git tool authority retirement detach fences and joins the actual epoch before successor ownership",
-        "native non-Git tool authority retirement interrupt fences and joins the actual epoch before successor ownership",
-        "native terminal-turn accounting binds retained warm transport usage to the successor run authority",
-        "native warm session supervision warm session identity transitions keeps warm owners and attachment staging untouched during exact Stop cleanup (invalidated=false)",
-        "native warm session supervision warm session identity transitions keeps warm owners and attachment staging untouched during exact Stop cleanup (invalidated=true)"
+        "native Stop semantic revocation and terminal accounting > does not make an intentional native self-interruption wait for its own API response",
+        "native Stop semantic revocation and terminal accounting > drains exact native usage during cancel while semantic callbacks refuse",
+        "native non-Git tool authority retirement > cancel fences and joins the actual epoch before successor ownership",
+        "native non-Git tool authority retirement > close fences and joins the actual epoch before successor ownership",
+        "native non-Git tool authority retirement > detach fences and joins the actual epoch before successor ownership",
+        "native non-Git tool authority retirement > interrupt fences and joins the actual epoch before successor ownership",
+        "native terminal-turn accounting > binds retained warm transport usage to the successor run authority",
+        "native warm session supervision > warm session identity transitions > keeps warm owners and attachment staging untouched during exact Stop cleanup (invalidated=false)",
+        "native warm session supervision > warm session identity transitions > keeps warm owners and attachment staging untouched during exact Stop cleanup (invalidated=true)"
       ]
     },
     {

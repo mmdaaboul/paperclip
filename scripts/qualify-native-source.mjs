@@ -24,11 +24,20 @@ export function sourceEnvironment(ambient,home,tmp){
  const names=['PATH','USER','LOGNAME','LANG','LC_ALL','SHELL','RUSTUP_HOME'];const env=Object.fromEntries(names.filter(k=>ambient[k]!==undefined).map(k=>[k,ambient[k]]));
  return {...env,RUSTUP_HOME:ambient.RUSTUP_HOME??join(ambient.HOME??home,'.rustup'),HOME:home,TMPDIR:tmp,GITHUB_ACTIONS:'true',CI:'true',COREPACK_HOME:join(tmp,'corepack'),CARGO_HOME:join(tmp,'cargo'),CARGO_BUILD_JOBS:'2',PAPERCLIP_HOME:join(home,'.paperclip'),PAPERCLIP_TELEMETRY_DISABLED:'1',DO_NOT_TRACK:'1',PAPERCLIP_VITEST_RETRY:'0',NO_COLOR:'1'};
 }
+/** Vitest selects canonical runtime names with >; JSON fullName uses spaces. */
+export function vitestRuntimeName(assertion){
+ assert(Array.isArray(assertion?.ancestorTitles)&&assertion.ancestorTitles.every(x=>typeof x==='string'&&x.length>0)&&typeof assertion.title==='string'&&assertion.title.length>0,'native_assertion_name_fields_required');
+ const parts=[...assertion.ancestorTitles,assertion.title];assert.equal(assertion.fullName,parts.join(' '),'native_assertion_reporter_name_changed');return parts.join(' > ');
+}
+export function sourceQualificationFailureCheck(error){
+ const codes=['native_selected_report_failed','native_exact_file_report_required','native_selected_wrong_file','native_selected_empty','native_selected_names_missing_or_duplicate','native_selected_skip_or_failure','native_unselected_was_executed','native_assertion_name_fields_required','native_assertion_reporter_name_changed','native_source_total_deadline'];
+ return codes.find(code=>error?.message===code||error?.message?.startsWith(code+'\n'))??'native_source_check_unclassified';
+}
 export function inspectVitestReport(report,group,workspace){
  assert(report?.success===true&&report.numFailedTests===0&&report.numFailedTestSuites===0,'native_selected_report_failed');assert(Array.isArray(report.testResults)&&report.testResults.length===1,'native_exact_file_report_required');
  const r=report.testResults[0];assert.equal(resolve(workspace,r.name),resolve(workspace,group.path),'native_selected_wrong_file');assert.equal(r.status,'passed');assert(Array.isArray(r.assertionResults));
- const selected=group.selection==='whole-file'?r.assertionResults:r.assertionResults.filter(x=>group.fullNames.includes(x.fullName));
- assert(selected.length>0,'native_selected_empty');if(group.selection==='exact-full-names')assert.deepEqual(selected.map(x=>x.fullName).sort(),[...group.fullNames].sort(),'native_selected_names_missing_or_duplicate');
+ const selected=group.selection==='whole-file'?r.assertionResults:r.assertionResults.filter(x=>group.fullNames.includes(vitestRuntimeName(x)));
+ assert(selected.length>0,'native_selected_empty');if(group.selection==='exact-full-names')assert.deepEqual(selected.map(vitestRuntimeName).sort(),[...group.fullNames].sort(),'native_selected_names_missing_or_duplicate');
  assert(selected.every(x=>x.status==='passed'),'native_selected_skip_or_failure');const other=r.assertionResults.filter(x=>!selected.includes(x));assert(other.every(x=>['pending','skipped','todo','disabled'].includes(x.status)),'native_unselected_was_executed');
  return {selected:selected.length,passed:selected.length,failed:0,skipped:0,unselected:other.length};
 }
@@ -65,7 +74,7 @@ async function qualify(){
    evidence.groups.push({path:group.path,project:group.project,selection:group.selection,...(group.fullNames?{fullNames:group.fullNames}:{}),sourceSha256:hash(readFileSync(join(workspace,group.path))),reportSha256,...counts});save();
   }
   command('git',['diff','--exit-code','HEAD','--']);evidence.phase='source-qualified';evidence.status='passed';evidence.passed=evidence.groups.reduce((n,g)=>n+g.passed,0);evidence.failed=0;evidence.skipped=0;
- }catch(error){const capacity=nativeCapacityFailure(error);if(capacity)evidence.capacityRefusal=capacity;evidence.status='failed';evidence.failedPhase=evidence.phase;evidence.failureCode=error?.code==='ERR_ASSERTION'?'ERR_ASSERTION':'NATIVE_SOURCE_FAILED';process.exitCode=1;}
+ }catch(error){const capacity=nativeCapacityFailure(error);if(capacity)evidence.capacityRefusal=capacity;evidence.status='failed';evidence.failedPhase=evidence.phase;evidence.failureCode=error?.code==='ERR_ASSERTION'?'ERR_ASSERTION':'NATIVE_SOURCE_FAILED';evidence.failureCheck=sourceQualificationFailureCheck(error);process.exitCode=1;}
  finally{evidence.finishedAt=new Date().toISOString();save();console.log(JSON.stringify(evidence));}
 }
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url))await qualify();
