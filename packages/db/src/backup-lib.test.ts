@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { gunzipSync, gzipSync } from "node:zlib";
@@ -33,9 +34,16 @@ async function createTempDatabase(): Promise<string> {
 async function createSiblingDatabase(connectionString: string, databaseName: string): Promise<string> {
   const adminUrl = new URL(connectionString);
   adminUrl.pathname = "/postgres";
-  await ensurePostgresDatabase(adminUrl.toString(), databaseName);
+  // A shared test cluster must never reuse a sibling from an earlier run.
+  const ownedName = `${databaseName.slice(0, 20)}_${randomUUID().replaceAll("-", "")}`;
+  await ensurePostgresDatabase(adminUrl.toString(), ownedName);
+  cleanups.push(async () => {
+    const admin = postgres(adminUrl.toString(), { max: 1 });
+    try { await admin.unsafe(`DROP DATABASE "${ownedName}"`); }
+    finally { await admin.end(); }
+  });
   const targetUrl = new URL(connectionString);
-  targetUrl.pathname = `/${databaseName}`;
+  targetUrl.pathname = `/${ownedName}`;
   return targetUrl.toString();
 }
 
@@ -106,6 +114,29 @@ describeEmbeddedPostgres("runDatabaseBackup", () => {
       if (previous === undefined) delete process.env.PAPERCLIP_PG_DUMP_PATH;
       else process.env.PAPERCLIP_PG_DUMP_PATH = previous;
     }
+  }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
+
+  it("serializes native temporal COPY data with ISO DateStyle despite a non-ISO source default", async () => {
+    const source = await createTempDatabase();
+    const sourceSql = postgres(source, { max: 1, onnotice() {} });
+    try {
+      const sourceName = new URL(source).pathname.slice(1);
+      if (!/^[a-zA-Z0-9_]+$/.test(sourceName)) throw new Error("owned test database required");
+      await sourceSql.unsafe(`ALTER DATABASE "${sourceName}" SET DateStyle TO 'Postgres, DMY'`);
+      await sourceSql`SET DateStyle TO 'ISO, YMD'`;
+      await sourceSql.unsafe(`CREATE TABLE temporal_copy (id integer PRIMARY KEY, plain timestamp, zoned timestamptz, moments timestamp[]);
+        INSERT INTO temporal_copy VALUES (1,'2026-11-20 01:02:03.123456','2026-11-20 01:02:03.987654+00',ARRAY['2026-11-20 01:02:03.000001'::timestamp]);`);
+      const backup = await runDatabaseBackup({ connectionString: source, backupDir: createTempDir("temporal-copy-"), backupEngine: "auto",
+        excludeTables: ["not_a_real_table"], retention: { dailyDays: 1, weeklyWeeks: 1, monthlyMonths: 1 } });
+      const body = gunzipSync(fs.readFileSync(backup.backupFile)).toString();
+      const header = 'COPY "public"."temporal_copy" ("id", "plain", "zoned", "moments") FROM stdin;\n';
+      expect(body).toContain(header); const offset = body.indexOf(header) + header.length;
+      const copied = body.slice(offset, body.indexOf("\\.\n", offset));
+      const expected: Buffer[] = []; for await (const chunk of await sourceSql.unsafe('COPY temporal_copy TO STDOUT').readable()) expected.push(Buffer.from(chunk));
+      expect(copied).toBe(Buffer.concat(expected).toString()); expect(copied).toContain(".123456"); expect(copied).toContain(".000001");
+      // Restore of this COPY path requires native psql; the separate all-cell
+      // roundtrip covers the qualification's actual JavaScript INSERT engine.
+    } finally { await sourceSql.end(); }
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
 
   it("preserves identity generation, sequence options and progress in JavaScript backups", async () => {

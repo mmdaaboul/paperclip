@@ -5,7 +5,7 @@ import {join} from 'node:path';
 import {tmpdir} from 'node:os';
 import {createRequire} from 'node:module';
 import {pathToFileURL} from 'node:url';
-import {validateSameTreePair,installedNativeFacts,compareRestoredContent,installedDatabaseEntry,nativeCoreFailureCode} from './qualify-native-maintenance.mjs';
+import {validateSameTreePair,installedNativeFacts,compareRestoredContent,installedDatabaseEntry,nativeCoreFailureCode,nativeCoreFailureCheck} from './qualify-native-maintenance.mjs';
 const A='a'.repeat(40),B='b'.repeat(40),T='c'.repeat(40),pair={head:B,parent:A,headTree:T,parentTree:T,parents:[A]};
 test('native rehearsal binds two full SHAs, sole parent and one exact source tree',()=>{assert.deepEqual(validateSameTreePair(pair,B),{initialSha:A,candidateSha:B,sourceTree:T,relation:'sole-parent-same-tree',migration:'none'});for(const change of [{head:A},{parent:B},{headTree:A},{parents:[A,T]},{head:'main'}])assert.throws(()=>validateSameTreePair({...pair,...change},B));});
 function fixture(){const root=mkdtempSync(join(tmpdir(),'native-artifact-proof-')),server=join(root,'node_modules/@paperclipai/server'),acp=join(server,'node_modules/@agentclientprotocol/claude-agent-acp'),runner=join(server,'dist/vendor/paperclip-runner/bin/paperclip-runnerd');mkdirSync(join(acp,'dist'),{recursive:true});mkdirSync(join(root,'node_modules/paperclipai'),{recursive:true});writeFileSync(join(root,'node_modules/paperclipai/package.json'),JSON.stringify({version:'0.3.1'}));mkdirSync(join(server,'dist/vendor/paperclip-runner/bin'),{recursive:true});writeFileSync(join(server,'package.json'),JSON.stringify({name:'@paperclipai/server',type:'module'}));writeFileSync(join(server,'dist/build-info.json'),JSON.stringify({commit:A}));writeFileSync(join(acp,'package.json'),JSON.stringify({name:'@agentclientprotocol/claude-agent-acp',version:'0.73.0'}));writeFileSync(join(acp,'dist/acp-agent.js'),'synthetic patched package bytes');const sdk=join(acp,'node_modules/@anthropic-ai/claude-agent-sdk');mkdirSync(sdk,{recursive:true});writeFileSync(join(sdk,'package.json'),JSON.stringify({name:'@anthropic-ai/claude-agent-sdk',version:'0.3.286',exports:{'.':'./sdk.mjs'}}));writeFileSync(join(sdk,'sdk.mjs'),'synthetic SDK entry');const elf=Buffer.alloc(80);elf.set([127,69,76,70,2,1]);elf.writeUInt16LE(62,18);writeFileSync(runner,elf,{mode:0o700});return {root,server,acp,runner};}
@@ -19,4 +19,8 @@ test('actual published DB export refuses require conditions and imports its fixe
 });
 test('native import diagnostics retain known fixed codes and suppress arbitrary exception text',()=>{
  assert.equal(nativeCoreFailureCode({code:'ERR_PACKAGE_PATH_NOT_EXPORTED',message:'PRIVATE PATH'}),'ERR_PACKAGE_PATH_NOT_EXPORTED');assert.equal(nativeCoreFailureCode({code:'PRIVATE TOKEN',message:'PRIVATE TOKEN'}),'NATIVE_CORE_FAILED');
+});
+
+test('native backup assertion diagnostics retain fixed comparison codes without raw content',()=>{
+ assert.equal(nativeCoreFailureCheck(new Error('native_restore_content_changed\nPRIVATE ROWS')),'native_restore_content_changed');assert.equal(nativeCoreFailureCheck(new Error('PRIVATE KEY')),'native_core_check_unclassified');
 });

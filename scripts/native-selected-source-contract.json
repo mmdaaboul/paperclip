@@ -154,6 +154,11 @@
     },
     {
       "project": "root",
+      "path": "packages/db/src/backup-lib-temporal.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
       "path": "ui/src/components/AgentConfigForm.render.test.tsx",
       "selection": "exact-full-names",
       "fullNames": [

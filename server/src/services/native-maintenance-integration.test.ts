@@ -2,11 +2,11 @@ import { beforeAll, beforeEach, afterEach, afterAll, describe, expect, it } from
 import { randomBytes, randomUUID } from "node:crypto";
 import { readFileSync, mkdtempSync, realpathSync, chmodSync, rmSync } from "node:fs";
 import { join } from "node:path";
-import { createDb, ensurePostgresDatabase, applyPendingMigrations, type Db } from "@paperclipai/db";
+import { createDb, ensurePostgresDatabase, applyPendingMigrations, runDatabaseBackup, runDatabaseRestore, type Db } from "@paperclipai/db";
 import {reviewerNativeTestDatabase} from "../__tests__/helpers/reviewer-native-database.js";
 import { NativeMaintenanceHold, type MaintenanceHandle } from "./native-maintenance-hold.js";
 import { startNativeMaintenanceServer } from "./native-maintenance-server.js";
-import { captureNativePreservationBaseline, verifyNativePreservationCandidate, assertNativeMaintenanceWorkStopped } from "./native-preservation.js";
+import { captureNativePreservationBaseline, verifyNativePreservationCandidate, assertNativeMaintenanceWorkStopped, readNativePreservationContent } from "./native-preservation.js";
 const key=randomBytes(32),old="a".repeat(40),next="b".repeat(40),companies:string[]=[];
 let fixture:Awaited<ReturnType<typeof reviewerNativeTestDatabase>>;
 let db:Db,hold:NativeMaintenanceHold,handle:MaintenanceHandle,root:string,company:string,agent:string,run:string;
@@ -39,4 +39,19 @@ describe('actual native migrations/full schema and private maintenance capture c
   await db.$client.unsafe("UPDATE agent_reference_folder_configs SET revision=revision+1 WHERE company_id=$1 AND agent_id=$2",[company,agent]);await expect(verifyNativePreservationCandidate({db,hold,handle,key,commit:next,baseline})).rejects.toThrow('existing_content_changed');expect(hold.status()?.phase).toBe('recovery_required');expect(()=>hold.release(handle,baseline.digest)).toThrow('validation_required');
  },60000);
  it('persisted active run prevents baseline admission despite maintenance health',async()=>{await db.$client.unsafe("UPDATE heartbeat_runs SET status='running' WHERE id=$1",[run]);try{await expect(captureNativePreservationBaseline({db,hold,handle,key,commit:old})).rejects.toThrow('persisted_work_present');expect(hold.status()?.baselineDigest).toBeUndefined();}finally{await db.$client.unsafe("UPDATE heartbeat_runs SET status='succeeded' WHERE id=$1",[run]);}},60000);
+ it('restores every native/custom table cell, column and sequence through native JavaScript backup without losing microseconds',async()=>{
+  await db.$client.unsafe("UPDATE heartbeat_runs SET finished_at='2026-11-20 01:02:03.123456+00'::timestamptz WHERE id=$1",[run]);
+  expect((await db.$client.unsafe("SELECT mod(extract(microseconds FROM finished_at)::bigint,1000)=456 AS precise FROM heartbeat_runs WHERE id=$1",[run]))[0]?.precise).toBe(true);
+  const baseline=await captureNativePreservationBaseline({db,hold,handle,key,commit:old});
+  const backup=await runDatabaseBackup({connectionString:fixture.connectionString,backupDir:join(root,'owned-native-backup'),backupEngine:'javascript',retention:{dailyDays:1,weeklyWeeks:1,monthlyMonths:1}});
+  expect(backup.prunedCount).toBe(0);expect(backup.sizeBytes).toBeGreaterThan(0);
+  const name='pc_f10_native_restore_'+randomUUID().replaceAll('-','');expect((await db.$client.unsafe('SELECT 1 FROM pg_database WHERE datname=$1',[name])).length).toBe(0);
+  await db.$client.unsafe('CREATE DATABASE "'+name+'"');const url=new URL(fixture.connectionString);url.pathname='/'+name;let restored:Db|undefined;
+  try{
+   await runDatabaseRestore({connectionString:url.href,backupFile:backup.backupFile});restored=createDb(url.href,{maxConnections:1});const actual=await readNativePreservationContent(restored,key);
+   expect(actual.database).not.toBe(baseline.database);expect(actual.coverage).toBe('all_non_system_tables');expect(actual.tables).toEqual(baseline.tables);expect(actual.sequences).toEqual(baseline.sequences);
+   const unchanged=await readNativePreservationContent(db,key);expect(unchanged.tables).toEqual(baseline.tables);expect(unchanged.sequences).toEqual(baseline.sequences);
+  }finally{await restored?.$client.end({timeout:5});await db.$client.unsafe('DROP DATABASE "'+name+'"');}
+ },60000);
+
 });

@@ -591,6 +591,8 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     }
 
     await sql`SELECT 1`;
+    // Serialize backend temporal text independently of the source DB's DateStyle.
+    await sql`SET DateStyle TO 'ISO, YMD'`;
 
     const emit = (line: string) => writer.emit(line);
     const emitStatement = (statement: string) => {
@@ -608,6 +610,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
     emitStatement("SET LOCAL session_replication_role = replica;");
     emitStatement("SET LOCAL client_min_messages = warning;");
     emitStatement("SET LOCAL check_function_bodies = false;");
+    emitStatement("SET LOCAL DateStyle = 'ISO, YMD';");
     emit("");
 
     const allTables = await sql<TableDefinition[]>`
@@ -981,6 +984,7 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
         await writer.writeRaw("\n");
         const copySql = postgres(opts.connectionString, { max: 1, connect_timeout: connectTimeout });
         try {
+          await copySql`SET DateStyle TO 'ISO, YMD'`;
           const copyStream = await copySql
             .unsafe(`COPY ${qualifiedTableName} (${colNames}) TO STDOUT`)
             .readable();
@@ -998,7 +1002,14 @@ export async function runDatabaseBackup(opts: RunDatabaseBackupOptions): Promise
 
       const binaryArray = (column: (typeof cols)[number]) => column.data_type === "ARRAY"
         && column.udt_schema === "pg_catalog" && column.udt_name === "_bytea";
-      const projection = cols.some(binaryArray) ? cols.map(column => binaryArray(column)
+      // PostgreSQL text preserves timestamp microseconds, wall-clock values and
+      // temporal array bounds that the JavaScript Date decoder cannot retain.
+      const temporalText = (column: (typeof cols)[number]) =>
+        ["date", "timestamp without time zone", "timestamp with time zone"].includes(column.data_type)
+        || column.data_type === "ARRAY" && column.udt_schema === "pg_catalog"
+          && ["_date", "_timestamp", "_timestamptz"].includes(column.udt_name);
+      const losslessText = (column: (typeof cols)[number]) => binaryArray(column) || temporalText(column);
+      const projection = cols.some(losslessText) ? cols.map(column => losslessText(column)
         ? `${quoteIdentifier(column.column_name)}::text AS ${quoteIdentifier(column.column_name)}`
         : quoteIdentifier(column.column_name)).join(", ") : "*";
       const rowCursor = sql
