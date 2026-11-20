@@ -1,0 +1,223 @@
+{
+  "schema": "paperclip.native-selected-source-contract.v2",
+  "releaseFamily": "v2026.1117.0",
+  "groups": [
+    {
+      "project": "root",
+      "path": "ui/src/components/IssueExecutionDecision.test.tsx",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "ui/src/components/IssueScopedReviews.test.tsx",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "ui/src/components/AgentReferenceFoldersCard.test.tsx",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "ui/src/components/AgentReviewerPolicyCard.test.tsx",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "ui/src/api/agent-reference-folders.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/__tests__/human-execution-decision-route.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/__tests__/agent-optional-policy-routes.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/__tests__/total-review-budget.routes-database.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/__tests__/total-review-budget.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/__tests__/review-cycle-http.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/services/reviewer-workspace-admission.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/services/reviewer-native-boundaries.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/services/github-attributed-push.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/services/github-controller-policy.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/services/native-runtime/native-controller-github.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/services/native-runtime/native-controller-github-authority.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/services/native-runtime/native-controller-git-lifecycle.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/services/native-runtime/native-provider-failure.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/services/native-runtime/native-provider-overload.integration.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/__tests__/heartbeat-provider-limit-wait.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/services/native-runtime/reviewer-github-lifetime.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/services/native-maintenance-hold.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/services/native-maintenance-integration.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/services/native-maintenance-startup.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/services/native-preservation.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "cli/src/__tests__/common.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "cli/src/__tests__/selected-policy.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "cli/src/__tests__/update-git-pin.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "cli/src/__tests__/service-health-check.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "packages/adapter-utils/src/github-agent-attribution.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "ui/src/components/AgentConfigForm.render.test.tsx",
+      "selection": "exact-full-names",
+      "fullNames": [
+        "AgentConfigForm environment selector disabling recorded GitHub mode preserves the remaining saved configuration",
+        "AgentConfigForm environment selector optional policy cards are absent on create and Secrets",
+        "AgentConfigForm environment selector recorded GitHub mode defaults off and saves through the existing parent draft"
+      ]
+    },
+    {
+      "project": "root",
+      "path": "server/src/services/native-runtime/native-session-executor.test.ts",
+      "selection": "exact-full-names",
+      "fullNames": [
+        "native Stop semantic revocation and terminal accounting does not make an intentional native self-interruption wait for its own API response",
+        "native Stop semantic revocation and terminal accounting drains exact native usage during cancel while semantic callbacks refuse",
+        "native non-Git tool authority retirement cancel fences and joins the actual epoch before successor ownership",
+        "native non-Git tool authority retirement close fences and joins the actual epoch before successor ownership",
+        "native non-Git tool authority retirement detach fences and joins the actual epoch before successor ownership",
+        "native non-Git tool authority retirement interrupt fences and joins the actual epoch before successor ownership",
+        "native terminal-turn accounting binds retained warm transport usage to the successor run authority",
+        "native warm session supervision warm session identity transitions keeps warm owners and attachment staging untouched during exact Stop cleanup (invalidated=false)",
+        "native warm session supervision warm session identity transitions keeps warm owners and attachment staging untouched during exact Stop cleanup (invalidated=true)"
+      ]
+    },
+    {
+      "project": "runner",
+      "path": "packages/paperclip-runner/src/contracts/workspace-access.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "node-tap",
+      "path": "packages/paperclip-runner/test/claude-terminal-failure.test.mjs",
+      "selection": "whole-file",
+      "expectedPassed": 10
+    }
+  ],
+  "retries": 0,
+  "maximumWorkers": 1,
+  "unselectedCasesArePasses": false,
+  "optionalSdkKernelCampaign": false,
+  "liveProviderAcceptance": false,
+  "expectedClaudeVersion": "0.73.0",
+  "expectedSchema": {
+    "publicTables": 327,
+    "migrations": 451
+  },
+  "expectedWorkspacePackages": 17,
+  "expectedClaudeSdkVersion": "0.3.286",
+  "resources": {
+    "sourceBuild": {
+      "diskGiB": 12,
+      "memoryGiB": 4
+    },
+    "sourceTests": {
+      "diskGiB": 2,
+      "memoryGiB": 2
+    },
+    "nativeInstall": {
+      "diskGiB": 12,
+      "memoryGiB": 4
+    },
+    "nativeUpdate": {
+      "diskGiB": 8,
+      "memoryGiB": 4
+    }
+  }
+}

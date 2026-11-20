@@ -1,4 +1,4 @@
-name: Native installer qualification
+name: Native candidate qualification
 on:
   push:
     branches: [qualification/native-linux-build]
@@ -16,6 +16,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 2
           persist-credentials: false
       - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
         with:
@@ -37,10 +38,11 @@ jobs:
             echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus"
           } >> "$GITHUB_ENV"
       - name: Focused packaging and qualification contracts
-        run: node --test scripts/prepare-workspace-publish-assets.test.mjs scripts/qualify-native-install.test.mjs
+        run: node --test scripts/prepare-workspace-publish-assets.test.mjs scripts/qualify-native-install.test.mjs scripts/qualify-native-maintenance.test.mjs scripts/qualify-native-capacity.test.mjs
       - name: Complete official bootstrap install and authenticated service lifecycle
         env:
           NATIVE_INSTALL_GITHUB_TOKEN: ${{ github.token }}
+          NATIVE_REHEARSAL_MODE: same-tree-parent
         run: node scripts/qualify-native-install.mjs
       - name: Upload only structured nonsecret evidence
         if: always()
@@ -48,6 +50,38 @@ jobs:
         with:
           name: native-install-evidence
           path: ${{ runner.temp }}/f03-native-install/evidence.json
+          include-hidden-files: false
+          if-no-files-found: warn
+          retention-days: 14
+
+  selected_native_source:
+    if: github.repository == 'mmdaaboul/paperclip' && github.ref == 'refs/heads/qualification/native-linux-build'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_SHA: ${{ github.sha }}
+      WORKFLOW_SHA: ${{ github.workflow_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.21.0
+          package-manager-cache: false
+      - name: Focused native source producer contracts
+        run: node --test scripts/qualify-native-source.test.mjs scripts/qualify-native-capacity.test.mjs
+      - name: Frozen native workspace build and selected source qualification
+        env:
+          NATIVE_INSTALL_GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/qualify-native-source.mjs
+      - name: Upload only structured native source evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: native-source-evidence
+          path: ${{ runner.temp }}/f10-native-source/evidence.json
           include-hidden-files: false
           if-no-files-found: warn
           retention-days: 14

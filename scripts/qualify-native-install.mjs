@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 // Disposable hosted Linux qualification only. No production installation entry point.
 import assert from 'node:assert/strict';
+import {nativeCapacity,nativeCapacityFailure} from './qualify-native-capacity.mjs';
 import { spawnSync } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
@@ -9,6 +10,8 @@ import { dirname, join, resolve, sep } from 'node:path';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { getReleasePackages } from './release-package-map.mjs';
+import {validateSameTreePair,runNativeMaintenanceRehearsal} from './qualify-native-maintenance.mjs';
+const nativePolicy=JSON.parse(readFileSync(new URL('./native-selected-source-contract.json',import.meta.url),'utf8'));
 
 export const BOOTSTRAP = Object.freeze({
   version: '2026.1117.0',
@@ -101,7 +104,6 @@ export function installEnvironment(e, home, pc, tmp) {
     LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8', TMPDIR: tmp,
     PAPERCLIP_HOME: pc, PAPERCLIP_INSTANCE_ID: 'f03qualification',
     PAPERCLIP_TELEMETRY_DISABLED: '1', DO_NOT_TRACK: '1', PAPERCLIP_NO_BROWSER: '1',
-    PAPERCLIP_BUILD_COMMIT: e.SOURCE_SHA, PAPERCLIP_README_ASSET_REF: e.SOURCE_SHA,
     PAPERCLIP_TAILNET_BIND_HOST: '127.0.0.1', PORT: '4311', CARGO_BUILD_JOBS: '2',
     COREPACK_HOME: join(tmp, 'corepack'), CARGO_HOME: join(tmp, 'cargo'),
     RUSTUP_HOME: e.RUSTUP_HOME ?? join(home, '.rustup'),
@@ -114,11 +116,12 @@ export function installEnvironment(e, home, pc, tmp) {
 async function qualify() {
   validateTarget(process.env);
   assert(process.platform === 'linux' && process.arch === 'x64' && process.getuid() > 0, 'normal_linux_user_required');
-  const e = process.env, sha = e.SOURCE_SHA, workspace = realpathSync(process.cwd());
+  const e = process.env, workflowSha = e.SOURCE_SHA, workspace = realpathSync(process.cwd());
+  const rehearsal=e.NATIVE_REHEARSAL_MODE==='same-tree-parent';assert(!e.NATIVE_REHEARSAL_MODE||rehearsal,'native_rehearsal_mode');let sha=workflowSha,pair;
   const home = realpathSync(homedir()); assert.equal(realpathSync(e.HOME), home, 'real_runner_home_required');
   const root = join(realpathSync(e.RUNNER_TEMP), 'f03-native-install');
   assert(!existsSync(root), 'fresh_qualification_root_required'); mkdirSync(root, { mode: 0o700 });
-  const evidence = { schema: 'paperclip.native-install-qualification.v1', sourceRevision: sha,
+  const evidence = { schema: rehearsal?'paperclip.native-install-qualification.v2':'paperclip.native-install-qualification.v1', sourceRevision: workflowSha,
     bootstrapVersion: BOOTSTRAP.version, bootstrapIntegrity: BOOTSTRAP.integrity,
     status: 'running', phase: 'preflight', completed: [], retry: false };
   const save = () => writeFileSync(join(root, 'evidence.json'), JSON.stringify(evidence, null, 2) + '\n', { mode: 0o600 });
@@ -144,7 +147,7 @@ async function qualify() {
     }
     return r.stdout;
   }
-  const cli = (args, timeout) => command(shim, args, timeout);
+  const cli = (args, timeout, overrides={}) => command(shim, args, timeout,overrides);
   const systemctl = args => command('systemctl', ['--user', ...args], 30000);
   const base = 'http://127.0.0.1:4311';
   async function http(path, { method = 'GET', body, cookie } = {}) {
@@ -166,24 +169,27 @@ async function qualify() {
     throw new Error('native_health_deadline');
   }
   async function runtime(stage) {
-    const r = await check(stage + '-runtime-info', () => JSON.parse(readFileSync(join(pc, 'instances/f03qualification/runtime-info.json'), 'utf8')));
-    await check(stage + '-runtime-shape', () => {
+    const inspect=(suffix,fn)=>stage?check(stage+'-'+suffix,fn):fn();
+    const r = await inspect('runtime-info', () => JSON.parse(readFileSync(join(pc, 'instances/f03qualification/runtime-info.json'), 'utf8')));
+    await inspect('runtime-shape', () => {
       assert.equal(r.schemaVersion, 1); assert.equal(r.instanceId, 'f03qualification');
       assert.equal(r.host, '127.0.0.1'); assert.equal(r.port, 4311); assert(Number.isSafeInteger(r.pid) && r.pid > 0);
     });
-    const pid = await check(stage + '-runtime-supervisor-pid', () => {
+    const pid = await inspect('runtime-supervisor-pid', () => {
       const value = Number(systemctl(['show', unit, '--property=MainPID', '--value']).trim());
       assert.equal(value, r.pid, 'service_pid_must_serve'); return value;
     });
-    await check(stage + '-runtime-process', () => process.kill(pid, 0)); return r;
+    await inspect('runtime-process', () => process.kill(pid, 0)); return r;
   }
   async function absentListener() {
     let response; try { response = await http('/api/health'); } catch { return; }
     assert.fail('listener_remains_after_native_stop_' + response.status);
   }
   try {
+    evidence.capacity=[nativeCapacity(root,nativePolicy.resources.nativeInstall,'before-native-install')];save();
     assert(!existsSync(shim) && !existsSync(definition) && !existsSync(pc), 'preexisting_install_refused');
-    assert.equal(command('git', ['-C', workspace, 'rev-parse', 'HEAD']).trim(), sha);
+    assert.equal(command('git', ['-C', workspace, 'rev-parse', 'HEAD']).trim(), workflowSha);
+    if(rehearsal){const parents=command('git',['-C',workspace,'rev-list','--parents','-n','1','HEAD']).trim().split(' ');pair=validateSameTreePair({head:parents[0],parent:parents[1],parents:parents.slice(1),headTree:command('git',['-C',workspace,'rev-parse','HEAD^{tree}']).trim(),parentTree:command('git',['-C',workspace,'rev-parse','HEAD^1^{tree}']).trim()},workflowSha);sha=pair.initialSha;evidence.candidatePair=pair;save();}
     command('git', ['-C', workspace, 'diff', '--exit-code', 'HEAD', '--']);
     systemctl(['show-environment']); await absentListener();
     const occupied = spawnSync('ss', ['-H', '-ltn', 'sport = :54329'], { encoding: 'utf8', timeout: 5000 });
@@ -194,7 +200,7 @@ async function qualify() {
     const tar = join(root, 'official-bootstrap.tgz'); writeFileSync(tar, bytes, { flag: 'wx', mode: 0o600 }); done('official-bootstrap-integrity');
     phase('complete-native-git-install');
     // Verified official npm artifact; ONE real source install, no source archive override.
-    command('npx', ['--yes', '--package', tar, 'paperclipai', 'install', '--repo', e.GITHUB_REPOSITORY, '--ref', sha, '--yes'], 1740000, { GH_TOKEN: token });
+    command('npx', ['--yes', '--package', tar, 'paperclipai', 'install', '--repo', e.GITHUB_REPOSITORY, '--ref', sha, '--yes'], 1740000, { GH_TOKEN: token,PAPERCLIP_BUILD_COMMIT:sha,PAPERCLIP_README_ASSET_REF:sha });
     done('complete-native-git-install');
     phase('installed-payload-assets');
     const cliRoot = join(pc, 'cli'), payload = realpathSync(join(cliRoot, 'installs/git', sha.slice(0, 12)));
@@ -291,7 +297,7 @@ async function qualify() {
       migrations: (await sql`select hash, created_at from drizzle.__drizzle_migrations order by created_at`)
         .map(({ hash, created_at }) => ({ hash, created_at })),
     });
-    const baseline = await snapshot(); assert.equal(baseline.tables.length, 327); assert.equal(baseline.migrations.length, 451);
+    const baseline = await snapshot(); assert.equal(baseline.tables.length, nativePolicy.expectedSchema.publicTables); assert.equal(baseline.migrations.length, nativePolicy.expectedSchema.migrations);
     for (const table of ['agent_reference_folder_configs', 'agent_reviewer_policies', 'github_push_operation_receipts',
       'reviewer_github_operations', 'reviewer_github_events', 'issue_review_cycle_budgets', 'issue_scoped_reviews'])
       assert(baseline.tables.includes(table), 'custom_foundation_missing_' + table);
@@ -324,8 +330,14 @@ async function qualify() {
     await check('start-config-preservation', () => assert.deepEqual(readFileSync(configPath), configBytes));
     evidence.lifecycle = { correlatedPid: true, restartNewPid: true, stopNoListener: true, startNewPid: true,
       sameSource: true, sameSchema: true, sameConfig: true, ownerSessionPreserved: true };
-    done('native-service-stop-start'); evidence.status = 'passed';
-  } catch {
+    done('native-service-stop-start');
+    if(rehearsal){
+      await sql.end({timeout:5});sql=undefined;phase('native-core-two-candidate-rehearsal');evidence.nativeCore={status:'running',phase:'starting',completed:[],retry:false};save();
+      await runNativeMaintenanceRehearsal({pair,pc,root,env,cli,userId,save,proof:evidence.nativeCore,runBinary:command,runtimeProof:()=>runtime(),buildEnv:{GH_TOKEN:token},http:(path,options={})=>http(path,{...options,cookie:options.cookie===null?undefined:options.cookie??cookie})});
+    }
+    evidence.status = 'passed';
+  } catch (error) {
+    const capacity=nativeCapacityFailure(error);if(capacity)evidence.capacityRefusal=capacity;
     // No error message or raw stdout can leak a password, cookie, invite URL or token.
     evidence.status = 'failed'; evidence.failedPhase = evidence.phase;
     process.exitCode = 1;
