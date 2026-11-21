@@ -1,4 +1,7 @@
+import { executeIssuePostCommitActions, type IssuePostCommitAction } from "../issues.js";
+import { publishActivity, type ActivityPublication } from "../activity-log.js";
 import { notifyLiveRunRecovery } from "../live-run-recovery-notifications.js";
+import { mutateNativeOperationalIssue } from "../native-operational-issue-mutation.js";
 import { NATIVE_SESSION_RESUMPTION_ISSUE_STATUSES } from "./native-session-resumption-statuses.js";
 import { notifyExternalAgentSettlement } from "../../modules/external-agents/index.js";
 import { pendingNativeRunProjectionCondition } from "./native-run-projection.js";
@@ -49,7 +52,6 @@ import {
   dispatchPendingNativeStatusEffects,
 } from "./status-decision-committer.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
-import { issueService } from "../issues.js";
 import { emitAgentTaskRun } from "../agent-task-run-telemetry.js";
 import { isNewTerminalRunFailure, reportRunFailure } from "../run-failure-report.js";
 import { resumeNativeWorkspaceFinalization, recordNativeWorkspaceFinalizationFailure } from "./native-workspace-finalizer.js";
@@ -153,6 +155,8 @@ export async function claimNativeSessionResumptions(input: {
     let terminalRunToEmit: typeof heartbeatRuns.$inferSelect | null = null;
     let claimFailed = false;
     let claimedAttempt = 0;
+    const publications: ActivityPublication[] = [], postCommitActions: IssuePostCommitAction[] = [];
+    let projectionCommitted = false;
     const claimed = await input.db.transaction(async (tx) => {
       await tx.execute(sql`select set_config('statement_timeout', '10000', true), set_config('lock_timeout', '2000', true)`);
       const [issue] = await tx.select().from(issues).where(and(
@@ -277,11 +281,18 @@ export async function claimNativeSessionResumptions(input: {
         // unless that earlier write was an unreported pending retry.
         terminalRunToEmit =
           updatedRun && isNewTerminalRunFailure(row.run, updatedRun) ? updatedRun : null;
-        await issueService(tx as unknown as Db).update(
-          row.coordinator.issueId,
-          { status: "blocked" },
-          tx,
-        );
+        const projection = await mutateNativeOperationalIssue(tx, {
+          companyId: row.run.companyId,
+          issueId: row.coordinator.issueId,
+          expected: issue,
+          operation: { kind: "failure_block", runId: row.run.id, target: "blocked" },
+        }, publications, postCommitActions);
+        if (projection.kind === "deferred" || projection.kind === "projection_failed") {
+          await tx.update(nativeRunFinalizations).set({
+            failureDetail: sql`coalesce(${nativeRunFinalizations.failureDetail}, '{}'::jsonb) ||
+              ${JSON.stringify({ issueProjection: { kind: projection.kind, code: projection.code } })}::jsonb`,
+          }).where(eq(nativeRunFinalizations.runId, row.run.id));
+        }
         await issueRecoveryActionService(tx as unknown as Db).upsertSourceScoped({
           companyId: row.run.companyId,
           sourceIssueId: row.coordinator.issueId,
@@ -333,7 +344,7 @@ export async function claimNativeSessionResumptions(input: {
       }).where(eq(heartbeatRuns.id, row.run.id));
       await restoreNativeSessionExecution(tx as unknown as Db, { issue, run, agentName: agent.name, now });
       return true;
-    }).catch((error: unknown) => {
+    }).then(result => { projectionCommitted = true; return result; }).catch((error: unknown) => {
       claimFailed = true;
       input.onError?.(error);
       terminalRunToEmit = null;
@@ -341,6 +352,10 @@ export async function claimNativeSessionResumptions(input: {
         "failed to claim native session recovery candidate");
       return false;
     });
+    if (projectionCommitted) {
+      for (const publication of publications) publishActivity(publication);
+      await executeIssuePostCommitActions(input.db, postCommitActions);
+    }
     // Telemetry is best-effort background work; it must not delay claiming
     // the remaining candidates in this loop, so fire it and do not await it.
     if (terminalRunToEmit) {

@@ -193,6 +193,51 @@
       "path": "packages/paperclip-runner/test/claude-terminal-failure.test.mjs",
       "selection": "whole-file",
       "expectedPassed": 10
+    },
+    {
+      "project": "root",
+      "path": "server/src/__tests__/native-operational-issue-mutation.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/__tests__/native-operational-continuations.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/__tests__/native-operational-handoffs-stop.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/__tests__/native-operational-recovery-callers.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/__tests__/native-comment-continuations.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/services/native-runtime/native-total-review-bootstrap.integration.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/modules/wake-queue/adapters/postgres.test.ts",
+      "selection": "exact-full-names",
+      "fullNames": [
+        "wake-queue postgres adapter > scopes every release mutation to its own company and affects no row across a company boundary",
+        "wake-queue postgres adapter > refuses to reopen an issue for a company that does not own it, and leaves the issue untouched",
+        "wake-queue postgres adapter > reopens an issue for the company that owns it, and clears the execution state"
+      ]
+    },
+    {
+      "project": "root",
+      "path": "server/src/services/native-runtime/native-safe-replacement-review-budget.test.ts",
+      "selection": "whole-file"
     }
   ],
   "retries": 0,

@@ -4,7 +4,9 @@ import { isAiConnectionConfigurationFailure } from "./ai-auth-failure.js";
 import { and, eq, isNull, lte, asc, inArray, notInArray, desc, sql } from "drizzle-orm";
 import { connectionIntentDeliveries, issueThreadInteractions, issues, agentWakeupRequests, companyMemberships, heartbeatRuns, chatConversations, chatEndpoints, type Db } from "@paperclipai/db";
 import type { heartbeatService } from "./heartbeat.js";
-import { issueService } from "./issues.js";
+import { issueService, executeIssuePostCommitActions, type IssuePostCommitAction } from "./issues.js";
+import { normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
+import { mutateNativeOperationalIssue, nativeOperationalIssueSnapshot } from "./native-operational-issue-mutation.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { connectionDeliveryWaitingForResponse, connectionIntentWaitingForResponse } from "./idle-work-proof.js";
@@ -78,6 +80,7 @@ export function connectionIntentDeliveryService(db: Db, heartbeat: Pick<Heartbea
     interaction: typeof issueThreadInteractions.$inferSelect;
   }) {
     const publications: ActivityPublication[] = [];
+    const postCommitActions: IssuePostCommitAction[] = [];
     const restored = await db.transaction(async (tx) => {
       const [issue] = await tx.select().from(issues).where(and(
         eq(issues.id, loaded.issue.id), eq(issues.companyId, loaded.issue.companyId),
@@ -100,14 +103,22 @@ export function connectionIntentDeliveryService(db: Db, heartbeat: Pick<Heartbea
       const recovery = await recoveries.getActiveForIssue(issue.companyId, issue.id, tx);
       if (!recovery || recovery.cause !== "configuration_incomplete" || recovery.evidence.latestRunId !== latest.id) return null;
       const actorId = loaded.interaction.resolvedByUserId ?? loaded.interaction.addresseeUserId!;
-      const updated = await issueService(db).update(issue.id, {
+      let updated: typeof issues.$inferSelect | null;
+      if (normalizeIssueExecutionPolicy(issue.executionPolicy)?.totalReviewCycles === 5) {
+        const result = await mutateNativeOperationalIssue(tx, { companyId: issue.companyId, issueId: issue.id,
+          expected: nativeOperationalIssueSnapshot(issue), operation: { kind: "owned_resume", runId: latest.id,
+            receiptId: recovery.id, target: "in_progress" }, actor: { userId: actorId } }, publications, postCommitActions);
+        if (result.kind !== "applied" && result.kind !== "unchanged") return null;
+        updated = result.issue;
+      } else updated = await issueService(db).update(issue.id, {
         status: "in_progress", actorUserId: actorId, companyGuard: issue.companyId,
-      }, tx, publications);
+      }, tx, publications, postCommitActions);
       await recoveries.resolveActiveForIssue({ companyId: issue.companyId, sourceIssueId: issue.id,
         actionId: recovery.id, status: "resolved", outcome: "restored", resolutionNote: "AI connection restored by the responsible user." }, tx);
       return updated;
     });
     for (const publication of publications) publishActivity(publication);
+    await executeIssuePostCommitActions(db, postCommitActions);
     if (restored) await logActivity(db, { companyId: restored.companyId, actorType: "user",
       actorId: loaded.interaction.resolvedByUserId ?? loaded.interaction.addresseeUserId!,
       action: "issue.updated", entityType: "issue", entityId: restored.id,

@@ -74,7 +74,7 @@ import { canActorReadAssetContent } from "../asset-content-access.js";
 import { getSecretProvider } from "../../secrets/provider-registry.js";
 import { runnerApiSensitiveResponse } from "./runner-api-sensitive-response.js";
 import { workspaceFileResourceService } from "../workspace-file-resources.js";
-import { badRequest, forbidden, notFound, HttpError } from "../../errors.js";
+import { badRequest, conflict, forbidden, notFound, HttpError } from "../../errors.js";
 import { runnerApiCatalog, searchRunnerApi } from "./runner-api-catalog.js";
 import { executeRunnerApi, validateRunnerApiCall, RUNNER_API_MAX_BYTES, type RunnerApiCall, type RunnerApiFile, type RunnerApiIo } from "./runner-api-client.js";
 import { acquireRunnerApiResponseSlot, runnerApiCompanyCaptureMaxBytes, RUNNER_API_RESPONSE_MAX_BYTES, RUNNER_API_RESPONSE_RUN_MAX_BYTES, RunnerApiResponseLimitError } from "./runner-api-response-limits.js";
@@ -106,7 +106,8 @@ import { CAPABILITY_CANONICAL_OPERATIONS, CAPABILITY_SEMANTIC_TOOL_CATALOG, pars
 import { agentService } from "../agents.js";
 import { approvalService } from "../approvals.js";
 import { documentService } from "../documents.js";
-import { issueService } from "../issues.js";
+import { issueService, executeIssuePostCommitActions, type IssuePostCommitAction } from "../issues.js";
+import { mutateNativeOperationalIssue, nativeOperationalIssueSnapshot, type NativeOperationalTransaction } from "../native-operational-issue-mutation.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { readPersistedConfirmationDecision } from "../confirmation-decision.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext, type NativeReviewAssignmentContext } from "./native-review-participant.js";
@@ -2313,6 +2314,9 @@ export class PaperclipRunnerToolAuthority {
       if (["done", "cancelled", "in_review"].includes(target.status) || record(target.executionState).status === "pending") {
         throw new Error("paperclip_runner_reassignment_state_denied");
       }
+      if (normalizeIssueExecutionPolicy(target.executionPolicy)?.totalReviewCycles === 5 && !["todo", "in_progress"].includes(target.status)) {
+        throw conflict("Reassignment awaits its native workflow owner", { code: "native_operational_review_transition_required" });
+      }
       if (target.assigneeUserId !== expectedUser || target.assigneeAgentId !== expectedOwner || target.statusVersion !== expectedVersion) {
         throw new Error("paperclip_runner_reassignment_conflict: refresh search_tasks before deciding again");
       }
@@ -2325,6 +2329,12 @@ export class PaperclipRunnerToolAuthority {
       const target = await authorize(tx as unknown as Db, context.run);
       if (await priorReceipt(tx as unknown as Db)) return null;
       validate(target);
+      if (normalizeIssueExecutionPolicy(target.executionPolicy)?.totalReviewCycles === 5) {
+        if (record(target.executionState).totalReviewBudgetHold === true) throw conflict("Reassignment awaits its native workflow owner", { code: "native_operational_review_pending" });
+        const scoped = await tx.execute(sql`select id from issue_scoped_reviews where company_id=${this.binding.companyId}
+          and issue_id=${taskId} and state in ('draft','pending','cancelling') limit 1 for share`);
+        if (Array.from(scoped).length) throw conflict("Reassignment awaits its native workflow owner", { code: "native_operational_scope_pending" });
+      }
       return target;
     });
     // Cancellation and ownership commit cannot share locks. If the second
@@ -2346,6 +2356,12 @@ export class PaperclipRunnerToolAuthority {
           current.conversationAgentId || !["todo", "in_progress"].includes(current.status) ||
           record(current.executionState).status === "pending") return;
       if (current.executionRunId && current.executionRunId !== prepared.executionRunId) return;
+      if (normalizeIssueExecutionPolicy(current.executionPolicy)?.totalReviewCycles === 5) {
+        if (record(current.executionState).totalReviewBudgetHold === true) return;
+        const scoped = await this.db.execute(sql`select id from issue_scoped_reviews where company_id=${this.binding.companyId}
+          and issue_id=${taskId} and state in ('draft','pending','cancelling') limit 1`);
+        if (Array.from(scoped).length) return;
+      }
       try {
         await this.binding.enqueueWakeup(current.assigneeAgentId, {
           source: "assignment", triggerDetail: "system", reason: "issue_assigned",
@@ -2372,6 +2388,7 @@ export class PaperclipRunnerToolAuthority {
       }
     }
     let publication: Awaited<ReturnType<typeof persistActivity>>["publication"] | null = null;
+    const publications: Parameters<typeof publishActivity>[0][] = [], postCommitActions: IssuePostCommitAction[] = [];
     const result = await this.#withMutationReceipt("reassign_task", key, input, async (tx, context) => {
       if (context.issue.workMode !== "standard") throw new Error("paperclip_runner_tool_mode_denied");
       const target = await authorize(tx, context.run);
@@ -2386,11 +2403,25 @@ export class PaperclipRunnerToolAuthority {
         if (run && ["running", "queued", "scheduled_retry"].includes(run.status)) throw new Error("paperclip_runner_reassignment_stop_unconfirmed");
       }
       const changed = target.assigneeAgentId !== assigneeAgentId || target.assigneeUserId !== assigneeUserId;
-      const updated = changed ? await issueService(tx).update(taskId, {
-        companyGuard: this.binding.companyId, assigneeAgentId, assigneeUserId,
-        status: target.status === "in_progress" ? "todo" : target.status,
-        statusVersion: target.statusVersion + 1, actorAgentId: this.binding.agentId,
-      }, tx) : target;
+      let updated = target;
+      if (changed && normalizeIssueExecutionPolicy(target.executionPolicy)?.totalReviewCycles === 5) {
+        const mutation = await mutateNativeOperationalIssue(tx as unknown as NativeOperationalTransaction, {
+          companyId: this.binding.companyId, issueId: taskId, expected: nativeOperationalIssueSnapshot(target),
+          operation: { kind: "handoff", receiptId: fingerprint,
+            assignee: assigneeUserId ? { userId: assigneeUserId } : { agentId: assigneeAgentId! } },
+          actor: { agentId: this.binding.agentId },
+        }, publications, postCommitActions);
+        if (mutation.kind === "deferred" || mutation.kind === "projection_failed") throw conflict("Reassignment awaits its native workflow owner", { code: mutation.code });
+        updated = mutation.issue;
+      } else if (changed) {
+        const nativeUpdated = await issueService(tx).update(taskId, {
+          companyGuard: this.binding.companyId, assigneeAgentId, assigneeUserId,
+          status: target.status === "in_progress" ? "todo" : target.status,
+          statusVersion: target.statusVersion + 1, actorAgentId: this.binding.agentId,
+        }, tx, publications, postCommitActions);
+        if (!nativeUpdated) throw new Error("paperclip_runner_task_not_found");
+        updated = nativeUpdated;
+      }
       if (!updated) throw new Error("paperclip_runner_task_not_found");
       const receipt = {
         commandId: `reassign-task:${taskId}:${updated.statusVersion}`, disposition: changed ? "applied" : "duplicate",
@@ -2415,7 +2446,9 @@ export class PaperclipRunnerToolAuthority {
       stateRevision: number; scheduledWakeIds: string[];
     } | undefined;
     if (result === undefined) return undefined;
+    for (const queued of publications) publishActivity(queued);
     if (publication) publishActivity(publication);
+    await executeIssuePostCommitActions(this.db, postCommitActions);
     // Replay repairs a failed dispatch. The durable wake key and state/version guard
     // prevent duplicate successors and prevent waking a later, unrelated assignment.
     if (assigneeAgentId && result.scheduledWakeIds.length && this.binding.enqueueWakeup) {

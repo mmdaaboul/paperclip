@@ -9,7 +9,9 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { logger } from "../../middleware/logger.js";
-import { issueService } from "../issues.js";
+import { issueService, executeIssuePostCommitActions, type IssuePostCommitAction } from "../issues.js";
+import { normalizeIssueExecutionPolicy } from "../issue-execution-policy.js";
+import { mutateNativeOperationalIssue, nativeOperationalIssueSnapshot } from "../native-operational-issue-mutation.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
 import { enqueueTerminalIssueInteractionChatPublications } from "../chat-interaction-publications.js";
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
@@ -71,6 +73,7 @@ export async function dismissObsoleteNativePolicyReviews(db: Db, runIds?: string
 async function dismissCandidates(db: Db, candidates: Awaited<ReturnType<typeof findObsoletePolicyReviews>>) {
   for (const { interaction, decision, priorDecisionId } of candidates) {
     const publications: ActivityPublication[] = [];
+    const postCommitActions: IssuePostCommitAction[] = [];
     try {
       await db.transaction(async (tx) => {
         // Same lock order as status commits: coordinator, issue, interaction.
@@ -122,23 +125,44 @@ async function dismissCandidates(db: Db, candidates: Awaited<ReturnType<typeof f
           && ["backlog", "todo", "in_progress", "blocked"].includes(decision.fromStatus)
           && pendingInteraction.length === 0 && pendingApproval.length === 0
           && issue.executionState?.status !== "pending";
+        let restoredStatus = false;
+        let operationalDeferral: string | undefined;
         if (restoreStatus) {
           const priorDecision = priorDecisionId ? await tx.select().from(statusDecisions).where(and(
             eq(statusDecisions.id, priorDecisionId), eq(statusDecisions.companyId, issue.companyId),
             eq(statusDecisions.issueId, issue.id),
           )).then((rows) => rows[0]) : null;
-          await issueService(tx as unknown as Db).update(issue.id, {
-            status: decision.fromStatus,
-            // This is an administrative correction, not a replay of the old decision.
-            lastStatusDecisionId: null,
-            unblockDescriptor: priorDecision?.decisionJson.unblockDescriptor as typeof issue.unblockDescriptor ?? null,
-          }, tx, publications);
+          if (normalizeIssueExecutionPolicy(issue.executionPolicy)?.totalReviewCycles === 5) {
+            // The closed operational owner cannot authorize a fresh backlog or
+            // failure verdict from this obsolete review. Leave those statuses
+            // and decision metadata to the native workflow owner.
+            if (!["todo", "in_progress"].includes(decision.fromStatus)) {
+              operationalDeferral = "native_operational_review_transition_required";
+            } else {
+              const restored = await mutateNativeOperationalIssue(tx, { companyId: issue.companyId, issueId: issue.id,
+                expected: nativeOperationalIssueSnapshot(issue), operation: { kind: "owned_resume", runId: decision.runId,
+                  receiptId: decision.id, target: decision.fromStatus as "todo" | "in_progress" } }, publications, postCommitActions);
+              if (restored.kind === "applied" || restored.kind === "unchanged") {
+                await issueService(tx as unknown as Db).update(issue.id, { lastStatusDecisionId: null,
+                  unblockDescriptor: priorDecision?.decisionJson.unblockDescriptor as typeof issue.unblockDescriptor ?? null }, tx, publications, postCommitActions);
+                restoredStatus = true;
+              } else if (restored.kind === "deferred" || restored.kind === "projection_failed") operationalDeferral = restored.code;
+            }
+          } else {
+            await issueService(tx as unknown as Db).update(issue.id, {
+              status: decision.fromStatus,
+              // Administrative correction, never replay of the old decision.
+              lastStatusDecisionId: null,
+              unblockDescriptor: priorDecision?.decisionJson.unblockDescriptor as typeof issue.unblockDescriptor ?? null,
+            }, tx, publications, postCommitActions);
+            restoredStatus = true;
+          }
         }
         const { publication } = await persistActivity(tx as unknown as Db, {
           companyId: issue.companyId,
           actorType: "system",
           actorId: "native-policy-review-cleanup",
-          action: restoreStatus ? "issue.updated" : "issue.interaction_cancelled",
+          action: restoredStatus ? "issue.updated" : "issue.interaction_cancelled",
           entityType: "issue",
           entityId: issue.id,
           issueId: issue.id,
@@ -148,7 +172,8 @@ async function dismissCandidates(db: Db, candidates: Awaited<ReturnType<typeof f
             interactionId: interaction.id,
             decisionId: decision.id,
             fromStatus: issue.status,
-            toStatus: restoreStatus ? decision.fromStatus : issue.status,
+            toStatus: restoredStatus ? decision.fromStatus : issue.status,
+            ...(operationalDeferral ? { nativeOperationalRestore: operationalDeferral } : {}),
           },
         });
         publications.push(publication);
@@ -166,6 +191,7 @@ async function dismissCandidates(db: Db, candidates: Awaited<ReturnType<typeof f
           "Obsolete native policy review cleanup committed; live activity publication failed, history is preserved");
       }
     }
+    await executeIssuePostCommitActions(db, postCommitActions);
   }
 }
 

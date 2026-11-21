@@ -1,3 +1,5 @@
+import { executeIssuePostCommitActions, type IssuePostCommitAction } from "../issues.js";
+import { publishActivity, type ActivityPublication } from "../activity-log.js";
 import { notifyScheduledRetryDispatch } from "../run-dispatch-notifications.js";
 import { notifyNativeStatusReassessment } from "../native-status-reassessment-notifications.js";
 import { notifyUnsafeWorkspaceExportRecovery } from "../unsafe-workspace-export-notifications.js";
@@ -22,7 +24,7 @@ import {
 } from "@paperclipai/db";
 import { readRemoteWorkspaceAuthority, remoteWorkspaceRunReferenceSchema } from "@paperclipai/shared";
 import { decideNativeReplacement } from "./native-replacement-evidence.js";
-import { issueService } from "../issues.js";
+import { mutateNativeOperationalIssue } from "../native-operational-issue-mutation.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { buildExecutionContinuation } from "../execution-continuation.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
@@ -588,6 +590,7 @@ export async function reconcileSafeNativeReplacements(
         });
         continue;
       }
+      const publications: ActivityPublication[] = [], postCommitActions: IssuePostCommitAction[] = [];
       const created = await db.transaction(async (tx) => {
         await tx.execute(
           sql`select set_config('statement_timeout', '15000', true), set_config('lock_timeout', '1000', true)`,
@@ -629,6 +632,7 @@ export async function reconcileSafeNativeReplacements(
           )).for("update");
           historicalRun = currentRun;
         }
+        let ownedFailureReceiptId: string | null = null;
         if (task.status === "blocked") {
           const failureHolds = await tx.select().from(issueRecoveryActions).where(and(
             eq(issueRecoveryActions.companyId, run.companyId),
@@ -637,11 +641,12 @@ export async function reconcileSafeNativeReplacements(
             eq(issueRecoveryActions.cause, current.failureCode!),
             sql`${issueRecoveryActions.evidence}->>'runId' = ${run.id}`,
           )).for("update");
-          const ownsBlock = failureHolds.some(hold => {
+          const ownedFailure = failureHolds.find(hold => {
             const receipt = record(hold.evidence.nativeFailureBlock);
             return receipt.runId === run.id && receipt.statusVersion === task.statusVersion;
           });
-          if (!ownsBlock) return false;
+          if (!ownedFailure) return false;
+          ownedFailureReceiptId = ownedFailure.id;
         }
         const preservationHolds = historicalListener ? await tx.select().from(issueRecoveryActions).where(and(
           eq(issueRecoveryActions.companyId, run.companyId), eq(issueRecoveryActions.sourceIssueId, task.id),
@@ -666,7 +671,14 @@ export async function reconcileSafeNativeReplacements(
         if (task.status === "blocked") {
           // Restore only this failure's unchanged projection. The normal issue
           // service still enforces dependency readiness and assignee eligibility.
-          await issueService(tx as unknown as Db).update(task.id, { status: "in_progress" }, tx);
+          if (!ownedFailureReceiptId) return false;
+          const projection = await mutateNativeOperationalIssue(tx, {
+            companyId: run.companyId,
+            issueId: task.id,
+            expected: task,
+            operation: { kind: "owned_resume", target: "in_progress", runId: run.id, receiptId: ownedFailureReceiptId },
+          }, publications, postCommitActions);
+          if (projection.kind !== "applied" && projection.kind !== "unchanged") return false;
         }
         if (stoppedSession) {
           // If the last ownership proof changes, roll back the status restoration.
@@ -812,6 +824,8 @@ export async function reconcileSafeNativeReplacements(
           );
         return true;
       });
+      for (const publication of publications) publishActivity(publication);
+      await executeIssuePostCommitActions(db, postCommitActions);
       if (created) {
         options.failpoint?.("lineage_committed");
         scheduled += 1;

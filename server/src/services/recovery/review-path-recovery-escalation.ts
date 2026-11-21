@@ -97,6 +97,17 @@ export async function escalateExhaustedIssueReviewPathRecovery(
       maxAttempts: 1,
       lastAttemptAt: run.finishedAt ?? new Date(),
     });
+    if (issue.executionPolicy?.totalReviewCycles === 5) {
+      // A generic missing-path heuristic does not own a selected review stage.
+      // Retain the board incident without a false blocked notice or verdict.
+      await logActivity(tx as unknown as Db, {
+        companyId: run.companyId, actorType: "system", actorId: "heartbeat", agentId: run.agentId, runId: run.id,
+        action: "issue.review_path_recovery_projection_deferred", entityType: "issue", entityId: issueId,
+        details: { recoveryActionId: recoveryAction.id, consumedPathRef,
+          code: "total_review_path_projection_deferred", projectionApplied: false },
+      }, publications);
+      return recoveryAction;
+    }
     await issuesSvc.update(issueId, {
       status: "blocked", companyGuard: run.companyId,
     }, tx, publications, postCommitActions);

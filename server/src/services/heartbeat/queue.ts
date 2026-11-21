@@ -1,4 +1,5 @@
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
+import { mutateNativeOperationalIssue, nativeOperationalIssueSnapshot } from "../native-operational-issue-mutation.js";
 import { CONTEXT_COMPACTION_WAKE_REASON, ContextCompactionError, isContextCompactionRun, readContextCompactionRequest } from "../context-compaction.js";
 import { isProcessRunAdmissionClosed } from "./run-admission.js";
 import { deliveredQueuedCommentIds } from "../queued-comment-delivery.js";
@@ -3295,6 +3296,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               conversationState: issues.conversationState,
               status: issues.status,
               statusVersion: issues.statusVersion,
+              executionPolicy: issues.executionPolicy,
+              executionState: issues.executionState,
               projectId: issues.projectId,
               projectWorkspaceId: issues.projectWorkspaceId,
               executionWorkspaceId: issues.executionWorkspaceId,
@@ -3305,6 +3308,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               monitorNextCheckAt: issues.monitorNextCheckAt,
               monitorWakeRequestedAt: issues.monitorWakeRequestedAt,
               executionRunId: issues.executionRunId,
+              checkoutRunId: issues.checkoutRunId,
               executionAgentNameKey: issues.executionAgentNameKey,
               createdAt: issues.createdAt,
             })
@@ -4080,8 +4084,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 issue.identifier,
                 issue.id,
               );
+              const selectedTotal5 = parseObject(issue.executionPolicy).totalReviewCycles === 5;
               const blockedComment = [
-                `Paperclip blocked ${issueLabel} before dispatch because its workspace settings are not runnable.`,
+                selectedTotal5
+                  ? `Paperclip could not dispatch ${issueLabel} because its workspace settings are not runnable. Its task and review state are preserved.`
+                  : `Paperclip blocked ${issueLabel} before dispatch because its workspace settings are not runnable.`,
                 "",
                 `- Code: \`${WORKSPACE_WORKTREE_REQUIRES_PROJECT_CODE}\``,
                 `- Reason: ${WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE}`,
@@ -4093,11 +4100,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentTimers);
               if (issue.status !== "blocked") await notifyChatResponseAvailability(tx, { companyId: issue.companyId, issueId: issue.id });
               await notifyRoutineExecutionStatus(tx, issue.id, issue.companyId);
-              if (issue.status === "done") {
+              if (!selectedTotal5 && issue.status === "done") {
                 const blocked = await issuesSvc.updateForCompany(issue.id, issue.companyId,
                   { status: "blocked", executionState: null }, tx, issueActivityPublications, issuePostCommitActions);
                 if (!blocked) throw conflict("The task changed before its workspace settings could be checked");
-              } else await tx
+              } else if (!selectedTotal5) await tx
                 .update(issues)
                 .set({
                   status: "blocked",
@@ -4152,6 +4159,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   reason: WORKSPACE_WORKTREE_REQUIRES_PROJECT_MESSAGE,
                   remediation: WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
                   requestedReason: reason,
+                  taskStatusPreserved: selectedTotal5,
                   source,
                   triggerDetail,
                   resolvedMode,
@@ -4487,8 +4495,23 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           }
 
           if (opts.queuedCommentInterruptId && issue.status === "done") {
-            const reopened = await issuesSvc.updateForCompany(issue.id, issue.companyId,
-              { status: "todo", executionState: null }, tx, issueActivityPublications, issuePostCommitActions);
+            const selectedTotal5 = parseObject(issue.executionPolicy).totalReviewCycles === 5;
+            if (selectedTotal5 && !explicitContinuation) throw conflict("The saved comment has no current native continuation admission", {
+              code: "native_comment_continuation_receipt_required",
+            });
+            const projection = selectedTotal5 ? await mutateNativeOperationalIssue(tx, {
+              companyId: issue.companyId, issueId: issue.id, expected: nativeOperationalIssueSnapshot(issue),
+              operation: { kind: "continuation", receiptId: opts.queuedCommentInterruptId },
+              actor: { userId: opts.requestedByActorId },
+            }, issueActivityPublications, issuePostCommitActions) : null;
+            if (projection && !("issue" in projection)) {
+              // Roll back admission/hold retirement too; a rejected projection
+              // cannot consume the saved input or create a successor run.
+              throw conflict("The saved comment cannot reopen this review-controlled task", { code: projection.code });
+            }
+            const reopened = projection && "issue" in projection ? projection.issue
+              : await issuesSvc.updateForCompany(issue.id, issue.companyId,
+                { status: "todo", executionState: null }, tx, issueActivityPublications, issuePostCommitActions);
             if (!reopened) throw conflict("The task changed before its saved message could start");
             await logActivity(tx as unknown as Db, {
               companyId: issue.companyId, actorType: "user", actorId: opts.requestedByActorId!,

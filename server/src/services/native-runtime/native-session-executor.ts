@@ -284,12 +284,13 @@ import { describeOwnFailedAttachment, inspectRemoteWarmSessionRecovery, isSettle
 import { assertNativeWarmIngressRetirement, nativeWarmIngressAllocation, nativeWarmIngressIdentity, type NativeWarmIngressClaim, type NativeWarmIngressOwner } from "./native-warm-ingress-ownership.js";
 import { resolveNativeStagedAttachmentRecovery, type NativeStagedAttachmentRecovery } from "./native-staged-attachment-recovery.js";
 import { emitStartupReuse, environmentStartupReuse } from "@paperclipai/adapter-utils/startup-reuse";
-import { persistActivity, publishActivity } from "../activity-log.js";
+import { persistActivity, publishActivity, type ActivityPublication } from "../activity-log.js";
+import { executeIssuePostCommitActions, type IssuePostCommitAction } from "../issues.js";
 import { commitNativeStatusDecision } from "./status-decision-committer.js";
 import { resolvePaperclipInstanceRoot } from "../../home-paths.js";
 import { documentService } from "../documents.js";
 import { issueThreadInteractionService } from "../issue-thread-interactions.js";
-import { issueService } from "../issues.js";
+import { mutateNativeOperationalIssue } from "../native-operational-issue-mutation.js";
 import {
   NATIVE_STATUS_ARBITER_POLICY_VERSION,
   type NativeAuthoritativeIssueStatus,
@@ -11771,6 +11772,20 @@ async function executePaperclipNativeSessionAttempt(
       // with a retry or release the still-live runner's lease.
       throw new NativeControllerDetachedForRestartError();
     }
+    // Record the already-redacted primary failure before task projection. A
+    // secondary projection/savepoint failure must not erase its original cause.
+    if (input.onLog) {
+      try {
+        await input.onLog("stderr", `${JSON.stringify({
+          type: "paperclip.native.execution_failure",
+          runId: input.execution.binding.runId,
+          message: redactIdentityText(error instanceof Error ? error.message : String(error)).slice(0, 2_000),
+          source: "before_issue_failure_projection",
+        })}\n`);
+      } catch {
+        logger.warn({ runId: input.execution.binding.runId }, "native primary failure diagnostic could not be recorded");
+      }
+    }
     const protocolIntegrityFailure =
       error instanceof NativeSessionProtocolIntegrityError ? error : null;
     const ownershipUnverified =
@@ -11976,6 +11991,8 @@ async function executePaperclipNativeSessionAttempt(
       // transitions the run into "failed". Read after the transaction
       // commits, so a rolled-back write never reports a false failure.
       let terminalRunToReport: typeof heartbeatRuns.$inferSelect | null = null;
+      const failurePublications: ActivityPublication[] = [];
+      const failurePostCommitActions: IssuePostCommitAction[] = [];
       await input.db.transaction(async (tx) => {
         await tx.execute(
           sql`select set_config('statement_timeout', '15000', true), set_config('lock_timeout', '1000', true)`,
@@ -12235,12 +12252,22 @@ async function executePaperclipNativeSessionAttempt(
             failureTask.checkoutRunId === input.execution.binding.runId);
         let failureBlockStatusVersion: number | undefined;
         if (stillOwnsTask && recoveryProjection.issueStatus) {
-          const projected = await issueService(tx as unknown as Db).update(
-            input.execution.binding.issueId,
-            { status: recoveryProjection.issueStatus },
-            tx,
-          );
-          if (projected?.status === "blocked") failureBlockStatusVersion = projected.statusVersion;
+          const projection = await mutateNativeOperationalIssue(tx, {
+            companyId: input.execution.binding.companyId,
+            issueId: input.execution.binding.issueId,
+            expected: failureTask,
+            operation: { kind: "failure_block", runId: input.execution.binding.runId, target: recoveryProjection.issueStatus },
+          }, failurePublications, failurePostCommitActions);
+          if (projection.kind === "applied" || projection.kind === "unchanged") {
+            if (projection.issue.status === "blocked") failureBlockStatusVersion = projection.issue.statusVersion;
+          } else if (projection.kind === "deferred" || projection.kind === "projection_failed") {
+            // The primary native run/coordinator failure still commits. A live
+            // review keeps its own authority; no review verdict is synthesized.
+            await tx.update(nativeRunFinalizations).set({
+              failureDetail: sql`coalesce(${nativeRunFinalizations.failureDetail}, '{}'::jsonb) ||
+                ${JSON.stringify({ issueProjection: { kind: projection.kind, code: projection.code } })}::jsonb`,
+            }).where(eq(nativeRunFinalizations.runId, input.execution.binding.runId));
+          }
         }
         if (
           !ownershipUnverified &&
@@ -12362,6 +12389,14 @@ async function executePaperclipNativeSessionAttempt(
         }
         throw failure;
       });
+      // A best-effort postcommit observer must not replace the original native
+      // failure after its durable run/coordinator/issue transaction committed.
+      for (const publication of failurePublications) {
+        try { publishActivity(publication); }
+        catch { logger.warn({ runId: input.execution.binding.runId }, "native failure activity publication failed after commit"); }
+      }
+      try { await executeIssuePostCommitActions(input.db, failurePostCommitActions); }
+      catch { logger.warn({ runId: input.execution.binding.runId }, "native failure postcommit actions remain pending"); }
       // Pass the raw error only for closed settlement labels: its text bypasses
       // the identity redactor applied to the persisted message above.
       if (terminalRunToReport) void reportRunFailure(input.db, terminalRunToReport, { nativeCloseFailure: error });

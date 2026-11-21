@@ -24,11 +24,12 @@ import { executionStartedEventPredicate } from "./pre-dispatch-execution-evidenc
 import { readRunCancellation } from "./run-cancellation.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { issueRecoveryActionService } from "./issue-recovery-actions.js";
-import { parseIssueExecutionState } from "./issue-execution-policy.js";
+import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "./issue-execution-policy.js";
 import { executionFailureRetryCount } from "./execution-recovery-attempt.js";
-import { logActivity } from "./activity-log.js";
+import { logActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
 import { isSupersededConversationRun } from "./agent-conversations.js";
-import { issueService } from "./issues.js";
+import { issueService, executeIssuePostCommitActions, type IssuePostCommitAction } from "./issues.js";
+import { mutateNativeOperationalIssue, nativeOperationalIssueSnapshot } from "./native-operational-issue-mutation.js";
 import { isInterruptedNativePreparation, isInterruptedNativePreparationCandidate } from "./cancelled-native-startup.js";
 import { hasVerifiedWorkspaceRepair } from "./workspace-recovery-receipt.js";
 
@@ -337,7 +338,8 @@ export async function settleInterruptedNativeBootstrap(
   if (input.providerDispatchStarted) return null;
   const issueId = input.run.contextSnapshot?.issueId;
   if (typeof issueId !== "string") return null;
-  return db.transaction(async tx => {
+  const publications: ActivityPublication[] = [], postCommitActions: IssuePostCommitAction[] = [];
+  const result = await db.transaction(async tx => {
     const [task] = await tx.select().from(issues).where(and(eq(issues.id, issueId), eq(issues.companyId, input.run.companyId))).for("update");
     const [run] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id, input.run.id), eq(heartbeatRuns.companyId, input.run.companyId))).for("update");
     if (!task || !run || !isInterruptedNativePreparationCandidate(run) ||
@@ -370,7 +372,16 @@ export async function settleInterruptedNativeBootstrap(
       // Restore only the unchanged projection made by this exact incident.
       // The issue service still enforces dependency/assignee readiness. Human
       // reblocks, reassignment and conversation resets invalidate this receipt.
-      await issueService(tx as unknown as Db).update(task.id, { status: String(ownedBlock.previousStatus) }, tx);
+      if (normalizeIssueExecutionPolicy(task.executionPolicy)?.totalReviewCycles === 5) {
+        const restored = await mutateNativeOperationalIssue(tx, { companyId: task.companyId, issueId: task.id,
+          expected: nativeOperationalIssueSnapshot(task), operation: { kind: "owned_resume", runId: run.id,
+            receiptId: `legacy-execution:${run.id}`, target: String(ownedBlock.previousStatus) as "todo" | "in_progress" | "in_review" } }, publications, postCommitActions);
+        if (restored.kind !== "applied" && restored.kind !== "unchanged") {
+          if (holds.length) await tx.update(issueRecoveryActions).set({ evidence: sql`coalesce(${issueRecoveryActions.evidence}, '{}'::jsonb) || ${JSON.stringify({ nativeOperationalRestore: restored })}::jsonb` })
+            .where(inArray(issueRecoveryActions.id, holds.map(hold => hold.id)));
+          return null;
+        }
+      } else await issueService(tx as unknown as Db).update(task.id, { status: String(ownedBlock.previousStatus) }, tx, publications, postCommitActions);
     }
     const now = new Date();
     const [settled] = await tx.update(heartbeatRuns).set({ resultJson: { ...run.resultJson,
@@ -392,10 +403,13 @@ export async function settleInterruptedNativeBootstrap(
       action: "issue.recovery_action_resolved", entityType: "issue", entityId: task.id, agentId: run.agentId, runId: run.id,
       details: { reason: "native_bootstrap_stopped_before_provider", recoveryActionIds: resolved.map(r => r.id),
         ...(input.proof ? { ownerProof: input.proof } : {}) },
-    });
+    }, publications);
     input.onHoldsResolved?.(resolved.length);
     return settled;
   });
+  for (const publication of publications) publishActivity(publication);
+  await executeIssuePostCommitActions(db, postCommitActions);
+  return result;
 }
 
 /** The source stays discoverable until normal admission records a successor.
@@ -434,7 +448,8 @@ export async function settleCancelledLegacyPreparation(
   if (input.providerDispatchStarted || input.run.runtimeMode !== "legacy" || input.run.status !== "cancelled") return null;
   const issueId = input.run.issueId ?? input.run.contextSnapshot?.issueId;
   if (typeof issueId !== "string") return null;
-  return db.transaction(async tx => {
+  const publications: ActivityPublication[] = [], postCommitActions: IssuePostCommitAction[] = [];
+  const result = await db.transaction(async tx => {
     const [task] = await tx.select().from(issues)
       .where(and(eq(issues.id, issueId), eq(issues.companyId, input.run.companyId))).for("update");
     const [run] = await tx.select().from(heartbeatRuns)
@@ -460,9 +475,7 @@ export async function settleCancelledLegacyPreparation(
       ? !lease.releasedAt || lease.status === "pending_cleanup" || lease.cleanupStatus === "failed"
       : !hasRemoteTerminationReceipt(lease))) return null;
     const now = new Date();
-    const [settled] = await tx.update(heartbeatRuns).set({ resultJson: { ...run.resultJson,
-      executionRecovery: { kind: "bootstrap", providerWorkStarted: false, preparationSettledAt: now.toISOString() },
-    }, updatedAt: now }).where(eq(heartbeatRuns.id, run.id)).returning();
+
     // The automatic disposition may already have closed the incident with
     // replay blocked, and moved the task to blocked. Correct both verdicts.
     const holds = await tx.select().from(issueRecoveryActions).where(and(
@@ -482,8 +495,20 @@ export async function settleCancelledLegacyPreparation(
     if (task.status === "blocked" && ownedBlock && task.assigneeAgentId === run.agentId &&
         !isSupersededConversationRun(task, run) && !task.executionRunId && !task.checkoutRunId) {
       // Restore only the unchanged projection made by this exact incident.
-      await issueService(tx as unknown as Db).update(task.id, { status: String(ownedBlock.previousStatus) }, tx);
+      if (normalizeIssueExecutionPolicy(task.executionPolicy)?.totalReviewCycles === 5) {
+        const restored = await mutateNativeOperationalIssue(tx, { companyId: task.companyId, issueId: task.id,
+          expected: nativeOperationalIssueSnapshot(task), operation: { kind: "owned_resume", runId: run.id,
+            receiptId: `legacy-execution:${run.id}`, target: String(ownedBlock.previousStatus) as "todo" | "in_progress" | "in_review" } }, publications, postCommitActions);
+        if (restored.kind !== "applied" && restored.kind !== "unchanged") {
+          if (holds.length) await tx.update(issueRecoveryActions).set({ evidence: sql`coalesce(${issueRecoveryActions.evidence}, '{}'::jsonb) || ${JSON.stringify({ nativeOperationalRestore: restored })}::jsonb` })
+            .where(inArray(issueRecoveryActions.id, holds.map(hold => hold.id)));
+          return null;
+        }
+      } else await issueService(tx as unknown as Db).update(task.id, { status: String(ownedBlock.previousStatus) }, tx, publications, postCommitActions);
     }
+    const [settled] = await tx.update(heartbeatRuns).set({ resultJson: { ...run.resultJson,
+      executionRecovery: { kind: "bootstrap", providerWorkStarted: false, preparationSettledAt: now.toISOString() },
+    }, updatedAt: now }).where(eq(heartbeatRuns.id, run.id)).returning();
     const resolved = holds.length ? await tx.update(issueRecoveryActions).set({ status: "resolved", outcome: "false_positive",
       resolutionNote: "The run was stopped before its adapter started; there are no provider actions to reconcile.",
       resolvedAt: now, updatedAt: now,
@@ -496,10 +521,13 @@ export async function settleCancelledLegacyPreparation(
       await logActivity(tx as unknown as Db, { companyId: run.companyId, actorType: "system", actorId: "system",
         action: "issue.recovery_action_resolved", entityType: "issue", entityId: task.id, agentId: run.agentId, runId: run.id,
         details: { reason: "legacy_cancelled_before_adapter", recoveryActionIds: resolved.map(r => r.id) },
-      });
+      }, publications);
     }
     return settled;
   });
+  for (const publication of publications) publishActivity(publication);
+  await executeIssuePostCommitActions(db, postCommitActions);
+  return result;
 }
 
 /** Capture the required-file obligation before unrelated host writes. Keeps

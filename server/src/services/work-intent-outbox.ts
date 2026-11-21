@@ -6,6 +6,9 @@ import { deliveredQueuedCommentIds } from "./queued-comment-delivery.js";
 import { notifyIssueRecovery } from "./issue-recovery-notifications.js";
 import { notifyRunDispatch } from "./run-dispatch-notifications.js";
 import { persistActivity, publishActivity, type ActivityPublication } from "./activity-log.js";
+import { executeIssuePostCommitActions, type IssuePostCommitAction } from "./issues.js";
+import { normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
+import { mutateNativeOperationalIssue, nativeOperationalIssueSnapshot } from "./native-operational-issue-mutation.js";
 
 /**
  * Work-intent outbox (durable ownership plan, section E; invariant 4).
@@ -115,10 +118,9 @@ export async function saveUndeliveredUserComments(db: Db, input: {
   reopenAgentClosedDone?: boolean;
 }): Promise<string | null> {
   if (input.commentIds.length === 0) return null;
-  let publication: ActivityPublication | undefined;
+  const publications: ActivityPublication[] = [], postCommitActions: IssuePostCommitAction[] = [];
   const savedId = await db.transaction(async tx => {
-    const [issue] = await tx.select({ status: issues.status, assigneeAgentId: issues.assigneeAgentId,
-      conversationAgentId: issues.conversationAgentId }).from(issues)
+    const [issue] = await tx.select().from(issues)
       .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId))).for("update");
     // A reassigned or cancelled task ends the intent; a conversation keeps
     // its own inbound authorization path.
@@ -138,6 +140,22 @@ export async function saveUndeliveredUserComments(db: Db, input: {
     const remaining = input.commentIds.filter(id => live.some(row => row.id === id) && !delivered.has(id));
     if (remaining.length === 0) return null;
     const latest = remaining.at(-1)!;
+    if (issue.status === "done" && input.reopenAgentClosedDone) {
+      if (normalizeIssueExecutionPolicy(issue.executionPolicy)?.totalReviewCycles === 5) {
+        const reopened = await mutateNativeOperationalIssue(tx, { companyId: input.companyId, issueId: input.issueId,
+          expected: nativeOperationalIssueSnapshot(issue), operation: { kind: "continuation", receiptId: latest } }, publications, postCommitActions);
+        if (reopened.kind !== "applied" && reopened.kind !== "unchanged") return null;
+      } else {
+        const { issueService } = await import("./issues.js");
+        const updated = await issueService(tx as unknown as Db).updateForCompany(input.issueId, input.companyId,
+          { status: "todo", executionState: null }, tx, publications, postCommitActions);
+        if (!updated) throw new Error("undelivered_comment_task_changed");
+      }
+      publications.push((await persistActivity(tx as unknown as Db, { companyId: input.companyId, actorType: "system",
+        actorId: "ownership-reconciler", agentId: input.agentId, action: "issue.updated", entityType: "issue",
+        entityId: input.issueId,
+        details: { status: "todo", reopened: true, reopenedFrom: "done", source: "undelivered_comment_backstop" } })).publication);
+    }
     await notifyDeferredExecutionWork(tx, { companyId: input.companyId });
     await notifyDeferredWakesForIssue(tx, { companyId: input.companyId, issueId: input.issueId });
     const [saved] = await tx.insert(agentWakeupRequests).values({
@@ -150,18 +168,9 @@ export async function saveUndeliveredUserComments(db: Db, input: {
         [DEFERRED_WAKE_CONTEXT_KEY]: { issueId: input.issueId, taskId: input.issueId, wakeReason: "issue_commented",
           source: "issue.comment", wakeCommentIds: remaining, wakeCommentId: latest } }, remaining),
     }).returning({ id: agentWakeupRequests.id });
-    if (saved && issue.status === "done" && input.reopenAgentClosedDone) {
-      const { issueService } = await import("./issues.js");
-      const updated = await issueService(tx as unknown as Db).updateForCompany(input.issueId, input.companyId,
-        { status: "todo", executionState: null }, tx);
-      if (!updated) throw new Error("undelivered_comment_task_changed");
-      publication = (await persistActivity(tx as unknown as Db, { companyId: input.companyId, actorType: "system",
-        actorId: "ownership-reconciler", agentId: input.agentId, action: "issue.updated", entityType: "issue",
-        entityId: input.issueId,
-        details: { status: "todo", reopened: true, reopenedFrom: "done", source: "undelivered_comment_backstop" } })).publication;
-    }
     return saved?.id ?? null;
   });
-  if (publication) publishActivity(publication);
+  for (const publication of publications) publishActivity(publication);
+  await executeIssuePostCommitActions(db, postCommitActions);
   return savedId;
 }

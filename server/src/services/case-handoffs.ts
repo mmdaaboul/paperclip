@@ -13,7 +13,9 @@ import { authorizationService, type AuthorizationActor } from "./authorization.j
 import { assertActorCanReadCase, assertCaseTrustedForExecution, canActorReceiveCase, retainCaseAccessSource } from "./case-access.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import { instanceSettingsService } from "./instance-settings.js";
-import { issueService } from "./issues.js";
+import { issueService, executeIssuePostCommitActions, type IssuePostCommitAction } from "./issues.js";
+import { normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
+import { mutateNativeOperationalIssue, nativeOperationalIssueSnapshot, type NativeOperationalTransaction } from "./native-operational-issue-mutation.js";
 import { documentService } from "./documents.js";
 import { applyCaseWorkflow, captureCaseWorkflow } from "./case-workflows.js";
 import type { CurrentCloudOwnerAuthority } from "./cloud-tenant-authority.js";
@@ -239,7 +241,7 @@ export function caseHandoffService(db: Db) {
     return row;
   }
 
-  async function apply(tx: Db, row: CaseHandoffRow, caseRow: CaseRow, issue: IssueRow, publications: ActivityPublication[], originalActor?: AuthorizationActor, cloudAuthority?: CurrentCloudOwnerAuthority | null) {
+  async function apply(tx: Db, row: CaseHandoffRow, caseRow: CaseRow, issue: IssueRow, publications: ActivityPublication[], postCommitActions: IssuePostCommitAction[], originalActor?: AuthorizationActor, cloudAuthority?: CurrentCloudOwnerAuthority | null) {
     if (row.destinationKind !== "agent" || !row.toAgentId) throw conflict("Only agent handoffs can transfer a task");
     if (caseRow.workIssueId !== issue.id || caseRow.handoffVersion !== row.version || issue.statusVersion !== row.expectedIssueStatusVersion || issue.responsibleUserId !== row.responsibleUserId ||
         issue.assigneeAgentId !== row.fromAgentId || issue.assigneeUserId) throw conflict("Handoff was superseded by a newer task decision");
@@ -263,10 +265,22 @@ export function caseHandoffService(db: Db) {
     if (issue.executionRunId && issue.executionRunId !== row.sourceRunId) throw conflict("A newer execution owns this task");
     if (issue.checkoutRunId && issue.checkoutRunId !== row.sourceRunId) throw conflict("A newer checkout owns this task");
     const workflowTransition = await applyCaseWorkflow(tx, row, publications);
-    const updated = await issueService(tx).update(issue.id, { assigneeAgentId: row.toAgentId, assigneeUserId: null,
+    let updated: IssueRow | null;
+    if (normalizeIssueExecutionPolicy(issue.executionPolicy)?.totalReviewCycles === 5) {
+      const mutation = await mutateNativeOperationalIssue(tx as unknown as NativeOperationalTransaction, {
+        companyId: row.companyId, issueId: issue.id, expected: nativeOperationalIssueSnapshot(issue),
+        operation: { kind: "handoff", receiptId: row.id, caseHandoffId: row.id, assignee: { agentId: row.toAgentId } },
+        actor: { agentId: row.actorType === "agent" ? row.actorId : null, userId: row.actorType === "user" ? row.actorId : null },
+      }, publications, postCommitActions);
+      if (mutation.kind === "deferred" || mutation.kind === "projection_failed") throw conflict("Case handoff awaits its native workflow owner", { code: mutation.code });
+      // Ownership/status came from the locked budget owner. Preserve native
+      // release of this same admitted handoff's execution pointers separately.
+      updated = await issueService(tx).update(issue.id, { executionRunId: null, checkoutRunId: null,
+        executionAgentNameKey: null, companyGuard: row.companyId, caseHandoffId: row.id }, tx, publications, postCommitActions);
+    } else updated = await issueService(tx).update(issue.id, { assigneeAgentId: row.toAgentId, assigneeUserId: null,
       status: "todo", executionRunId: null, checkoutRunId: null, executionAgentNameKey: null,
       companyGuard: row.companyId, caseHandoffId: row.id, actorAgentId: row.actorType === "agent" ? row.actorId : null,
-      actorUserId: row.actorType === "user" ? row.actorId : null }, tx, publications, []);
+      actorUserId: row.actorType === "user" ? row.actorId : null }, tx, publications, postCommitActions);
     if (!updated) throw notFound("Task not found");
     publications.push((await persistActivity(tx, { companyId: row.companyId, actorType: row.actorType, actorId: row.actorId,
       agentId: row.actorType === "agent" ? row.actorId : null, runId: row.sourceRunId, issueId: issue.id,
@@ -342,7 +356,7 @@ export function caseHandoffService(db: Db) {
       if (!companyAllowed(actor, companyId)) throw notFound("Company not found");
       const who = identity(actor), input = handoffCaseSchema.parse(rawInput);
       const fingerprint = createHash("sha256").update(canonical(input)).digest("hex");
-      const publications: ActivityPublication[] = [];
+      const publications: ActivityPublication[] = [], postCommitActions: IssuePostCommitAction[] = [];
       const outcome = await db.transaction(async transaction => {
         const tx = transaction as unknown as Db;
         if (input.to !== "done") await notifyDeliveryWork(tx, DELIVERY_QUEUES.caseHandoffs, companyId);
@@ -523,11 +537,12 @@ export function caseHandoffService(db: Db) {
         }).returning();
         let row = saved!;
         await event(tx, row, "handoff_requested", publications);
-        if (!sourceRunId) row = await apply(tx, row, caseRow!, issue, publications, actor);
+        if (!sourceRunId) row = await apply(tx, row, caseRow!, issue, publications, postCommitActions, actor);
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.caseHandoffs, row.id);
         return result(row, issue, actor, false);
       });
       publications.forEach(publishActivity);
+      await executeIssuePostCommitActions(db, postCommitActions);
       return outcome;
     },
 
@@ -605,7 +620,7 @@ export function caseHandoffService(db: Db) {
       await assertEnabled(db);
       const [authoritySnapshot] = await db.select().from(caseHandoffs).where(eq(caseHandoffs.id, handoffId));
       const cloudAuthority = authoritySnapshot?.state === "awaiting_release" ? await loadCaseHandoffCloudAuthority(authoritySnapshot) : null;
-      const publications: ActivityPublication[] = [];
+      const publications: ActivityPublication[] = [], postCommitActions: IssuePostCommitAction[] = [];
       const applied = await db.transaction(async transaction => {
         const tx = transaction as unknown as Db;
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.caseHandoffs, handoffId);
@@ -617,11 +632,11 @@ export function caseHandoffService(db: Db) {
         const [row] = await tx.select().from(caseHandoffs).where(eq(caseHandoffs.id, handoffId)).for("update");
         if (!row || row.state !== "awaiting_release") return row ?? null;
         if (!issue || !caseRow) throw notFound("Case work no longer exists");
-        const updated = await apply(tx, row, caseRow, issue, publications, undefined, cloudAuthority);
+        const updated = await apply(tx, row, caseRow, issue, publications, postCommitActions, undefined, cloudAuthority);
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.caseHandoffs, row.id);
         return updated;
       });
-      publications.forEach(publishActivity); return applied;
+      publications.forEach(publishActivity); await executeIssuePostCommitActions(db, postCommitActions); return applied;
     },
     async authorizePendingDispatch(handoffId: string) {
       await assertEnabled(db);

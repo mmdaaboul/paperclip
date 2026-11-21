@@ -1,3 +1,4 @@
+import { publishActivity, type ActivityPublication } from "../activity-log.js";
 import { notifyNativeEnvironmentSettlement } from "../native-environment-settlement-notifications.js";
 import { isContextCompactionRun } from "../context-compaction.js";
 import { notifyExternalAgentSettlement } from "../../modules/external-agents/index.js";
@@ -71,7 +72,8 @@ import {
 } from "./status-decision-committer.js";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import { preservedResultHasStop, readPreservedNativeResultFinalization } from "./preserved-native-result-finalization.js";
-import { issueService } from "../issues.js";
+import { issueService, executeIssuePostCommitActions, type IssuePostCommitAction } from "../issues.js";
+import { mutateNativeOperationalIssue } from "../native-operational-issue-mutation.js";
 import { publishChatPublicationCommitSignal } from "../chat-publication-reconciliation.js";
 import { nativeSha256 } from "./canonical.js";
 import { beginRunPhase, measureRunPhase, withRunResponsePresentationTiming } from "../execution-preparation-timing.js";
@@ -328,6 +330,7 @@ async function recordRetryableFailure(input: {
         ? ("cancelled" as const)
         : ("failed" as const);
   let terminalRunToEmit: typeof heartbeatRuns.$inferSelect | null = null;
+  const publications: ActivityPublication[] = [], postCommitActions: IssuePostCommitAction[] = [];
   const outcome = await input.db.transaction(async (tx) => {
     // Admission snapshots cannot authorize a failure write after a different
     // owner committed success. Match status-committer lock ordering.
@@ -365,6 +368,7 @@ async function recordRetryableFailure(input: {
     const issue = await tx
       .select({
         lastStatusDecisionId: issues.lastStatusDecisionId,
+        executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId,
         status: issues.status, statusVersion: issues.statusVersion,
         assigneeAgentId: issues.assigneeAgentId, assigneeUserId: issues.assigneeUserId,
       })
@@ -547,16 +551,19 @@ async function recordRetryableFailure(input: {
         tx,
       );
     } else if (exhausted) {
-      const blocked = await issueService(tx as unknown as Db).update(
-        input.coordinator.issueId,
-        {
-          status:
-            input.failureScope === "workspace"
-              ? "blocked"
-              : "in_review",
-        },
-        tx,
-      );
+      const projection = issue ? await mutateNativeOperationalIssue(tx, {
+        companyId: input.run.companyId,
+        issueId: input.coordinator.issueId,
+        expected: issue,
+        operation: { kind: "failure_block", runId: input.run.id, target: input.failureScope === "workspace" ? "blocked" : "in_review" },
+      }, publications, postCommitActions) : null;
+      const blocked = projection?.kind === "applied" || projection?.kind === "unchanged" ? projection.issue : null;
+      if (projection?.kind === "deferred" || projection?.kind === "projection_failed") {
+        await tx.update(nativeRunFinalizations).set({
+          failureDetail: sql`coalesce(${nativeRunFinalizations.failureDetail}, '{}'::jsonb) ||
+            ${JSON.stringify({ issueProjection: { kind: projection.kind, code: projection.code } })}::jsonb`,
+        }).where(eq(nativeRunFinalizations.runId, input.run.id));
+      }
       if (input.failureScope === "workspace" && issue && blocked?.status === "blocked"
         && !["blocked", "done", "cancelled"].includes(issue.status)
         && issue.assigneeAgentId === input.run.agentId && !issue.assigneeUserId
@@ -618,6 +625,8 @@ async function recordRetryableFailure(input: {
       nextAttemptAt: supersededByNewerRun || exhausted ? null : nextAttemptAt,
     };
   });
+  for (const publication of publications) publishActivity(publication);
+  await executeIssuePostCommitActions(input.db, postCommitActions);
   if (terminalRunToEmit) {
     await emitAgentTaskRun(input.db, terminalRunToEmit);
     void reportRunFailure(input.db, terminalRunToEmit);

@@ -34,6 +34,9 @@ import {
 } from "@paperclipai/shared";
 import { conflict, notFound, unprocessable } from "../errors.js";
 import type { IssuePostCommitAction } from "./issues.js";
+import { publishActivity, type ActivityPublication } from "./activity-log.js";
+import { normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
+import { mutateNativeOperationalIssue, nativeOperationalIssueSnapshot } from "./native-operational-issue-mutation.js";
 import { notifyTerminalWorkspaceWork } from "./terminal-workspace-work.js";
 import { readRunCancellation } from "./run-cancellation.js";
 
@@ -931,12 +934,27 @@ export function issueTreeControlService(db: Db) {
     if (issueIds.length === 0) return { updatedIssueIds: [], updatedIssues: [] };
 
     const now = new Date();
-    const postCommitIssueActions: IssuePostCommitAction[] = [];
+    const postCommitIssueActions: IssuePostCommitAction[] = [], publications: ActivityPublication[] = [];
     const { executeIssuePostCommitActions, issueService } = await import("./issues.js");
     const svc = issueService(db);
     const updated = await db.transaction(async (tx) => {
+      // A preflight snapshot is not cancellation authority. Recheck the live
+      // hold and its exact retained members under this mutation's transaction.
+      const [currentHold] = await tx.select().from(issueTreeHolds).where(and(
+        eq(issueTreeHolds.companyId, companyId), eq(issueTreeHolds.id, holdId),
+      )).for("update");
+      if (!currentHold || currentHold.rootIssueId !== rootIssueId || currentHold.mode !== "cancel" || currentHold.status !== "active") {
+        throw conflict("Subtree cancellation hold changed", { code: "native_operational_cancel_hold_changed" });
+      }
+      const currentMembers = await tx.select().from(issueTreeHoldMembers).where(and(
+        eq(issueTreeHoldMembers.companyId, companyId), eq(issueTreeHoldMembers.holdId, holdId),
+        inArray(issueTreeHoldMembers.issueId, issueIds),
+      )).for("share");
+      if (issueIds.some(id => !currentMembers.some(member => member.issueId === id && !member.skipped))) {
+        throw conflict("Subtree cancellation membership changed", { code: "native_operational_cancel_hold_changed" });
+      }
       const eligibleIssues = await tx
-        .select({ id: issues.id })
+        .select()
         .from(issues)
         .where(
           and(
@@ -948,22 +966,30 @@ export function issueTreeControlService(db: Db) {
 
       const rows = [];
       for (const issue of eligibleIssues) {
+        if (normalizeIssueExecutionPolicy(issue.executionPolicy)?.totalReviewCycles === 5) {
+          const mutation = await mutateNativeOperationalIssue(tx, { companyId, issueId: issue.id,
+            expected: nativeOperationalIssueSnapshot(issue), operation: { kind: "owned_cancel", receiptId: currentHold.id },
+            actor: { agentId: currentHold.createdByAgentId, userId: currentHold.createdByUserId } }, publications, postCommitIssueActions);
+          if (mutation.kind === "deferred" || mutation.kind === "projection_failed") throw conflict("Subtree cancellation awaits its native workflow owner", { code: mutation.code });
+          rows.push(mutation.issue); continue;
+        }
         const updatedIssue = await svc.update(
           issue.id,
           {
             status: "cancelled",
             cancelledAt: now,
-            actorAgentId: hold.createdByAgentId,
-            actorUserId: hold.createdByUserId,
+            actorAgentId: currentHold.createdByAgentId,
+            actorUserId: currentHold.createdByUserId,
           },
           tx,
-          undefined,
+          publications,
           postCommitIssueActions,
         );
         if (updatedIssue) rows.push(updatedIssue);
       }
       return rows;
     });
+    for (const publication of publications) publishActivity(publication);
     await executeIssuePostCommitActions(db, postCommitIssueActions);
 
     return {
@@ -1028,6 +1054,8 @@ export function issueTreeControlService(db: Db) {
 
     const now = new Date();
     const releasedCancelHoldIds = activeCancelHolds.map((hold) => hold.id);
+    const publications: ActivityPublication[] = [], postCommitActions: IssuePostCommitAction[] = [];
+    const { issueService, executeIssuePostCommitActions } = await import("./issues.js");
     const updatedIssues = await db.transaction(async (tx) => {
       await notifyDeferredExecutionEligibility(tx, { companyId });
       await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
@@ -1035,7 +1063,28 @@ export function issueTreeControlService(db: Db) {
       const restored: TreeStatusUpdateResult["updatedIssues"] = [];
       for (const [status, issueIdsForStatus] of issueIdsByStatus) {
         if (issueIdsForStatus.length === 0) continue;
-        for (const issueId of issueIdsForStatus) {
+        const candidates = await tx.select().from(issues).where(and(eq(issues.companyId, companyId),
+          inArray(issues.id, issueIdsForStatus), eq(issues.status, "cancelled"))).for("update");
+        const ordinaryIds = candidates.filter(issue => normalizeIssueExecutionPolicy(issue.executionPolicy)?.totalReviewCycles !== 5).map(issue => issue.id);
+        for (const issue of candidates.filter(issue => normalizeIssueExecutionPolicy(issue.executionPolicy)?.totalReviewCycles === 5)) {
+          // The native cancel snapshot maps interrupted work back to todo.
+          // Other prior statuses need their review/failure workflow owner; a
+          // hold receipt does not authorize a synthetic run or review verdict.
+          if (status !== "todo") throw conflict("Subtree restore awaits its native workflow owner", { code: "native_operational_review_transition_required" });
+          const [ownedRestore] = await tx.select().from(issueTreeHolds).where(and(eq(issueTreeHolds.id, restoreHoldId),
+            eq(issueTreeHolds.companyId, companyId), eq(issueTreeHolds.status, "active"), eq(issueTreeHolds.mode, "restore"))).for("update");
+          const ownedCancels = await tx.select({ id: issueTreeHolds.id }).from(issueTreeHolds).where(and(eq(issueTreeHolds.companyId, companyId),
+            inArray(issueTreeHolds.id, releasedCancelHoldIds), eq(issueTreeHolds.status, "active"), eq(issueTreeHolds.mode, "cancel"))).for("update");
+          if (!ownedRestore || ownedCancels.length !== releasedCancelHoldIds.length) throw conflict("Subtree restore hold changed", { code: "native_operational_issue_changed" });
+          const mutation = await mutateNativeOperationalIssue(tx, { companyId, issueId: issue.id,
+            expected: nativeOperationalIssueSnapshot(issue), operation: { kind: "continuation", receiptId: restoreHoldId },
+            actor: { agentId: input.actor.agentId, userId: input.actor.userId } }, publications, postCommitActions);
+          if (mutation.kind === "deferred" || mutation.kind === "projection_failed") throw conflict("Subtree restore awaits its native workflow owner", { code: mutation.code });
+          const updated = await issueService(tx as unknown as Db).update(issue.id, { cancelledAt: null, completedAt: null,
+            checkoutRunId: null, executionRunId: null, executionAgentNameKey: null, executionLockedAt: null }, tx, publications, postCommitActions);
+          if (updated) restored.push({ id: updated.id, status: coerceIssueStatus(updated.status), assigneeAgentId: updated.assigneeAgentId });
+        }
+        for (const issueId of ordinaryIds) {
           await notifyRoutineExecutionStatus(tx, issueId, companyId);
           await notifyNativeStatusReassessment(tx, { companyId, issueId });
           await notifyTerminalWorkspaceWork(tx, `issue:${issueId}`);
@@ -1043,7 +1092,7 @@ export function issueTreeControlService(db: Db) {
           if (status === "blocked" || status === "in_review") await notifyUnsafeWorkspaceExportRecovery(tx, { companyId, issueId });
         }
         await notifyStatusCardIssueChange(tx, companyId);
-        const rows = await tx
+        const rows = ordinaryIds.length ? await tx
           .update(issues)
           .set({
             status,
@@ -1058,7 +1107,7 @@ export function issueTreeControlService(db: Db) {
           .where(
             and(
               eq(issues.companyId, companyId),
-              inArray(issues.id, issueIdsForStatus),
+              inArray(issues.id, ordinaryIds),
               eq(issues.status, "cancelled"),
             ),
           )
@@ -1066,7 +1115,7 @@ export function issueTreeControlService(db: Db) {
             id: issues.id,
             status: issues.status,
             assigneeAgentId: issues.assigneeAgentId,
-          });
+          }) : [];
         restored.push(...rows.map((issue) => ({
           id: issue.id,
           status: coerceIssueStatus(issue.status),
@@ -1115,6 +1164,8 @@ export function issueTreeControlService(db: Db) {
       return restored;
     });
 
+    for (const publication of publications) publishActivity(publication);
+    await executeIssuePostCommitActions(db, postCommitActions);
     return {
       updatedIssueIds: updatedIssues.map((issue) => issue.id),
       updatedIssues,

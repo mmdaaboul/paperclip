@@ -10,7 +10,8 @@ import { notifyUnsafeWorkspaceExportRecovery } from "../unsafe-workspace-export-
 import { notifyCancelledWorkspacePreservation } from "../cancelled-workspace-preservation-notifications.js";
 import { notifyInstructionCollection } from "../instruction-collection-notifications.js";
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
-import { boundRunIssueId } from "../run-task-binding.js";
+import { boundRunIssueId, boundRunIssueIdSql } from "../run-task-binding.js";
+import { mutateNativeOperationalIssue } from "../native-operational-issue-mutation.js";
 import { REMOTE_WORKSPACE_PREPARATION_TIMEOUT_CODE, REMOTE_WORKSPACE_RESTORE_FAILED_CODE } from "../remote-workspace-transport.js";
 import { REUSABLE_SANDBOX_RESUME_FAILED_CODE } from "../reusable-sandbox-resume-error.js";
 import { PLUGIN_WORKER_UNAVAILABLE_CODE } from "../plugin-worker-unavailable-error.js";
@@ -1726,18 +1727,27 @@ export function recoveryService(
       if (paths.hasActiveExecutionPath || paths.hasDurableWaitingPath)
         return false;
 
-      const updated = await issuesSvc.update(
-        current.id,
-        {
-          status: "blocked",
-          unblockDescriptor: { owner: "board", action: proof.action },
-        },
-        tx,
-        publications,
-        postCommitActions,
-      );
+      // The accepted result/contract/decision and unchanged source were proved
+      // above under this same task lock. The helper owns only the operational
+      // status projection; it never creates a review admission or verdict.
+      const transactionIssuesSvc = issueService(tx as unknown as Db);
+      const projection = await mutateNativeOperationalIssue(tx, {
+        companyId: current.companyId, issueId: current.id, expected: current,
+        operation: { kind: "failure_block", runId: source.id, target: "blocked" },
+      }, publications, postCommitActions);
+      if (projection.kind === "deferred" || projection.kind === "projection_failed") {
+        await logActivity(tx as unknown as Db, {
+          companyId: current.companyId, actorType: "system", actorId: "recovery",
+          action: "issue.native_blocked_wait_projection_deferred", entityType: "issue", entityId: current.id,
+          details: { sourceRunId: source.id, nativeResultId: proof.resultId, code: projection.code, projectionApplied: false },
+        }, publications);
+        return false;
+      }
+      const updated = await transactionIssuesSvc.update(current.id, {
+        unblockDescriptor: { owner: "board", action: proof.action }, companyGuard: current.companyId,
+      }, tx, publications, postCommitActions);
       if (!updated) return false;
-      await issuesSvc.addComment(
+      await transactionIssuesSvc.addComment(
         current.id,
         `The native run reported a blocker. The original request and assignee are preserved; no automatic continuation was started.\n\nUnblock request: ${proof.action}`,
         {},
@@ -1771,10 +1781,10 @@ export function recoveryService(
       );
       return true;
     });
-    if (repaired) {
-      for (const publication of publications) publishActivity(publication);
-      await executeIssuePostCommitActions(db, postCommitActions);
-    }
+    // Even a refused projection may have committed its diagnostic. Never
+    // publish inside the outer transaction, or discard committed effect queues.
+    for (const publication of publications) publishActivity(publication);
+    await executeIssuePostCommitActions(db, postCommitActions);
     return repaired;
   }
 
@@ -2181,6 +2191,7 @@ export function recoveryService(
         identifier: issues.identifier,
         status: issues.status,
         createdByAgentId: issues.createdByAgentId,
+        executionPolicy: issues.executionPolicy,
       })
       .from(issueRelations)
       .innerJoin(issues, eq(issueRelations.issueId, issues.id))
@@ -2227,6 +2238,12 @@ export function recoveryService(
         continue;
       }
 
+      if (parseObject(candidate.executionPolicy).totalReviewCycles === 5) {
+        logger.warn({ issueId: candidate.id, code: "total_review_orphan_assignment_deferred" },
+          "Orphan assignment requires the selected task review owner");
+        skipped += 1;
+        continue;
+      }
       const relations = await issuesSvc.getRelationSummaries(candidate.id);
       const blockingLinks = formatIssueLinksForComment(relations.blocks);
       const updated = await issuesSvc.update(candidate.id, {
@@ -2806,6 +2823,11 @@ export function recoveryService(
     publications: ActivityPublication[];
     postCommitActions: IssuePostCommitAction[];
   }) {
+    if (parseObject(input.issue.executionPolicy).totalReviewCycles === 5) {
+      logger.warn({ issueId: input.issue.id, code: "total_review_recovery_in_place_deferred" },
+        "Recovery issue projection requires the selected task review owner");
+      return null;
+    }
     const database = transaction?.tx ?? db;
     const mutationIssuesSvc = transaction ? issueService(database as Db) : issuesSvc;
     const updated = await mutationIssuesSvc.update(input.issue.id, {
@@ -2997,6 +3019,11 @@ export function recoveryService(
       ]),
     ];
     if (blockedByIssueIds.length === 0) return null;
+    if (parseObject(issue.executionPolicy).totalReviewCycles === 5) {
+      logger.warn({ issueId: issue.id, code: "total_review_continuation_wait_deferred" },
+        "Heuristic continuation wait cannot project the selected review task");
+      return null;
+    }
 
     const updated = await issuesSvc.update(issue.id, {
       status: "blocked",
@@ -3563,6 +3590,12 @@ export function recoveryService(
         hasNewSourcePath
       ) {
         if (healthyChildren.length > 0 && !sourceState.hasDurableWaitingPath) {
+          if (parseObject(issue.executionPolicy).totalReviewCycles === 5) {
+            logger.warn({ issueId: issue.id, recoveryActionId: action.id, code: "total_review_recovery_heal_deferred" },
+              "Recovery action remains unresolved until its selected review projection is applied");
+            result.skipped += 1;
+            continue;
+          }
           const blockerIds = await existingUnresolvedBlockerIssueIds(
             issue.companyId,
             issue.id,
@@ -3697,6 +3730,11 @@ export function recoveryService(
         ),
       );
 
+    if (parseObject(input.issue.executionPolicy).totalReviewCycles === 5) {
+      logger.warn({ issueId: input.issue.id, recoveryActionId: action.id, code: "total_review_disposition_repair_deferred" },
+        "Board recovery incident retained without projecting the selected review task");
+      return null;
+    }
     const updated = await issuesSvc.update(input.issue.id, {
       status: "blocked",
     });
@@ -4065,10 +4103,10 @@ export function recoveryService(
 
       return applyStrandedAssignedIssueEscalation(input, tx, publications, postCommitActions);
     });
-    if (updated) {
-      for (const publication of publications) publishActivity(publication);
-      await executeIssuePostCommitActions(db, postCommitActions);
-    }
+    // A retained board incident may commit even when its issue projection is
+    // deferred. Flush only after the real outer commit, including that case.
+    for (const publication of publications) publishActivity(publication);
+    await executeIssuePostCommitActions(db, postCommitActions);
     return updated;
   }
 
@@ -4103,6 +4141,56 @@ export function recoveryService(
       recoveryCause === "provider_quota" &&
       !recoveryAction.ownerAgentId &&
       Boolean(recoveryAction.returnOwnerAgentId);
+    const blockerIds = await existingUnresolvedBlockerIssueIds(
+      input.issue.companyId,
+      input.issue.id,
+      tx,
+    );
+    if (parseObject(input.issue.executionPolicy).totalReviewCycles === 5) {
+      // The incident remains real even when no exact stopped source run exists.
+      // Never fabricate a run id to satisfy the operational adapter.
+      const source = input.latestRun ? await tx.select({
+        ...getTableColumns(heartbeatRuns), rowVersion: recoveryRunVersionColumn,
+      }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, input.latestRun.id), eq(heartbeatRuns.companyId, input.issue.companyId),
+      )).for("share").limit(1).then(rows => rows[0] ?? null) : null;
+      const [latestSource] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, input.issue.companyId), eq(boundRunIssueIdSql(), input.issue.id),
+      )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+      // input.issue is the current task tuple already revalidated under the
+      // outer row lock. An old assignee's stopped run is not authority over its
+      // replacement, even when both native execution pointers are now null.
+      const projection = source && boundRunIssueId(source) === input.issue.id
+        && source.agentId === input.issue.assigneeAgentId && input.issue.assigneeUserId === null
+        && latestSource?.id === source.id && source.agentId === input.latestRun?.agentId
+        && source.status === input.latestRun?.status && TERMINAL_HEARTBEAT_RUN_STATUSES.has(source.status)
+        && (input.latestRun?.rowVersion !== undefined ? source.rowVersion === input.latestRun.rowVersion
+          : JSON.stringify(source.contextSnapshot) === JSON.stringify(input.latestRun?.contextSnapshot))
+        ? await mutateNativeOperationalIssue(tx, {
+          companyId: input.issue.companyId, issueId: input.issue.id, expected: input.issue,
+          operation: { kind: "failure_block", runId: source.id, target: "blocked" },
+        }, publications, postCommitActions)
+        : { kind: "deferred" as const, code: "native_recovery_source_proof_unavailable" };
+      if (projection.kind === "deferred" || projection.kind === "projection_failed") {
+        await tx.update(issueRecoveryActions).set({ evidence: {
+          ...parseObject(recoveryAction.evidence), nativeIssueProjection: {
+            kind: projection.kind, code: projection.code, projectionApplied: false, sourceRunId: input.latestRun?.id ?? null,
+          },
+        } }).where(and(eq(issueRecoveryActions.id, recoveryAction.id), eq(issueRecoveryActions.companyId, input.issue.companyId)));
+        await logActivity(tx as unknown as Db, {
+          companyId: input.issue.companyId, actorType: "system", actorId: "recovery",
+          action: "issue.native_recovery_projection_deferred", entityType: "issue", entityId: input.issue.id,
+          details: { recoveryActionId: recoveryAction.id, code: projection.code, projectionApplied: false },
+        }, publications);
+        return null;
+      }
+    }
+    const updated = await transactionIssuesSvc.update(input.issue.id, {
+      ...(parseObject(input.issue.executionPolicy).totalReviewCycles === 5 ? {} : { status: "blocked" }),
+      blockedByIssueIds: blockerIds,
+      companyGuard: input.issue.companyId,
+    }, tx, publications, postCommitActions);
+    if (!updated) return null;
     if (isProviderQuotaWait && recoveryAction.returnOwnerAgentId) {
       await ensureProviderQuotaWaitRecoveryMonitor({
         issue: input.issue,
@@ -4111,17 +4199,6 @@ export function recoveryService(
         agentId: recoveryAction.returnOwnerAgentId,
       }, tx);
     }
-    const blockerIds = await existingUnresolvedBlockerIssueIds(
-      input.issue.companyId,
-      input.issue.id,
-      tx,
-    );
-    const updated = await transactionIssuesSvc.update(input.issue.id, {
-      status: "blocked",
-      blockedByIssueIds: blockerIds,
-      companyGuard: input.issue.companyId,
-    }, tx, publications, postCommitActions);
-    if (!updated) return null;
     if (isProviderQuotaWait) return updated;
     const sourceAssigneePreserved =
       updated.assigneeAgentId === input.issue.assigneeAgentId &&

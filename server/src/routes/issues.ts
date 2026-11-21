@@ -1,4 +1,5 @@
 import { assertProtectedReviewSubmissionSupported, assertProtectedGenericReviewHandoff } from "../services/review-cycle-protected-reviewer.js";
+import { mutateNativeOperationalIssue, nativeOperationalIssueSnapshot } from "../services/native-operational-issue-mutation.js";
 import { decideNativeStageReview, nativeStageReviewDecisionSchema } from "../services/native-runtime/native-stage-review-decision.js";
 import { cancelScopedReviewSchema, createScopedReviewSchema } from "@paperclipai/shared";
 import { scopedReviewCancellationService } from "../services/scoped-review-cancellation.js";
@@ -19683,6 +19684,7 @@ export function issueRoutes(
 
       let scheduledRetrySupersededByComment = false;
       let cancelledScheduledRetryRunId: string | null = null;
+      let operationalContinuationComment: Awaited<ReturnType<typeof svc.addComment>> | null = null;
       if (effectiveMoveToTodoRequested && shouldResumeInProgressScheduledRetry) {
         cancelledScheduledRetryRunId = await cancelScheduledRetrySupersededByComment({
           scheduledRetryRunId: scheduledRetryForHumanComment?.runId,
@@ -19700,7 +19702,35 @@ export function issueRoutes(
         scheduledRetrySupersededByComment =
           shouldResumeInProgressScheduledRetry &&
           issue.status === "in_progress";
-        const reopenedIssue = await svc.update(id, { status: "todo" });
+        const selectedTotal5 = normalizeIssueExecutionPolicy(currentIssue.executionPolicy)?.totalReviewCycles === 5;
+        const continuationPublications: ActivityPublication[] = [];
+        const continuationActions: IssuePostCommitAction[] = [];
+        const sourceTrust = selectedTotal5 ? await sourceTrustForActorWrite(currentIssue, actor) : undefined;
+        const persistedContinuation = selectedTotal5 ? await db.transaction(async tx => {
+          // This is the actual native comment, not a request-ID receipt. Its
+          // persistence and the selected operational reopen share one commit.
+          const saved = await issueService(tx as unknown as Db).addComment(id, req.body.body, {
+            agentId: actor.agentId ?? undefined, userId: actor.actorType === "user" ? actor.actorId : undefined,
+            runId: actor.runId, onBehalfOfUserId: authenticatedActorResponsibleUserId(req),
+          }, {
+            authorType: req.body.authorType ?? (actor.actorType === "agent" ? "agent" : "user"),
+            presentation: commentPresentation, metadata: req.body.metadata ?? null,
+            attachmentIds: req.body.attachmentIds, clientRequestId: actor.actorType === "user" ? req.body.clientRequestId : undefined,
+            mirrorToSlack: actor.actorType === "user", authorizationReason: commentAuthorizationReason, sourceTrust,
+          }, tx);
+          const projection = await mutateNativeOperationalIssue(tx, {
+            companyId: currentIssue.companyId, issueId: id, expected: nativeOperationalIssueSnapshot(currentIssue),
+            operation: { kind: "continuation", receiptId: saved.id },
+            actor: { agentId: actor.agentId, userId: actor.actorType === "user" ? actor.actorId : null, runId: actor.runId },
+          }, continuationPublications, continuationActions);
+          if (!("issue" in projection)) {
+            throw conflict("This comment cannot reopen the current review-controlled task", { code: projection.code });
+          }
+          const hydratedIssue = await issueService(tx as unknown as Db).getById(id);
+          if (!hydratedIssue) throw conflict("The task disappeared before its comment continuation committed");
+          return { comment: saved, issue: hydratedIssue };
+        }) : null;
+        const reopenedIssue = persistedContinuation?.issue ?? await svc.update(id, { status: "todo" });
         if (!reopenedIssue) {
           res.status(404).json({ error: "Issue not found" });
           return;
@@ -19708,6 +19738,11 @@ export function issueRoutes(
         reopened = isClosed || (isBlocked && !hasUnresolvedFirstClassBlockers);
         reopenFromStatus = reopened ? issue.status : null;
         currentIssue = reopenedIssue;
+        if (persistedContinuation) {
+          operationalContinuationComment = persistedContinuation.comment;
+          for (const publication of continuationPublications) publishActivity(publication);
+          await flushIssuePostCommitActions(continuationActions);
+        }
 
         await logActivity(db, {
           companyId: currentIssue.companyId,
@@ -19805,7 +19840,9 @@ export function issueRoutes(
       let comment: Awaited<ReturnType<typeof svc.addComment>>;
       let goalCommentSteered = false;
       let fastResponseEnqueued = false;
-      if (shouldAutoApproveReviewComment) {
+      if (operationalContinuationComment) {
+        comment = operationalContinuationComment;
+      } else if (shouldAutoApproveReviewComment) {
         const usesCommentTotalBudget = currentExecutionPolicy?.totalReviewCycles === 5;
         const commentTransitionInput: TransitionInput = {
           issue: currentIssue,

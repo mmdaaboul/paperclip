@@ -1091,12 +1091,9 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
         });
         expect(normalizedUnderWrongCompany).toBeNull();
 
-        const reopenedUnderWrongCompany = await ports.transaction.reopenIssue({
-          companyId: otherCompanyId,
-          issueId,
-          runId,
-        });
-        expect(reopenedUnderWrongCompany).toBeNull();
+        await expect(ports.transaction.reopenIssue({
+          companyId: otherCompanyId, issueId, runId,
+        })).rejects.toThrow("native_continuation_claim_required");
 
         return { outcome: { kind: "released" as const }, postCommitEffects: [] };
       },
@@ -1126,7 +1123,8 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
       reopened: null,
     };
     await adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, async (_locked, ports) => {
-      captured.reopened = await ports.transaction.reopenIssue({ companyId: otherCompanyId, issueId, runId });
+      await expect(ports.transaction.reopenIssue({ companyId: otherCompanyId, issueId, runId }))
+        .rejects.toThrow("native_continuation_claim_required");
       return { outcome: { kind: "released" as const }, postCommitEffects: [] };
     });
     expect(captured.reopened).toBeNull();
@@ -1147,7 +1145,9 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     const captured: { reopened: { status: string; executionState: Record<string, unknown> | null } | null } = {
       reopened: null,
     };
+    const wakeId = await seedDeferredWake({ companyId, agentId, issueId });
     await adapter.withIssueExecutionLock({ companyId, runId, now: new Date() }, async (_locked, ports) => {
+      expect(await ports.transaction.claimDeferredWakeForPromotion({ companyId, wakeId, now: new Date() })).toBe(true);
       captured.reopened = await ports.transaction.reopenIssue({ companyId, issueId, runId });
       return { outcome: { kind: "released" as const }, postCommitEffects: [] };
     });

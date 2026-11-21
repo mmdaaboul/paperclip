@@ -17,6 +17,7 @@ import { getExecutionBlocker, hasPendingRunCleanup } from "../../../services/exe
 import { nativeManualAdmissionHoldsExecution } from "../../../services/native-runtime/native-runner-ownership.js";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import { readReleaseRun, type ReleaseRun } from "./release-run-read.js";
+import { mutateNativeOperationalIssue, type NativeOperationalTransaction } from "../../../services/native-operational-issue-mutation.js";
 import { isGovernancePauseStop } from "../../../services/governance-pause-stop.js";
 import type { Db } from "@paperclipai/db";
 import { deliveredQueuedCommentIds } from "../../../services/queued-comment-delivery.js";
@@ -45,11 +46,12 @@ import { evaluateAgentInvokabilityFromDb } from "../../../services/agent-invokab
 import { issueTreeControlService, isVerifiedIssueTreeControlInteractionWake } from "../../../services/issue-tree-control.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "../../../services/recovery/pause-hold-guard.js";
 import { classifyContinuationFailure } from "../../../services/recovery/service.js";
-import { issueService } from "../../../services/issues.js";
+import { issueService, executeIssuePostCommitActions, type IssuePostCommitAction } from "../../../services/issues.js";
+import { publishActivity, type ActivityPublication } from "../../../services/activity-log.js";
 import { issueRecoveryActionService } from "../../../services/issue-recovery-actions.js";
 import { readContinuationAttempt } from "../../../services/recovery/run-liveness-continuations.js";
 import { withRecoveryContext } from "../../../services/recovery/status-only-context.js";
-import { parseIssueExecutionState } from "../../../services/issue-execution-policy.js";
+import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../../../services/issue-execution-policy.js";
 import {
   queuedCommentIdsFromWakePayload,
   queuedCommentIdsFromRunContext,
@@ -215,9 +217,10 @@ function buildHost(_tx: Db, deps: WakeQueuePostgresAdapterDeps): WakeQueueHost {
   };
 }
 
-function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, run: ReleaseRun): WakeQueueTransaction {
+function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, run: ReleaseRun,
+  publications: ActivityPublication[], postCommitActions: IssuePostCommitAction[]): WakeQueueTransaction {
   const treeControlSvc = issueTreeControlService(tx);
-  const issuesSvc = issueService(tx);
+  let claimedPromotionWake: Pick<typeof agentWakeupRequests.$inferSelect, "id" | "companyId" | "agentId" | "payload"> | null = null;
   const interruptQueueId = run.runtimeMode !== "native" && run.status === "cancelled"
     ? readNonEmptyString(run.resultJson?.queuedCommentInterruptQueueId)
     : null;
@@ -473,9 +476,33 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
       return isCompletedOnboardingHandoffWake(tx, input);
     },
 
-    async reopenIssue({ companyId, issueId }) {
-      const updated = await issuesSvc.updateForCompany(issueId, companyId, { status: "todo", executionState: null }, tx);
-      return updated ? toIssueSnapshot(updated as unknown as IssueRow) : null;
+    async reopenIssue({ companyId, issueId, runId }) {
+      // Claim and continuation share the outer transaction; refusal must roll
+      // back the claim so a deferred wake cannot run an unchanged terminal task.
+      if (runId !== run.id || companyId !== run.companyId || !claimedPromotionWake
+        || claimedPromotionWake.companyId !== companyId
+        || parseObject(claimedPromotionWake.payload).issueId !== issueId) {
+        throw new Error("native_continuation_claim_required");
+      }
+      const [current] = await tx.select().from(issues).where(and(eq(issues.companyId, companyId), eq(issues.id, issueId))).for("update");
+      if (!current) return null;
+      // A native handoff may promote the current assignee after another owner
+      // finishes; unrelated same-company agents are not continuation owners.
+      if (claimedPromotionWake.agentId !== run.agentId && claimedPromotionWake.agentId !== current.assigneeAgentId) {
+        throw new Error("native_continuation_claim_required");
+      }
+      // Feature-off retains the native reset, including legacy blocked state.
+      if (normalizeIssueExecutionPolicy(current.executionPolicy)?.totalReviewCycles !== 5) {
+        const updated = await issueService(tx).updateForCompany(issueId, companyId,
+          { status: "todo", executionState: null }, tx, publications, postCommitActions);
+        return updated ? toIssueSnapshot(updated as unknown as IssueRow) : null;
+      }
+      const restored = await mutateNativeOperationalIssue(tx as unknown as NativeOperationalTransaction, {
+        companyId, issueId, expected: current,
+        operation: { kind: "continuation", receiptId: claimedPromotionWake.id },
+      }, publications, postCommitActions);
+      if (restored.kind === "deferred" || restored.kind === "projection_failed") throw new Error(restored.code);
+      return toIssueSnapshot(restored.issue as unknown as IssueRow);
     },
 
     async claimDeferredWakeForPromotion({ companyId, wakeId, now }) {
@@ -496,7 +523,9 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
             eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
           ),
         )
-        .returning({ id: agentWakeupRequests.id });
+        .returning({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId,
+          agentId: agentWakeupRequests.agentId, payload: agentWakeupRequests.payload });
+      claimedPromotionWake = claimed[0] ?? null;
       return claimed.length > 0;
     },
 
@@ -777,7 +806,8 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
   };
 }
 
-async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: ReleaseRun, issue: IssueRow, now: Date): Promise<boolean> {
+async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: ReleaseRun, issue: IssueRow, now: Date,
+  publications: ActivityPublication[], postCommitActions: IssuePostCommitAction[]): Promise<boolean> {
   const applies =
     run.runtimeMode === "native" &&
     ["failed", "timed_out", "interrupted", "cancelled"].includes(run.status) &&
@@ -810,8 +840,21 @@ async function recordNativeTerminalRecoveryIfNeeded(tx: Db, run: ReleaseRun, iss
     .limit(1);
   let nativeFailureBlock: { runId: string; statusVersion: number } | undefined;
   if (issue.status !== "blocked") {
-    const projected = await issueService(tx).update(issue.id, { status: "blocked" }, tx);
-    if (projected) {
+    // This release owner has just cleared its own execution/checkout bindings.
+    // Compare against the current locked tuple, not its pre-release snapshot.
+    const [releasedIssue] = await tx.select().from(issues).where(and(
+      eq(issues.companyId, issue.companyId), eq(issues.id, issue.id),
+      eq(issues.statusVersion, issue.statusVersion),
+    )).for("update");
+    if (!releasedIssue) return true;
+    const projection = await mutateNativeOperationalIssue(tx as unknown as NativeOperationalTransaction, {
+      companyId: issue.companyId,
+      issueId: issue.id,
+      expected: releasedIssue,
+      operation: { kind: "failure_block", runId: run.id, target: "blocked" },
+    }, publications, postCommitActions);
+    const projected = projection.kind === "applied" || projection.kind === "unchanged" ? projection.issue : null;
+    if (projected?.status === "blocked") {
       nativeFailureBlock = { runId: run.id, statusVersion: projected.statusVersion };
       await notifyDeliveryWork(tx, DELIVERY_QUEUES.mcpEvents, `task:${issue.id}`);
       await tx.insert(activityLog).values({
@@ -1167,7 +1210,8 @@ export function createWakeAdmissionWriter(): WakeAdmissionWriter {
 export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAdapterDeps): IssueLockWriter {
   return {
     async withIssueExecutionLock(input, fn): Promise<ReleaseTransactionResult & { run: RunSnapshot }> {
-      return db.transaction(async (rawTx) => {
+      const publications: ActivityPublication[] = [], postCommitActions: IssuePostCommitAction[] = [];
+      const committed = await db.transaction<ReleaseTransactionResult & { run: RunSnapshot }>(async (rawTx) => {
         const tx = rawTx as unknown as Db;
         const evidence = await readReleaseRun(tx, input);
         const run = evidence.run;
@@ -1369,7 +1413,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           && issueRow.status === "blocked" && issueRow.assigneeAgentId === run.agentId) {
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
-        if (!handoffAssigneeAgentId && await recordNativeTerminalRecoveryIfNeeded(tx, run, issueRow, input.now)) {
+        if (!handoffAssigneeAgentId && await recordNativeTerminalRecoveryIfNeeded(tx, run, issueRow, input.now, publications, postCommitActions)) {
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
 
@@ -1393,7 +1437,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
 
         const locked: LockedIssueExecution = { primaryIssue: toIssueSnapshot(issueRow), run: runSnapshot,
           recoveryOnly: recoveryOnly && !handoffAssigneeAgentId, ...(handoffAssigneeAgentId ? { handoffAssigneeAgentId } : {}) };
-        const result = await fn(locked, { host: buildHost(tx, deps), transaction: buildTransaction(tx, deps, db, run) });
+        const result = await fn(locked, { host: buildHost(tx, deps), transaction: buildTransaction(tx, deps, db, run, publications, postCommitActions) });
         // Explicit retry admission requires the exact source's task claim.
         // Preserve it only when the existing queue-first recovery policy
         // requests that retry. The clear/restore stays inside this task lock.
@@ -1408,6 +1452,9 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
         }
         return { ...result, run: runSnapshot };
       });
+      for (const publication of publications) publishActivity(publication);
+      await executeIssuePostCommitActions(db, postCommitActions);
+      return committed;
     },
   };
 }
