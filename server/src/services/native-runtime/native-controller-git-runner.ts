@@ -1,9 +1,16 @@
 import { execFile } from "node:child_process";
 import { lstat, mkdir, mkdtemp, realpath, rm } from "node:fs/promises";
-import { dirname, isAbsolute, join } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { NativeProviderStateIncompatibleError, createIsolatedCodexAppServerArgs, CODEX_SKILLLESS_PERMISSION_PROFILE, codexExecutableReadOnlyRoots, type WorkspaceAccessSnapshot } from "../../vendor/paperclip-runner/index.js";
 import type { AttributedGitCommandRunner } from "../github-attributed-push-git.js";
 import type { createNativeAttributedGitScope } from "./native-attributed-git-scope.js";
+
+export function nativeControllerGitDirectories(instanceRoot: string) {
+  const controllerRoot = resolve(instanceRoot, "runtime", "paperclip-runner");
+  // Writable operation scratch must be a sibling of the protected controller,
+  // never a child that would require relaxing its native filesystem deny.
+  return { controllerRoot, runtimeDirectory: resolve(instanceRoot, "runtime", "recorded-controller-git") };
+}
 
 /** Native Codex permission builder + ordinary Node child lifecycle, not the
  * stronger SDK kernel/custody owner. Result means captured launcher closed.

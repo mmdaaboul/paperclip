@@ -1,5 +1,6 @@
 import { bindNativeControllerGitSession } from "./native-controller-github-session.js";
 import { createNativeControllerGitActions } from "./native-controller-github.js";
+import { nativeControllerGitDirectories } from "./native-controller-git-runner.js";
 import { createNativeAttributedGitScope } from "./native-attributed-git-scope.js";
 import { nativeControllerGitState,controllerGitProviderEnvironment } from "../github-controller-policy.js";
 import { getNativeStageReviewAssignment, readNativeStageReviewContext } from "./native-stage-review.js";
@@ -14801,11 +14802,11 @@ async function createRunnerdBackendWithinSessionClaim(
     onUnavailable: message => input.onLog?.("stderr", `[paperclip] Reviewer PR discussion unavailable: ${message}\n`) ?? Promise.resolve(),
   }) : undefined;
   const controllerGitScope=createNativeAttributedGitScope();
-  const controllerRoot=resolve(resolvePaperclipInstanceRoot(),"runtime","paperclip-runner");
+  const {controllerRoot,runtimeDirectory:controllerGitDirectory}=nativeControllerGitDirectories(resolvePaperclipInstanceRoot());
   const controllerEnvironment=resolveNativeProviderEnvironment(input.execution.provider,input.runnerEnvironment);
   const controllerGit=!noExternalTools && !nativeReview && !nativeStageReview ? await createNativeControllerGitActions({
     db:input.db,execution:input.execution,workspaceAccess:input.workspaceAccess,targetKind:target.kind,scope:controllerGitScope,
-    runtimeDirectory:resolve(controllerRoot,"recorded-controller-git"),
+    runtimeDirectory:controllerGitDirectory,
     protectedPaths:[controllerRoot,...[input.managedAiCredentialHome,"runtimeContext" in input.execution?input.execution.runtimeContext.instructions.workingCopy?.rootPath:undefined].filter((path):path is string=>typeof path==="string"&&path.startsWith("/"))],
     filesystemEnvironment:{PAPERCLIP_GIT_METADATA_ROOTS:controllerEnvironment?.PAPERCLIP_GIT_METADATA_ROOTS,PAPERCLIP_RUNNER_NETWORK_ACCESS:controllerEnvironment?.PAPERCLIP_RUNNER_NETWORK_ACCESS,PAPERCLIP_RUNNER_NETWORK_ROOTS:controllerEnvironment?.PAPERCLIP_RUNNER_NETWORK_ROOTS},
   }):undefined;

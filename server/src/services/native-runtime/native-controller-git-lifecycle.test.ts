@@ -9,23 +9,47 @@ vi.mock("node:child_process",()=>({execFile:(_binary:string,args:string[],option
  const process=new EventEmitter();if(args.includes("--exec-path")){queueMicrotask(()=>callback(null,"/usr/libexec/git-core\n"));return process;}
  child.pending={emit:process.emit.bind(process),callback,args,env:options.env};child.entered?.();return process;
 }}));
-import { createNativeControllerGitRunner } from "./native-controller-git-runner.js";
+import { createNativeControllerGitRunner, nativeControllerGitDirectories } from "./native-controller-git-runner.js";
 import { createNativeAttributedGitScope } from "./native-attributed-git-scope.js";
 import { bindNativeControllerGitSession } from "./native-controller-github-session.js";
 import { createWorkspaceAccessSnapshot,type NativeSession } from "../../vendor/paperclip-runner/index.js";
 const roots:string[]=[];
-afterEach(async()=>{vi.useRealTimers();child.pending=null;child.entered=null;for(const root of roots.splice(0))await rm(root,{recursive:true,force:true});});
-async function fixture(){
+afterEach(async()=>{vi.useRealTimers();child.pending=null;child.entered=null;for(const root of roots.splice(0))if(process.env.PAPERCLIP_NATIVE_GIT_RETAIN_TEST_FIXTURES!=="1")await rm(root,{recursive:true,force:true});});
+async function fixture(protectedOperationRoot?: "controller" | "credential" | "instruction"){
  const root=await realpath(await mkdtemp(join(tmpdir(),"controller-lifecycle-")));roots.push(root);
- const workspace=join(root,"workspace"),reference=join(root,"reference"),runtime=join(root,"runtime"),codex=join(root,"codex");
- for(const path of [workspace,reference,runtime])await mkdir(path,{mode:0o700});await writeFile(codex,"fixture executable, never launched",{mode:0o700});
+ const workspace=join(root,"workspace"),reference=join(root,"reference"),codex=join(root,"codex");
+ const {controllerRoot,runtimeDirectory}=nativeControllerGitDirectories(join(root,"instance"));
+ const credential=join(root,"credentials"),instruction=join(root,"instructions");
+ const protectedPaths=[controllerRoot,credential,instruction];
+ const protectedRoot=protectedOperationRoot && {controller:controllerRoot,credential,instruction}[protectedOperationRoot];
+ const runtime=protectedRoot ? join(protectedRoot,"recorded-controller-git") : runtimeDirectory;
+ for(const path of [workspace,reference,controllerRoot,credential,instruction,runtime])await mkdir(path,{recursive:true,mode:0o700});await writeFile(codex,"fixture executable, never launched",{mode:0o700});
  const scope=createNativeAttributedGitScope(),snapshot=createWorkspaceAccessSnapshot({companyId:randomUUID(),agentId:randomUUID(),runId:randomUUID(),projectId:randomUUID(),workspaceId:randomUUID()},
   {workspaceDirectory:workspace,referenceDirectories:[reference],readOnlyWorkspace:false});
- const run=await createNativeControllerGitRunner({scope,workspace:snapshot,runtimeDirectory:runtime,gitBinary:"/usr/bin/git",codexCommand:codex,protectedPaths:[],filesystemEnvironment:{PAPERCLIP_RUNNER_NETWORK_ACCESS:"false",PAPERCLIP_GIT_METADATA_ROOTS:undefined,PAPERCLIP_RUNNER_NETWORK_ROOTS:undefined},assertCurrent:async()=>{}});
- const command=()=>run({binary:"/usr/bin/git",args:["status","--porcelain"],cwd:workspace,env:{},timeoutMs:1000});
- return {root,workspace,reference,runtime,scope,command};
+ const run=await createNativeControllerGitRunner({scope,workspace:snapshot,runtimeDirectory:runtime,gitBinary:"/usr/bin/git",codexCommand:codex,protectedPaths,filesystemEnvironment:{PAPERCLIP_RUNNER_NETWORK_ACCESS:"disabled",PAPERCLIP_GIT_METADATA_ROOTS:undefined,PAPERCLIP_RUNNER_NETWORK_ROOTS:undefined},assertCurrent:async()=>{}});
+ const command=(args=["status","--porcelain"])=>run({binary:"/usr/bin/git",args,cwd:workspace,env:{},timeoutMs:1000});
+ return {root,workspace,reference,runtime,protectedPaths,scope,command};
 }
 describe("actual controller lifecycle owner with controlled child close events",()=>{
+ it("admits production directory topology and settles a numeric closed Git config miss",async()=>{
+  const f=await fixture();let entered!:()=>void;const ready=new Promise<void>(resolve=>{entered=resolve;});child.entered=entered;
+  const work=f.command(["config","--local","--no-includes","--get-regexp","^credential\\."]);
+  await Promise.race([ready,work.then(()=>{throw new Error("Git command closed before the controlled child boundary");})]);
+  const pending=child.pending!,config=pending.args.join(" ");
+  for(const path of f.protectedPaths)expect(config).toContain(`${JSON.stringify(path)}="none"`);
+  expect(config).toContain(`${JSON.stringify(f.reference)}="read"`);
+  expect(config).toContain(`${JSON.stringify(pending.env.TMPDIR)}="write"`);
+  expect(pending.env.HOME).not.toBe(pending.env.TMPDIR);
+  pending.callback({code:1},"");pending.emit("close",1,null);
+  expect(await work).toEqual({code:1,stdout:"",stderr:""});
+  await f.scope.retire();expect(await readdir(f.runtime)).toEqual([]);
+ });
+ it.each(["controller","credential","instruction"] as const)("still refuses operation scratch beneath protected %s before child launch",async protectedRoot=>{
+  const f=await fixture(protectedRoot);
+  await expect(f.command()).rejects.toThrow("Workspace access overlaps protected runtime or credential paths");
+  expect(child.pending).toBeNull();expect(await readdir(f.runtime)).toHaveLength(1);
+  await f.scope.retire();
+ });
  it("uses current native scoped permissions and joins close after the callback",async()=>{
   const f=await fixture();let done=false;const work=f.command().then(value=>{done=true;return value;});
   while(!child.pending)await new Promise(resolve=>setTimeout(resolve,1));
