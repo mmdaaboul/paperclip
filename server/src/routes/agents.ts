@@ -56,7 +56,7 @@ import { assertAiConnectionCreateAccess, canInstallSharedAiConnectionForNewAgent
 import { isAiConnectionCompatible } from "@paperclipai/shared";
 import { applyConnectorSkills, resolveConnectorAssignments, annotateConnectorSkills, isConnectorSkill } from "../services/connector-runtime.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
-import { canRetryStoppedRun } from "../services/cancelled-native-startup.js";
+import { canRetryStoppedRun, isFailedNativePreparation } from "../services/cancelled-native-startup.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext, type NativeReviewAssignmentContext } from "../services/native-runtime/native-review-participant.js";
 import { paperclipRunnerTransitionConfig, normalizeLegacyRunnerProvider, isPaperclipRunnerProvider, PAPERCLIP_RUNNER_ACPX_PROFILES } from "@paperclipai/adapter-utils";
 import { applyMcpReasoningEffort } from "../services/public-mcp/agent-config.js";
@@ -69,7 +69,7 @@ import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
-import { activityLog, agents as agentsTable, chatConversations, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
+import { activityLog, agents as agentsTable, chatConversations, companies, heartbeatRuns, nativeRunFinalizations, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
 import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
 import { sha256Digest } from "../services/feedback-redaction.js";
 import {
@@ -6255,14 +6255,28 @@ export function agentRoutes(
         });
         if (!decision.allowed) throw forbidden(decision.explanation, authorizationDeniedDetails(decision));
         const savedReviewContext = readNativeReviewAssignmentContext(failedContext);
-        if (failedRun.runtimeMode === "native" && failedRun.status === "failed" &&
+        let failedScopedPreparation = false;
+        if (savedReviewContext && agent.adapterType === "paperclip_runner" && failedRun.status === "failed" &&
+            failedRun.errorCode === "setup_failed" && failedRun.runtimeMode === "legacy" && !failedRun.runtimeModeResolvedAt &&
+            failedRun.nativeIssueId === null && failedRun.scopeKind === "issue" && failedRun.issueId === issue.id &&
+            (failedContext.taskId === undefined || failedContext.taskId === issue.id)) {
+          const [coordinator] = await db.select().from(nativeRunFinalizations).where(and(
+            eq(nativeRunFinalizations.companyId, agent.companyId), eq(nativeRunFinalizations.runId, failedRun.id),
+          ));
+          // A default legacy label is not adapter execution: preparation failed
+          // before native identity was published. Require its no-launch proof.
+          failedScopedPreparation = await isFailedNativePreparation(db, failedRun, coordinator);
+        }
+        if (savedReviewContext && (failedScopedPreparation || failedRun.runtimeMode === "native" && failedRun.status === "failed" &&
             failedRun.errorCode === "native_provider_model_rejected" &&
-            failedRun.nativeIssueId === issue.id && savedReviewContext) {
+            failedRun.nativeIssueId === issue.id)) {
           const review = await getNativeReviewAssignment(db, {
             companyId: agent.companyId, issueId: issue.id, agentId: agent.id,
             contextSnapshot: savedReviewContext,
           });
-          if (review?.interaction.status !== "pending") {
+          if (review?.interaction.status !== "pending" || failedScopedPreparation && (!review.scopedReview ||
+              failedContext.sourceRunId !== undefined && failedContext.sourceRunId !== review.sourceRun.id ||
+              failedContext.revisionId !== undefined && failedContext.revisionId !== review.sourceDecision.id)) {
             throw conflict("The failed run's review is no longer current.");
           }
           retryNativeReviewContext = savedReviewContext;

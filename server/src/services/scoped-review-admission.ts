@@ -34,12 +34,22 @@ export async function assertScopedRunAdmission(db:Db,input:{companyId:string;iss
         return;
       }
       const [reviewerAgent]=await tx.select({adapterType:agents.adapterType}).from(agents).where(and(eq(agents.id,run.agentId),eq(agents.companyId,input.companyId)));
-      const nativeOrUnresolved=run.runtimeMode==="native" || !run.runtimeModeResolvedAt && reviewerAgent?.adapterType==="paperclip_runner";
-      if(run.agentId!==snapshot.reviewerAgentId || !nativeOrUnresolved || run.nativeIssueId!==issue.id)
+      // Queue identity precedes native preparation. Use its canonical task and
+      // durable assignment here; the post-preparation call still requires the
+      // native acting-run identity below.
+      const context=run.contextSnapshot??{};
+      const unresolved=run.runtimeMode==="legacy" && !run.runtimeModeResolvedAt && run.nativeIssueId===null
+        && reviewerAgent?.adapterType==="paperclip_runner" && run.scopeKind==="issue" && run.issueId===issue.id
+        && context.issueId===issue.id && (context.taskId===undefined || context.taskId===issue.id)
+        && ["queued","running"].includes(run.status) && (run.status!=="running" || issue.executionRunId===run.id);
+      if(run.agentId!==snapshot.reviewerAgentId || !(unresolved || run.runtimeMode==="native" && run.nativeIssueId===issue.id))
         throw conflict("A new Builder turn cannot start during the pending scoped review",{code:"scoped_review_pending"});
       const proof=await getNativeReviewAssignment(tx as unknown as Db,{companyId:input.companyId,issueId:input.issueId,agentId:run.agentId,
-        contextSnapshot:run.contextSnapshot,...(run.status==="running"?{actingRunId:run.id,issueExecutionRunId:issue.executionRunId}:{})});
+        contextSnapshot:run.contextSnapshot,...(!unresolved && run.status==="running"?{actingRunId:run.id,issueExecutionRunId:issue.executionRunId}:{})});
       if(!proof?.scopedReview || proof.scopedReview.id!==active.id) throw forbidden("This native run has no current scoped Reviewer assignment");
+      if(unresolved && (context.sourceRunId!==undefined && context.sourceRunId!==proof.sourceRun.id
+        || context.revisionId!==undefined && context.revisionId!==proof.sourceDecision.id))
+        throw forbidden("This queued run does not match its native Reviewer source");
       return;
     }
     const context=run.contextSnapshot as {scopedReviewId?:unknown;nativeReviewInteractionId?:unknown}|null;

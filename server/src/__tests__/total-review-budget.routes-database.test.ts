@@ -17,13 +17,14 @@ import { activityLog, agents, authUsers, companies, companyMemberships, createDb
 
 // Provider dispatch and executor-stop confirmation are stubbed; native authorization,
 // run rows, task state, ledger, decisions and audit use the real migrated database.
-const executionFixture = vi.hoisted(() => ({ rejectStop:false,suppressStopProof:false,loseStopReply:false }));
+const executionFixture = vi.hoisted(() => ({ rejectStop:false,suppressStopProof:false,loseStopReply:false,realWake:false }));
 vi.mock("../services/issue-assignment-wakeup.js", () => ({ queueIssueAssignmentWakeup: vi.fn() }));
 vi.mock("../services/heartbeat.js", async (loadActual) => {
   const actual = await loadActual<typeof import("../services/heartbeat.js")>();
   return { ...actual, heartbeatService: (...args: Parameters<typeof actual.heartbeatService>) => {
     const service = actual.heartbeatService(...args);
-    return { ...service, wakeup: vi.fn(async () => null), cancelRun: vi.fn(async (runId: string, _reason: unknown, options: any) => {
+    return { ...service, wakeup: vi.fn(async (...wakeArgs: Parameters<typeof service.wakeup>) =>
+      executionFixture.realWake ? service.wakeup(...wakeArgs) : null), cancelRun: vi.fn(async (runId: string, _reason: unknown, options: any) => {
       if (executionFixture.rejectStop) throw new Error("Unconfirmed executor stop in budget fixture");
       const database=args[0];
       const [stopped]=await database.update(heartbeatRuns).set({status:"cancelled",resultJson:options?.resultJson??{},finishedAt:new Date()}).where(eq(heartbeatRuns.id,runId)).returning();
@@ -49,13 +50,23 @@ vi.mock("../services/heartbeat.js", async (loadActual) => {
 });
 type Db = ReturnType<typeof createDb>;
 let db: Db;
-let fixture: Awaited<ReturnType<typeof reviewerNativeTestDatabase>>;
+let fixture: Pick<Awaited<ReturnType<typeof reviewerNativeTestDatabase>>, "end">;
 async function appFor(actor: Express.Request["actor"], enforceReviewerBoundary=false) {
   const { issueRoutes } = await import("../routes/issues.js");
   const app = express(); app.use(express.json());
   app.use((req, _res, next) => { req.actor = actor; next(); });
   if(enforceReviewerBoundary)app.use((await import("../middleware/reviewer-role-boundary.js")).reviewerRoleBoundary(db));
   app.use("/api", issueRoutes(db, {} as never));
+  app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) =>
+    res.status(err.status ?? 500).json({ error: err.message, details: err.details }));
+  return app;
+}
+async function retryAppFor(userId: string, companyId: string) {
+  const { agentRoutes } = await import("../routes/agents.js");
+  const app = express(); app.use(express.json());
+  app.use((req, _res, next) => { req.actor = { type: "board", userId, companyIds: [companyId],
+    source: "session", isInstanceAdmin: false }; next(); });
+  app.use("/api", agentRoutes(db));
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) =>
     res.status(err.status ?? 500).json({ error: err.message, details: err.details }));
   return app;
@@ -134,6 +145,30 @@ async function reviewingDraftFixture(existing?:Awaited<ReturnType<typeof seed>>)
   return {...f,reviewerRun,reviewerApp:await f.agentApp(f.reviewer.id,reviewerRun.id)};
 }
 
+// A real native result/status commit creates the pending scope, review card and
+// durable wake. Only provider completion/dispatch is simulated: this is the
+// queue's persisted pre-resolution shape, not a pre-filled native run.
+async function unresolvedScopedReviewerFixture() {
+  const f = await admittedDraftFixture();
+  const [wake] = await db.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, f.company.id), eq(agentWakeupRequests.agentId, f.reviewer.id)));
+  const context = (wake.payload as { _paperclipWakeContext: Record<string, unknown> })._paperclipWakeContext;
+  expect(context).toMatchObject({ issueId: f.issue.id, nativeReviewInteractionId: f.scope.interactionId,
+    nativeReviewDecisionId: f.scope.sourceDecisionId });
+  await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+  await db.update(nativeRunFinalizations).set({ phase: "committed" }).where(eq(nativeRunFinalizations.runId, f.runId));
+  await db.update(issues).set({ executionRunId: null, checkoutRunId: null }).where(eq(issues.id, f.issue.id));
+  const [reviewerRun] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.reviewer.id,
+    issueId: f.issue.id, scopeKind: "issue", status: "queued", responsibleUserId: f.userId,
+    wakeupRequestId: wake.id, contextSnapshot: context }).returning();
+  expect(reviewerRun).toMatchObject({ runtimeMode: "legacy", runtimeModeResolvedAt: null, nativeIssueId: null });
+  const { claimNativeReviewExecutionLock } = await import("../services/native-runtime/native-review-participant.js");
+  expect(await claimNativeReviewExecutionLock(db, { companyId: f.company.id, issueId: f.issue.id,
+    agentId: f.reviewer.id, runId: reviewerRun.id, contextSnapshot: context,
+    agentNameKey: "unresolved-scoped-reviewer", claimedAt: new Date() })).toBe(true);
+  return { ...f, wake, context, reviewerRun };
+}
+
 async function nativeCandidate(existing?: Awaited<ReturnType<typeof seed>>, agentId?: string) {
     const f=existing ?? await seed(), prior=await f.read(), runId=randomUUID(),contractId=randomUUID(),resultId=randomUUID(),assessmentId=randomUUID();
     const { nativeSha256 }=await import("../services/native-runtime/canonical.js");
@@ -199,7 +234,20 @@ function ok(response: any) { expect(response.status, JSON.stringify(response.bod
 
 describe("actual normal PATCH + native postgres-js + native issue service (injected actor, no worker execution)", () => {
   beforeAll(async () => {
-    fixture=await reviewerNativeTestDatabase();db=fixture.db;
+    const supplied = process.env.PAPERCLIP_SCOPED_REVIEW_STARTUP_TEST_DATABASE_URL;
+    if (supplied !== undefined) {
+      const url = new URL(supplied);
+      if (!/^postgres(?:ql)?:$/.test(url.protocol)
+        || !/^pc_scoped_review_startup_[a-f0-9]+_test$/.test(url.pathname.slice(1))) {
+        throw new Error("scoped_review_startup_test_database_not_isolated");
+      }
+      db = createDb(supplied, { maxConnections: 2, applicationName: "scoped-review-startup-regression" });
+      // Externally allocated fixtures and filesystem evidence are retained.
+      fixture = { end: () => db.$client.end({ timeout: 5 }) };
+    } else {
+      const nativeFixture = await reviewerNativeTestDatabase();
+      db = nativeFixture.db; fixture = nativeFixture;
+    }
     expect((await db.execute(sql`select to_regclass('issue_review_cycle_budgets') as name`))[0].name).toBe("issue_review_cycle_budgets");
     expect((await db.execute(sql`select to_regclass('issue_scoped_reviews') as name`))[0].name).toBe("issue_scoped_reviews");
     expect((await db.execute(sql`show server_version`))[0].server_version).toMatch(/^18\.1/);
@@ -326,6 +374,159 @@ describe("actual normal PATCH + native postgres-js + native issue service (injec
     ok(await patch(f.board,f.issue.id,{reviewCycleAllowance:allowance}));expect((await f.ledger()).admissions).toHaveLength(5);expect((await f.ledger()).allowances).toHaveLength(1);
     expect(await f.read()).toMatchObject({assigneeAgentId:f.builder.id,executionState:{totalReviewBudgetHold:false}});
   },90000);
+  it("unresolved scoped Reviewer reaches the real runtime guard boundary without changing native identity", async () => {
+    const f = await unresolvedScopedReviewerFixture();
+    const { assertScopedRunAdmission } = await import("../services/scoped-review-admission.js");
+    const identity = { companyId: f.company.id, issueId: f.issue.id, runId: f.reviewerRun.id };
+    await expect(assertScopedRunAdmission(db, identity)).resolves.toBeUndefined();
+    const [running] = await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date() })
+      .where(eq(heartbeatRuns.id, f.reviewerRun.id)).returning();
+    const { executeHeartbeatRuntime } = await import("../services/heartbeat/runtime-execution.js");
+    const sentinel = new Error("scoped-reviewer-after-production-admission-before-runtime");
+    let reachedRuntime = 0;
+    const input = { run: running, agent: f.reviewer, options: {}, task: { issueId: f.issue.id }, services: {},
+      get runtime() { reachedRuntime++; throw sentinel; } } as unknown as Parameters<typeof executeHeartbeatRuntime>[1];
+    await expect(executeHeartbeatRuntime(db, input)).rejects.toBe(sentinel);
+    expect(reachedRuntime).toBe(1);
+    const [unchanged] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, running.id));
+    expect(unchanged).toMatchObject({ runtimeMode: "legacy", nativeIssueId: null, runtimeModeResolvedAt: null,
+      processPid: null, nativeSessionId: null });
+    expect((await f.ledger()).admissions).toHaveLength(1);
+    expect(await f.read()).toMatchObject({ status: "in_review", executionRunId: running.id });
+    expect((await db.select().from(issueScopedReviews).where(eq(issueScopedReviews.id, f.scope.id)))[0].state).toBe("pending");
+    // Preparation publishes native identity later; its fully resolved check stays strict.
+    await db.update(heartbeatRuns).set({ runtimeMode: "native", runtimeModeResolvedAt: new Date(), nativeIssueId: f.issue.id })
+      .where(eq(heartbeatRuns.id, running.id));
+    await expect(assertScopedRunAdmission(db, identity)).resolves.toBeUndefined();
+    await db.update(heartbeatRuns).set({ nativeIssueId: null }).where(eq(heartbeatRuns.id, running.id));
+    await expect(assertScopedRunAdmission(db, identity)).rejects.toThrow("new Builder turn cannot start");
+  });
+
+  it.each(["eligible", "stale after queue", "resolved legacy", "provider started", "live controller",
+    "coordinator", "source mismatch", "revoked review", "changed artifact"] as const)(
+    "exact failed unresolved scoped Reviewer retry through real route and queue: %s", async change => {
+    const f = await unresolvedScopedReviewerFixture();
+    const context = { ...f.context, nativeStatusWakeIntentId: f.wake.id, source: "native_status_decision",
+      statusDecisionSource: "native_status_decision", wakeReason: "native_completion_review" };
+    const [delivery] = await db.insert(agentWakeupRequests).values({ companyId: f.company.id, agentId: f.reviewer.id,
+      source: f.wake.source, triggerDetail: "system", reason: "native_completion_review", status: "failed",
+      requestedByActorType: "system", requestedByActorId: `native-status-wake-dispatch:${f.wake.id}`,
+      runId: f.reviewerRun.id, payload: { issueId: f.issue.id, _paperclipWakeContext: context }, finishedAt: new Date() }).returning();
+    await db.update(agentWakeupRequests).set({ status: "coalesced", runId: f.reviewerRun.id, finishedAt: new Date() }).where(eq(agentWakeupRequests.id, f.wake.id));
+    const [failed] = await db.update(heartbeatRuns).set({ status: "failed", startedAt: new Date(), finishedAt: new Date(),
+      errorCode: "setup_failed", error: "A new Builder turn cannot start during the pending scoped review",
+      executionStage: "preparing", runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner" } },
+      resultJson: { stopReason: "adapter_failed", executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      wakeupRequestId: delivery.id, contextSnapshot: context }).where(eq(heartbeatRuns.id, f.reviewerRun.id)).returning();
+    await db.update(issues).set({ executionRunId: null, checkoutRunId: null }).where(eq(issues.id, f.issue.id));
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } })
+      .where(eq(agents.id, f.reviewer.id));
+    if (change === "resolved legacy") await db.update(heartbeatRuns).set({ runtimeModeResolvedAt: new Date() }).where(eq(heartbeatRuns.id, failed.id));
+    if (change === "provider started") await db.update(heartbeatRuns).set({ resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: true } } }).where(eq(heartbeatRuns.id, failed.id));
+    if (change === "live controller") await db.update(heartbeatRuns).set({ controllerLeaseExpiresAt: new Date(Date.now()+60_000) }).where(eq(heartbeatRuns.id, failed.id));
+    if (change === "coordinator") {
+      // An unresolved run cannot acquire a native coordinator with invented
+      // task identity; the native owner FK rejects it before route admission.
+      await expect(db.insert(nativeRunFinalizations).values({ companyId: f.company.id, issueId: f.issue.id,
+        runId: failed.id, phase: "terminal_failure" })).rejects.toMatchObject({
+        cause: { code: "23503", constraint_name: "native_run_finalizations_run_owner_fk" },
+      });
+      return;
+    }
+    if (change === "source mismatch") await db.update(heartbeatRuns).set({ contextSnapshot: { ...context, sourceRunId: randomUUID() } }).where(eq(heartbeatRuns.id, failed.id));
+    if (change === "revoked review") await db.update(issueThreadInteractions).set({ status: "rejected" }).where(eq(issueThreadInteractions.id, f.scope.interactionId!));
+    if (change === "changed artifact") await db.update(documentRevisions).set({ body: "Artifact changed before Retry" }).where(eq(documentRevisions.id, f.revision.id));
+    // The real queue persists the successor but cannot dispatch a provider while
+    // this synthetic slot is occupied. Atomic review claim is exercised below.
+    const [occupied] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.reviewer.id,
+      status: "running", startedAt: new Date() }).returning();
+    const app = await retryAppFor(f.userId, f.company.id);
+    const body = { failedRunId: failed.id, reason: "retry_failed_run", idempotencyKey: randomUUID(),
+      payload: { issueId: randomUUID(), nativeReviewDecisionId: randomUUID(), nativeReviewInteractionId: randomUUID() } };
+    executionFixture.realWake = true;
+    try {
+      const response = await request(app).post(`/api/agents/${f.reviewer.id}/wakeup`).send(body);
+      if (!["eligible", "stale after queue"].includes(change)) {
+        expect(response.status, JSON.stringify(response.body)).toBe(409);
+        expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, failed.id))).toHaveLength(0);
+        return;
+      }
+      expect(response.status, JSON.stringify(response.body)).toBe(202);
+      const successors = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, failed.id));
+      expect(successors).toHaveLength(1);
+      const successor = successors[0];
+      expect(successor).toMatchObject({ status: "queued", runtimeMode: "legacy", nativeIssueId: null,
+        contextSnapshot: { issueId: f.issue.id, nativeReviewDecisionId: f.scope.sourceDecisionId,
+          nativeReviewInteractionId: f.scope.interactionId, previousRunId: failed.id, forceFreshSession: true } });
+      const repeated = await request(app).post(`/api/agents/${f.reviewer.id}/wakeup`).send({ ...body, idempotencyKey: randomUUID() });
+      expect(repeated.status, JSON.stringify(repeated.body)).toBe(202);
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, failed.id))).toHaveLength(1);
+      await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, occupied.id));
+      const { claimQueuedNativeReviewRun } = await import("../services/native-runtime/native-review-dispatch.js");
+      if (change === "stale after queue") {
+        await db.update(documentRevisions).set({ body: "Artifact changed after Retry admission" }).where(eq(documentRevisions.id, f.revision.id));
+        expect(await claimQueuedNativeReviewRun(db, { run: successor, agentNameKey: "retried-scoped-reviewer",
+          claimedAt: new Date(), claimValues: {} })).toBeNull();
+        expect((await f.read()).executionRunId).toBeNull();
+        expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, successor.id)))[0]).toMatchObject({ status: "queued", processPid: null });
+        return;
+      }
+      expect(await claimQueuedNativeReviewRun(db, { run: successor, agentNameKey: "retried-scoped-reviewer",
+        claimedAt: new Date(), claimValues: {} })).toMatchObject({ id: successor.id, status: "running", nativeIssueId: null });
+      const { assertScopedRunAdmission } = await import("../services/scoped-review-admission.js");
+      await expect(assertScopedRunAdmission(db, { companyId: f.company.id, issueId: f.issue.id, runId: successor.id })).resolves.toBeUndefined();
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, failed.id)))[0]).toEqual(failed);
+      expect((await f.ledger()).admissions).toHaveLength(1);
+      expect((await db.select().from(issueScopedReviews).where(eq(issueScopedReviews.id, f.scope.id)))[0].state).toBe("pending");
+    } finally { executionFixture.realWake = false; }
+  });
+
+  it.each(["builder", "canonical issue", "context issue", "source run", "revision", "decision", "interaction",
+    "revoked interaction", "artifact", "workspace", "policy", "resolved legacy", "legacy adapter", "paused reviewer",
+    "execution owner", "foreign native identity", "terminal run"] as const)(
+    "unresolved scoped Reviewer refuses changed %s before runtime", async change => {
+      const f = await unresolvedScopedReviewerFixture();
+      let admissionRunId = f.reviewerRun.id;
+      await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, f.reviewerRun.id));
+      const runChange = (values: Partial<typeof heartbeatRuns.$inferInsert>) => db.update(heartbeatRuns).set(values).where(eq(heartbeatRuns.id, f.reviewerRun.id));
+      if (change === "builder") await runChange({ agentId: f.builder.id });
+      if (change === "canonical issue") {
+        const [other] = await db.insert(issues).values({ companyId: f.company.id, title: "Other task" }).returning();
+        const [foreign] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.reviewer.id,
+          issueId: other.id, scopeKind: "issue", status: "running", contextSnapshot: { ...f.context, issueId: other.id } }).returning();
+        admissionRunId = foreign.id;
+      }
+      if (change === "context issue") await runChange({ contextSnapshot: { ...f.context, issueId: randomUUID() } });
+      if (change === "source run") await runChange({ contextSnapshot: { ...f.context, sourceRunId: randomUUID() } });
+      if (change === "revision") await runChange({ contextSnapshot: { ...f.context, revisionId: randomUUID() } });
+      if (change === "decision") await runChange({ contextSnapshot: { ...f.context, nativeReviewDecisionId: randomUUID() } });
+      if (change === "interaction") await runChange({ contextSnapshot: { ...f.context, nativeReviewInteractionId: randomUUID() } });
+      if (change === "revoked interaction") await db.update(issueThreadInteractions).set({ status: "rejected" }).where(eq(issueThreadInteractions.id, f.scope.interactionId!));
+      if (change === "artifact") await db.update(documentRevisions).set({ body: "Changed pinned artifact" }).where(eq(documentRevisions.id, f.revision.id));
+      if (change === "workspace") await db.update(issues).set({ workspaceBindingRevision: sql`${issues.workspaceBindingRevision}+1` }).where(eq(issues.id, f.issue.id));
+      if (change === "policy") {
+        const policy = structuredClone(f.issue.executionPolicy) as { totalReviewCycles: number; stages: Array<{ id: string }> };
+        policy.stages[0].id = randomUUID();
+        await db.update(issues).set({ executionPolicy: policy }).where(eq(issues.id, f.issue.id));
+      }
+      if (change === "resolved legacy") await runChange({ runtimeModeResolvedAt: new Date() });
+      if (change === "legacy adapter") await db.update(agents).set({ adapterType: "codex_local" }).where(eq(agents.id, f.reviewer.id));
+      if (change === "paused reviewer") await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.reviewer.id));
+      if (change === "execution owner") await db.update(issues).set({ executionRunId: null }).where(eq(issues.id, f.issue.id));
+      if (change === "foreign native identity") {
+        // Native/canonical task disagreement is rejected even before admission.
+        await expect(runChange({ nativeIssueId: randomUUID() })).rejects.toMatchObject({
+          cause: { message: expect.stringContaining("native run task binding disagrees") },
+        });
+        return;
+      }
+      if (change === "terminal run") await runChange({ status: "cancelled", finishedAt: new Date() });
+      const { assertScopedRunAdmission } = await import("../services/scoped-review-admission.js");
+      await expect(assertScopedRunAdmission(db, { companyId: f.company.id, issueId: f.issue.id,
+        runId: admissionRunId })).rejects.toThrow();
+      expect((await f.ledger()).admissions).toHaveLength(1);
+    });
+
   it("scoped controller admission rejects a new Builder during review and accepts only exact Reviewer run context",async()=>{
     const f=await reviewingDraftFixture(); const {assertScopedRunAdmission}=await import("../services/scoped-review-admission.js");
     await expect(assertScopedRunAdmission(db,{companyId:f.company.id,issueId:f.issue.id,runId:f.reviewerRun.id})).resolves.toBeUndefined();
