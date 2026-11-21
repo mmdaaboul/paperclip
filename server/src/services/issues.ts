@@ -12401,7 +12401,12 @@ export function issueService(db: Db) {
         await notifyDeferredExecutionEligibility(tx, { companyId: issueCompany.companyId });
         await notifyDeliveryWork(tx, DELIVERY_QUEUES.agentTimers);
         await notifyRoutineExecutionStatus(tx, id);
-        return tx
+        // Capture the locked preimage for the optional scoped-return receipt.
+        // The adoption paths below deliberately cannot attest this transition.
+        const [checkoutBefore] = checkoutRunId ? await tx.select({ status: issues.status, statusVersion: issues.statusVersion })
+          .from(issues).where(and(eq(issues.id, id), eq(issues.companyId, issueCompany.companyId),
+            sql`coalesce(${issues.executionPolicy}->>'totalReviewCycles', '') = '5'`)).for("update") : [];
+        const checkedOut = await tx
           .update(issues)
           .set({
             assigneeAgentId: agentId,
@@ -12431,6 +12436,13 @@ export function issueService(db: Db) {
           )
           .returning()
           .then((rows) => rows[0] ?? null);
+        if (checkedOut && checkoutBefore && checkoutRunId) {
+          const { recordScopedReturnCheckout } = await import("./scoped-review-admission.js");
+          await recordScopedReturnCheckout(tx as unknown as Db, { companyId: issueCompany.companyId, issueId: id,
+            runId: checkoutRunId, agentId, beforeStatus: checkoutBefore.status, beforeStatusVersion: checkoutBefore.statusVersion,
+            afterStatusVersion: checkedOut.statusVersion });
+        }
+        return checkedOut;
       });
 
       if (updated) {

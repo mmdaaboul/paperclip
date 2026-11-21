@@ -13,17 +13,19 @@ import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { activityLog, agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns,
-  issueExecutionDecisions, issueReviewCycleBudgets, issues, completionContracts, nativeRunResults, nativeRunFinalizations, workAssessments, statusDecisions, statusDecisionEffects, agentWakeupRequests, issueRecoveryActions, projects, projectWorkspaces, executionWorkspaces, documents, documentRevisions, issueDocuments, issueScopedReviews, issueThreadInteractions } from "@paperclipai/db";
+  issueExecutionDecisions, issueReviewCycleBudgets, issues, completionContracts, nativeRunResults, nativeRunFinalizations, workAssessments, statusDecisions, statusDecisionEffects, agentWakeupRequests, issueRecoveryActions, projects, projectWorkspaces, executionWorkspaces, documents, documentRevisions, issueDocuments, issueScopedReviews, issueThreadInteractions, environmentLeases, heartbeatRunEvents, toolInvocations } from "@paperclipai/db";
 
 // Provider dispatch and executor-stop confirmation are stubbed; native authorization,
 // run rows, task state, ledger, decisions and audit use the real migrated database.
-const executionFixture = vi.hoisted(() => ({ rejectStop:false,suppressStopProof:false,loseStopReply:false,realWake:false }));
+const executionFixture = vi.hoisted(() => ({ rejectStop:false,suppressStopProof:false,loseStopReply:false,realWake:false,holdTaskRetryNudge:false }));
 vi.mock("../services/issue-assignment-wakeup.js", () => ({ queueIssueAssignmentWakeup: vi.fn() }));
 vi.mock("../services/heartbeat.js", async (loadActual) => {
   const actual = await loadActual<typeof import("../services/heartbeat.js")>();
   return { ...actual, heartbeatService: (...args: Parameters<typeof actual.heartbeatService>) => {
     const service = actual.heartbeatService(...args);
-    return { ...service, wakeup: vi.fn(async (...wakeArgs: Parameters<typeof service.wakeup>) =>
+    return { ...service, resumeTaskRetry: vi.fn(async (...retryArgs: Parameters<typeof service.resumeTaskRetry>) => {
+      if (!executionFixture.holdTaskRetryNudge) return service.resumeTaskRetry(...retryArgs);
+    }), wakeup: vi.fn(async (...wakeArgs: Parameters<typeof service.wakeup>) =>
       executionFixture.realWake ? service.wakeup(...wakeArgs) : null), cancelRun: vi.fn(async (runId: string, _reason: unknown, options: any) => {
       if (executionFixture.rejectStop) throw new Error("Unconfirmed executor stop in budget fixture");
       const database=args[0];
@@ -227,6 +229,88 @@ async function qualifyProtectedReview(f:Awaited<ReturnType<typeof stageFixture>>
     if(previousHome===undefined)delete process.env.PAPERCLIP_HOME;else process.env.PAPERCLIP_HOME=previousHome;
     throw error;
   }
+}
+
+// Real scoped resolution, durable outbox dispatch, transactional claim and
+// checkout/DB trigger. Queued-run construction and native preparation output
+// are controlled fixture seams; no provider executor is called.
+async function claimedScopedReturnFixture(outcome: "passed" | "changes_requested" = "passed") {
+  const f = await reviewingDraftFixture();
+  ok(await request(f.reviewerApp).post(`/api/issues/${f.issue.id}/interactions/${f.scope.interactionId}/${outcome === "passed" ? "accept" : "reject"}`)
+    .send(outcome === "passed" ? {} : { reason: "One concrete synthetic clarification remains" }));
+  const [scope] = await db.select().from(issueScopedReviews).where(eq(issueScopedReviews.id, f.scope.id));
+  await db.update(agentWakeupRequests).set({ status: "completed", runId: f.reviewerRun.id })
+    .where(and(eq(agentWakeupRequests.companyId, f.company.id), eq(agentWakeupRequests.agentId, f.reviewer.id)));
+  const { heartbeatService } = await import("../services/heartbeat.js");
+  await heartbeatService(db).dispatchPendingNativeStatusWakeups({ companyId: f.company.id, requestId: scope.returnWakeupId! });
+  const [delivery] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.requestedByActorId, `native-status-wake-dispatch:${scope.returnWakeupId}`));
+  expect(delivery).toMatchObject({ status: "deferred_issue_execution", agentId: f.builder.id });
+  // Model provider/finalization settlement and queue creation only. The real
+  // claim below must acquire its own run/wake/task locks and ownership.
+  await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.reviewerRun.id));
+  await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId));
+  await db.update(nativeRunFinalizations).set({ phase: "committed" }).where(eq(nativeRunFinalizations.runId, f.runId));
+  await db.update(issues).set({ executionRunId: null, checkoutRunId: null }).where(eq(issues.id, f.issue.id));
+  const [queued] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.builder.id,
+    issueId: f.issue.id, scopeKind: "issue", status: "queued", invocationSource: "automation", triggerDetail: "system",
+    responsibleUserId: f.userId, wakeupRequestId: delivery.id, contextSnapshot: (delivery.payload as any)._paperclipWakeContext }).returning();
+  await db.update(agentWakeupRequests).set({ status: "queued", runId: queued.id }).where(eq(agentWakeupRequests.id, delivery.id));
+  const { createHeartbeatQueueTestDependencies } = await import("./helpers/heartbeat-queue.js");
+  const { createHeartbeatQueue } = await import("../services/heartbeat/queue.js");
+  const { createHeartbeatRunState } = await import("../services/heartbeat/run-state.js");
+  const { createHeartbeatRunPreparation } = await import("../services/heartbeat/run-preparation.js");
+  const { createHeartbeatLifecycle } = await import("../services/heartbeat/run-lifecycle.js");
+  const { issueService } = await import("../services/issues.js");
+  const deps = createHeartbeatQueueTestDependencies(db), service = issueService(db);
+  deps.getAgent.mockImplementation(async id => (await db.select().from(agents).where(eq(agents.id, id)))[0] ?? null);
+  type Lifecycle = Parameters<typeof createHeartbeatLifecycle>[1];
+  const lifecycle = createHeartbeatLifecycle(db, { ...createHeartbeatRunState(db), ...createHeartbeatRunPreparation(db),
+    issuesSvc: { addComment: vi.fn<Lifecycle["issuesSvc"]["addComment"]>(), listReviewAttention: vi.fn<Lifecycle["issuesSvc"]["listReviewAttention"]>() },
+    recovery: { escalateStrandedAssignedIssue: vi.fn<Lifecycle["recovery"]["escalateStrandedAssignedIssue"]>() },
+    companySkills: { completeTestRunForIssue: vi.fn<Lifecycle["companySkills"]["completeTestRunForIssue"]>() },
+    budgets: { getInvocationBlock: vi.fn(async () => null) }, treeControlSvc: { getActivePauseHoldGate: vi.fn(async () => null) },
+    enqueueWakeup: vi.fn<Lifecycle["enqueueWakeup"]>(), getCurrentUserRedactionOptions: vi.fn(async () => ({})),
+    getAgentInvokability: vi.fn<Lifecycle["getAgentInvokability"]>(async () => ({ invokable: true })),
+    emitTerminalAgentTaskRun: vi.fn<Lifecycle["emitTerminalAgentTaskRun"]>(), budgetHooks: {} });
+  deps.setWakeupStatus.mockImplementation(lifecycle.setWakeupStatus);
+  deps.issuesSvc.getDependencyReadiness.mockImplementation(service.getDependencyReadiness);
+  deps.issuesSvc.listDependencyReadiness.mockImplementation(service.listDependencyReadiness);
+  deps.executeRun.mockImplementation(async () => { throw new Error("Provider execution is outside this fixture"); });
+  const claimed = await createHeartbeatQueue(db, deps).claimQueuedRun(queued);
+  expect(claimed).toMatchObject({ id: queued.id, status: "running" });
+  expect(deps.executeRun).not.toHaveBeenCalled();
+  expect(await f.read()).toMatchObject({ status: "todo", statusVersion: scope.returnStatusVersion, executionRunId: queued.id });
+  return { ...f, scope, delivery, claimed: claimed!, service, deps };
+}
+
+// Persist the exact fully-native/no-claim failure shape. Actual checkout has
+// already advanced one version; its ordinary failure projection advances one
+// more. No stop event or owner attestation is fabricated.
+async function failedScopedReturnFixture() {
+  const f = await claimedScopedReturnFixture();
+  await f.service.checkout(f.issue.id, f.builder.id, ["todo"], f.claimed.id);
+  const execution = structuredClone(f.execution); execution.binding.runId = f.claimed.id;
+  const [failed] = await db.update(heartbeatRuns).set({ status: "failed", runtimeMode: "native", nativeIssueId: f.issue.id,
+    runtimeModeResolvedAt: new Date(), nativeSessionId: randomUUID(), runnerInstanceId: randomUUID(), finishedAt: new Date(),
+    controllerBootId: null, controllerLeaseExpiresAt: null, executionStage: null,
+    errorCode: "adapter_failed", error: "The scoped return target or native receipt is no longer current",
+    contextSnapshot: { ...f.claimed.contextSnapshot, taskId: f.issue.id, nativeStatusWakeIntentId: f.scope.returnWakeupId },
+    runnerProfileJson: { nativeExecutionInput: execution }, resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } })
+    .where(eq(heartbeatRuns.id, f.claimed.id)).returning();
+  await db.update(agentWakeupRequests).set({ status: "failed", finishedAt: new Date() }).where(eq(agentWakeupRequests.id, f.delivery.id));
+  const [owner] = await db.insert(nativeRunFinalizations).values({ companyId: f.company.id, issueId: f.issue.id, runId: failed.id,
+    phase: "terminal_failure", attempt: 0, failureCode: "native_continuation_requires_reconciliation" }).returning();
+  const [lease] = await db.insert(environmentLeases).values({ companyId: f.company.id, issueId: f.issue.id,
+    executionWorkspaceId: f.workspace.id, heartbeatRunId: failed.id, provider: "local", status: "failed", releasedAt: new Date() }).returning();
+  const [blocked] = await db.update(issues).set({ status: "blocked", executionRunId: null, checkoutRunId: null }).where(eq(issues.id, f.issue.id)).returning();
+  expect(blocked.statusVersion).toBe(f.scope.returnStatusVersion! + 2);
+  const [failure] = await db.insert(issueRecoveryActions).values({ companyId: f.company.id, sourceIssueId: f.issue.id,
+    kind: "active_run_watchdog", cause: "native_continuation_requires_reconciliation", fingerprint: failed.id, ownerType: "board",
+    status: "resolved", outcome: "blocked", nextAction: "Inspect retained failure; only explicit new user input may continue.", resolvedAt: new Date(),
+    returnOwnerAgentId: f.builder.id, evidence: { runId: failed.id, originalFailureCode: "adapter_failed",
+      automaticRecovery: { runId: failed.id, policy: "preserve_without_replay_v1", replay: "blocked", actionOutcome: "unknown" },
+      nativeFailureBlock: { runId: failed.id, statusVersion: blocked.statusVersion } } }).returning();
+  return { ...f, failed, execution, owner, lease, failure, blocked };
 }
 
 const patch = (app: express.Express, id: string, body: object) => request(app).patch(`/api/issues/${id}`).send(body);
@@ -536,6 +620,141 @@ describe("actual normal PATCH + native postgres-js + native issue service (injec
     await expect(assertScopedRunAdmission(db,{companyId:f.company.id,issueId:f.issue.id,runId:f.reviewerRun.id})).rejects.toThrow("workspace or configured workflow changed");
     expect((await f.ledger()).admissions).toHaveLength(1);
   });
+  it.each(["passed", "changes_requested"] as const)("scoped return survives real native dispatch claim and checkout before the repeated production runtime gate: %s", async outcome => {
+    const f = await claimedScopedReturnFixture(outcome);
+    const { assertScopedRunAdmission } = await import("../services/scoped-review-admission.js");
+    const identity = { companyId: f.company.id, issueId: f.issue.id, runId: f.claimed.id };
+    await expect(assertScopedRunAdmission(db, identity)).resolves.toBeUndefined();
+    const checkout = await f.service.checkout(f.issue.id, f.builder.id, ["todo"], f.claimed.id);
+    expect(checkout).toMatchObject({ status: "in_progress", statusVersion: f.scope.returnStatusVersion! + 1,
+      checkoutRunId: f.claimed.id, executionRunId: f.claimed.id });
+    // Native preparation's identity output is the only remaining fixture seam.
+    const [prepared] = await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: f.issue.id, runtimeModeResolvedAt: new Date() })
+      .where(eq(heartbeatRuns.id, f.claimed.id)).returning();
+    const { executeHeartbeatRuntime } = await import("../services/heartbeat/runtime-execution.js");
+    const sentinel = new Error("scoped-return-passed-production-gate-before-any-provider");
+    let reachedRuntime = 0;
+    const input = { run: prepared, agent: f.builder, options: {}, task: { issueId: f.issue.id }, services: {},
+      get runtime() { reachedRuntime++; throw sentinel; } } as unknown as Parameters<typeof executeHeartbeatRuntime>[1];
+    await expect(executeHeartbeatRuntime(db, input)).rejects.toBe(sentinel);
+    expect(reachedRuntime).toBe(1);
+    expect(f.deps.executeRun.mock.calls.length).toBeLessThanOrEqual(1);
+    expect((await db.select().from(issueScopedReviews).where(eq(issueScopedReviews.id, f.scope.id)))[0].returnStatusVersion).toBe(f.scope.returnStatusVersion);
+    expect((await f.ledger()).admissions).toHaveLength(1);
+  });
+
+  it.each(["manual in_progress", "manual transition then adoption", "foreign checkout", "missing checkout", "foreign execution", "unresolved run",
+    "extra version", "foreign receipt owner", "receipt linked elsewhere", "artifact drift", "workspace drift", "policy drift"] as const)(
+    "scoped return owned checkout rejects %s before runtime", async change => {
+    const f = await claimedScopedReturnFixture();
+    if (change === "manual in_progress" || change === "manual transition then adoption") {
+      await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.issue.id));
+      if (change === "manual transition then adoption") await f.service.checkout(f.issue.id, f.builder.id, ["todo"], f.claimed.id);
+    } else await f.service.checkout(f.issue.id, f.builder.id, ["todo"], f.claimed.id);
+    if (change !== "unresolved run") await db.update(heartbeatRuns).set({ runtimeMode: "native", nativeIssueId: f.issue.id, runtimeModeResolvedAt: new Date() })
+      .where(eq(heartbeatRuns.id, f.claimed.id));
+    if (change === "foreign checkout") await db.update(issues).set({ checkoutRunId: f.reviewerRun.id }).where(eq(issues.id, f.issue.id));
+    if (change === "missing checkout") await db.update(issues).set({ checkoutRunId: null }).where(eq(issues.id, f.issue.id));
+    if (change === "foreign execution") await db.update(issues).set({ executionRunId: f.reviewerRun.id }).where(eq(issues.id, f.issue.id));
+    if (change === "extra version") await db.update(issues).set({ statusVersion: sql`${issues.statusVersion}+1` }).where(eq(issues.id, f.issue.id));
+    if (change === "foreign receipt owner") await db.update(agentWakeupRequests).set({ requestedByActorId: "not-the-native-return-dispatcher" }).where(eq(agentWakeupRequests.id, f.delivery.id));
+    if (change === "receipt linked elsewhere") await db.update(agentWakeupRequests).set({ runId: f.runId }).where(eq(agentWakeupRequests.id, f.delivery.id));
+    if (change === "artifact drift") await db.update(documentRevisions).set({ body: "A different unreviewed artifact" }).where(eq(documentRevisions.id, f.revision.id));
+    if (change === "workspace drift") await db.update(issues).set({ workspaceBindingRevision: sql`${issues.workspaceBindingRevision}+1` }).where(eq(issues.id, f.issue.id));
+    if (change === "policy drift") { const policy = structuredClone(f.issue.executionPolicy) as any; policy.stages[0].id = randomUUID();
+      await db.update(issues).set({ executionPolicy: policy }).where(eq(issues.id, f.issue.id)); }
+    const { assertScopedRunAdmission } = await import("../services/scoped-review-admission.js");
+    await expect(assertScopedRunAdmission(db, { companyId: f.company.id, issueId: f.issue.id, runId: f.claimed.id })).rejects.toThrow();
+    expect(f.deps.executeRun).not.toHaveBeenCalled();
+    expect((await f.ledger()).admissions).toHaveLength(1);
+  });
+
+  it("unclaimed scoped return proves no launch without inventing a stop receipt or legacy classification", async () => {
+    const f = await failedScopedReturnFixture();
+    const { isUnclaimedScopedReturnPreparation } = await import("../services/scoped-review-admission.js");
+    const { isFailedNativePreparation } = await import("../services/cancelled-native-startup.js");
+    expect(await isFailedNativePreparation(db, f.failed, f.owner)).toBe(false);
+    expect(await isUnclaimedScopedReturnPreparation(db, { companyId: f.company.id, issueId: f.issue.id, runId: f.failed.id })).toBe(true);
+    expect(await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.failed.id))).toHaveLength(0);
+    expect(await f.read()).toMatchObject({ status: "blocked", statusVersion: f.blocked.statusVersion });
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.delivery.id)))[0].status).toBe("failed");
+  });
+
+  it("unclaimed scoped return real TaskRetry and queue preserve one new user successor across a lost response", async () => {
+    const f = await failedScopedReturnFixture();
+    // Occupied company-level fixture slot prevents actual worker/provider
+    // dispatch; it is not a run bound to this task or a fake stop receipt.
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { enabled: false, maxConcurrentRuns: 1 } } }).where(eq(agents.id, f.builder.id));
+    await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId: f.builder.id, status: "running", startedAt: new Date() });
+    const body = { idempotencyKey: randomUUID(), observedRunId: f.failed.id };
+    // Model a committed receipt whose response/nudge was lost. Deliver its
+    // exact durable generation once, after both HTTP transactions settle.
+    executionFixture.holdTaskRetryNudge = true;
+    try {
+    const response = await request(f.board).post(`/api/issues/${f.issue.id}/retry`).send(body);
+    expect(response.status, JSON.stringify(response.body)).toBe(202);
+    expect(response.body.accepted).toBe(true);
+    const requestId = response.body.requestId;
+    const repeated = await request(f.board).post(`/api/issues/${f.issue.id}/retry`).send(body);
+    expect([200, 202]).toContain(repeated.status);
+    expect(repeated.body.requestId).toBe(requestId);
+    const actual = await vi.importActual<typeof import("../services/heartbeat.js")>("../services/heartbeat.js");
+    await actual.heartbeatService(db).resumeTaskRetry(f.company.id, requestId);
+    let successors: Array<typeof heartbeatRuns.$inferSelect> = [];
+    for (let n = 0; n < 30; n++) {
+      successors = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.company.id), sql`${heartbeatRuns.contextSnapshot}->>'taskRetryRequestId' = ${requestId}`));
+      if (successors.length) break;
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    expect(successors).toHaveLength(1);
+    expect(successors[0]).toMatchObject({ agentId: f.builder.id, status: "queued", contextSnapshot: {
+      issueId: f.issue.id, previousRunId: f.failed.id, forceFreshSession: true, taskRetryRequestId: requestId } });
+    expect(successors[0].contextSnapshot?.scopedReviewId).toBeUndefined();
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.failed.id)))[0]).toMatchObject({ status: "failed", errorCode: "adapter_failed" });
+    expect((await db.select().from(issueScopedReviews).where(eq(issueScopedReviews.id, f.scope.id)))[0]).toMatchObject({ state: "passed", returnStatusVersion: f.scope.returnStatusVersion });
+    expect((await f.ledger()).admissions).toHaveLength(1);
+    } finally { executionFixture.holdTaskRetryNudge = false; }
+  });
+
+  it.each(["claimed", "controller", "lease holder", "process", "provider started", "launch event", "provider event", "tool event",
+    "source event", "stop event", "tool invocation", "unreleased lease", "remote lease", "provider lease", "cleanup failed", "cleanup in flight",
+    "invalid scope", "foreign dispatcher", "failure version", "extra task version", "foreign execution", "artifact", "native binding", "reference binding"] as const)(
+    "unclaimed scoped return refuses contradictory %s evidence without mutation", async change => {
+    const f = await failedScopedReturnFixture();
+    if (change === "claimed") await db.update(nativeRunFinalizations).set({ attempt: 1 }).where(eq(nativeRunFinalizations.runId, f.failed.id));
+    if (change === "controller") await db.update(nativeRunFinalizations).set({ controllerPid: process.pid }).where(eq(nativeRunFinalizations.runId, f.failed.id));
+    if (change === "lease holder") await db.update(nativeRunFinalizations).set({ leaseOwner: "another-controller" }).where(eq(nativeRunFinalizations.runId, f.failed.id));
+    if (change === "process") await db.update(heartbeatRuns).set({ processPid: process.pid }).where(eq(heartbeatRuns.id, f.failed.id));
+    if (change === "provider started") await db.update(heartbeatRuns).set({ resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: true } } }).where(eq(heartbeatRuns.id, f.failed.id));
+    const eventTypes: Record<string, string> = { "launch event": "native.process_start_requested", "provider event": "turn.started", "tool event": "tool.execution.started", "source event": "otherwise-unknown", "stop event": "native.local_process_stopped" };
+    if (eventTypes[change]) await db.insert(heartbeatRunEvents).values({ companyId: f.company.id, runId: f.failed.id, agentId: f.builder.id,
+      seq: 1, eventType: eventTypes[change], stream: "system", sourceEventId: change === "source event" ? randomUUID() : null });
+    if (change === "tool invocation") await db.insert(toolInvocations).values({ companyId: f.company.id, agentId: f.builder.id,
+      issueId: f.issue.id, runId: f.failed.id, toolName: "synthetic-no-launch-contradiction", status: "succeeded" });
+    if (change === "unreleased lease") await db.update(environmentLeases).set({ releasedAt: null }).where(eq(environmentLeases.id, f.lease.id));
+    if (change === "remote lease") await db.update(environmentLeases).set({ provider: "ssh" }).where(eq(environmentLeases.id, f.lease.id));
+    if (change === "provider lease") await db.update(environmentLeases).set({ providerLeaseId: "unexpected-resource" }).where(eq(environmentLeases.id, f.lease.id));
+    if (change === "cleanup failed") await db.update(environmentLeases).set({ cleanupStatus: "failed" }).where(eq(environmentLeases.id, f.lease.id));
+    if (change === "cleanup in flight") await db.update(environmentLeases).set({ metadata: { pendingCleanupInFlight: true } }).where(eq(environmentLeases.id, f.lease.id));
+    if (change === "invalid scope") await db.update(heartbeatRuns).set({ contextSnapshot: { ...f.failed.contextSnapshot, scopedReviewId: "not-a-uuid" } }).where(eq(heartbeatRuns.id, f.failed.id));
+    if (change === "foreign dispatcher") await db.update(agentWakeupRequests).set({ requestedByActorType: "user" }).where(eq(agentWakeupRequests.id, f.delivery.id));
+    if (change === "failure version") await db.update(issueRecoveryActions).set({ evidence: { ...f.failure.evidence,
+      nativeFailureBlock: { runId: f.failed.id, statusVersion: f.blocked.statusVersion + 1 } } }).where(eq(issueRecoveryActions.id, f.failure.id));
+    if (change === "extra task version") await db.update(issues).set({ statusVersion: sql`${issues.statusVersion}+1` }).where(eq(issues.id, f.issue.id));
+    if (change === "foreign execution") await db.update(issues).set({ executionRunId: f.reviewerRun.id }).where(eq(issues.id, f.issue.id));
+    if (change === "artifact") await db.update(documentRevisions).set({ body: "Different unreviewed artifact" }).where(eq(documentRevisions.id, f.revision.id));
+    if (change === "native binding") { const execution = structuredClone(f.execution); execution.binding.runId = f.runId;
+      await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeExecutionInput: execution } }).where(eq(heartbeatRuns.id, f.failed.id)); }
+    if (change === "reference binding") await db.update(heartbeatRuns).set({ runnerProfileJson: { nativeExecutionInput: f.execution,
+      referenceFolderAdmission: { schema: "paperclip.reference-folder-admission.v1", binding: { companyId: f.company.id,
+        agentId: f.builder.id, runId: f.failed.id, projectId: f.workspace.projectId, workspaceId: randomUUID() },
+        workspaceDirectory: f.workspace.cwd!, revision: 1, paths: [] } } }).where(eq(heartbeatRuns.id, f.failed.id));
+    const before = await f.read();
+    const { isUnclaimedScopedReturnPreparation } = await import("../services/scoped-review-admission.js");
+    expect(await isUnclaimedScopedReturnPreparation(db, { companyId: f.company.id, issueId: f.issue.id, runId: f.failed.id })).toBe(false);
+    expect(await f.read()).toEqual(before);
+  });
+
   it("scoped return admission checks durable receipt, settlement, task version and exact artifact before workspace startup",async()=>{
     const f=await reviewingDraftFixture();ok(await request(f.reviewerApp).post(`/api/issues/${f.issue.id}/interactions/${f.scope.interactionId}/accept`).send({}));
     const [scope]=await db.select().from(issueScopedReviews).where(eq(issueScopedReviews.id,f.scope.id));
