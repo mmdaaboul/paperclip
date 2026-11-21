@@ -156,9 +156,12 @@ export async function isUnclaimedScopedReturnPreparation(db: Db, input: {
   const [owner] = await db.select().from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId, input.companyId), eq(nativeRunFinalizations.runId, run.id)));
   if (!owner || owner.issueId !== input.issueId || owner.phase !== "terminal_failure" || owner.attempt !== 0
     || owner.failureCode !== "native_continuation_requires_reconciliation" || owner.controllerGeneration !== 0
+    // Native wake release marks this unclaimed terminal failure "blocked";
+    // that settled marker is not an active recovery owner or scheduled retry.
+    || owner.recoveryState != null && owner.recoveryState !== "blocked"
     || owner.recoveryHistory.length || [owner.leaseOwner, owner.leaseHolder, owner.leaseExpiresAt, owner.controllerPid,
       owner.controllerBootId, owner.controllerHostHash, owner.controllerProcessStartedAt, owner.resultId, owner.assessmentId,
-      owner.decisionId, owner.controlDeadlineAt, owner.nextAttemptAt, owner.recoveryState, owner.recoveryRequestId,
+      owner.decisionId, owner.controlDeadlineAt, owner.nextAttemptAt, owner.recoveryRequestId,
       owner.failureDetail].some(value => value != null)) return false;
   const parsedScopeId = typeof run.contextSnapshot.scopedReviewId === "string" ? run.contextSnapshot.scopedReviewId : null;
   if (!parsedScopeId || !isUuidLike(parsedScopeId)) return false;

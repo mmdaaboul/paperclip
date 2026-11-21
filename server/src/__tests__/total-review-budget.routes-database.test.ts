@@ -283,9 +283,9 @@ async function claimedScopedReturnFixture(outcome: "passed" | "changes_requested
   return { ...f, scope, delivery, claimed: claimed!, service, deps };
 }
 
-// Persist the exact fully-native/no-claim failure shape. Actual checkout has
-// already advanced one version; its ordinary failure projection advances one
-// more. No stop event or owner attestation is fabricated.
+// Keep the controlled no-provider preparation seam, then execute the REAL
+// native release adapter to clear bindings, project blocked/v+1 and record its
+// terminal coordinator/recovery marker. Do not manually manufacture that shape.
 async function failedScopedReturnFixture() {
   const f = await claimedScopedReturnFixture();
   await f.service.checkout(f.issue.id, f.builder.id, ["todo"], f.claimed.id);
@@ -298,18 +298,28 @@ async function failedScopedReturnFixture() {
     runnerProfileJson: { nativeExecutionInput: execution }, resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } } })
     .where(eq(heartbeatRuns.id, f.claimed.id)).returning();
   await db.update(agentWakeupRequests).set({ status: "failed", finishedAt: new Date() }).where(eq(agentWakeupRequests.id, f.delivery.id));
-  const [owner] = await db.insert(nativeRunFinalizations).values({ companyId: f.company.id, issueId: f.issue.id, runId: failed.id,
-    phase: "terminal_failure", attempt: 0, failureCode: "native_continuation_requires_reconciliation" }).returning();
+  await db.insert(nativeRunFinalizations).values({ companyId: f.company.id, issueId: f.issue.id, runId: failed.id,
+    phase: "observed", attempt: 0 });
   const [lease] = await db.insert(environmentLeases).values({ companyId: f.company.id, issueId: f.issue.id,
     executionWorkspaceId: f.workspace.id, heartbeatRunId: failed.id, provider: "local", status: "failed", releasedAt: new Date() }).returning();
-  const [blocked] = await db.update(issues).set({ status: "blocked", executionRunId: null, checkoutRunId: null }).where(eq(issues.id, f.issue.id)).returning();
+  const { createReleaseIssueExecution } = await import("../modules/wake-queue/application/use-cases.js");
+  const { createPostgresWakeQueueAdapter } = await import("../modules/wake-queue/adapters/postgres.js");
+  const unexpected = vi.fn(async () => { throw new Error("Unexpected release callback: native terminal projection must not dispatch or recover"); });
+  const release = createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, {
+    resolveResponsibleUserId: unexpected, getRoutineEnv: unexpected, resolveSessionBeforeForWakeup: unexpected,
+  }), recovery: { escalateStrandedAssignedIssue: unexpected, escalateStrandedRecoveryIssueInPlace: unexpected } });
+  const released = await release({ companyId: f.company.id, runId: failed.id, now: new Date(), suppressImmediateRecovery: true });
+  expect(released.outcome.kind).toBe("released");
+  expect(unexpected).not.toHaveBeenCalled();
+  const [owner] = await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, failed.id));
+  expect(owner).toMatchObject({ phase: "terminal_failure", attempt: 0, controllerGeneration: 0,
+    recoveryState: "blocked", failureCode: "native_continuation_requires_reconciliation", leaseOwner: null });
+  const blocked = await f.read();
+  expect(blocked).toMatchObject({ status: "blocked", executionRunId: null, checkoutRunId: null });
   expect(blocked.statusVersion).toBe(f.scope.returnStatusVersion! + 2);
-  const [failure] = await db.insert(issueRecoveryActions).values({ companyId: f.company.id, sourceIssueId: f.issue.id,
-    kind: "active_run_watchdog", cause: "native_continuation_requires_reconciliation", fingerprint: failed.id, ownerType: "board",
-    status: "resolved", outcome: "blocked", nextAction: "Inspect retained failure; only explicit new user input may continue.", resolvedAt: new Date(),
-    returnOwnerAgentId: f.builder.id, evidence: { runId: failed.id, originalFailureCode: "adapter_failed",
-      automaticRecovery: { runId: failed.id, policy: "preserve_without_replay_v1", replay: "blocked", actionOutcome: "unknown" },
-      nativeFailureBlock: { runId: failed.id, statusVersion: blocked.statusVersion } } }).returning();
+  const [failure] = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, f.company.id),
+    eq(issueRecoveryActions.sourceIssueId, f.issue.id), eq(issueRecoveryActions.cause, "native_continuation_requires_reconciliation")));
+  expect(failure.evidence.nativeFailureBlock).toEqual({ runId: failed.id, statusVersion: blocked.statusVersion });
   return { ...f, failed, execution, owner, lease, failure, blocked };
 }
 
@@ -680,6 +690,13 @@ describe("actual normal PATCH + native postgres-js + native issue service (injec
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.delivery.id)))[0].status).toBe("failed");
   });
 
+  it("unclaimed scoped return retains the earlier null recovery marker with all native proof guards", async () => {
+    const f = await failedScopedReturnFixture();
+    await db.update(nativeRunFinalizations).set({ recoveryState: null }).where(eq(nativeRunFinalizations.runId, f.failed.id));
+    const { isUnclaimedScopedReturnPreparation } = await import("../services/scoped-review-admission.js");
+    expect(await isUnclaimedScopedReturnPreparation(db, { companyId: f.company.id, issueId: f.issue.id, runId: f.failed.id })).toBe(true);
+  });
+
   it("unclaimed scoped return real TaskRetry and queue preserve one new user successor across a lost response", async () => {
     const f = await failedScopedReturnFixture();
     // Occupied company-level fixture slot prevents actual worker/provider
@@ -718,9 +735,15 @@ describe("actual normal PATCH + native postgres-js + native issue service (injec
 
   it.each(["claimed", "controller", "lease holder", "process", "provider started", "launch event", "provider event", "tool event",
     "source event", "stop event", "tool invocation", "unreleased lease", "remote lease", "provider lease", "cleanup failed", "cleanup in flight",
-    "invalid scope", "foreign dispatcher", "failure version", "extra task version", "foreign execution", "artifact", "native binding", "reference binding"] as const)(
+    "invalid scope", "foreign dispatcher", "failure version", "extra task version", "foreign execution", "artifact", "native binding", "reference binding",
+    "active recovery state", "awaiting evidence", "runner reattach", "unknown recovery state", "recovery request", "recovery history"] as const)(
     "unclaimed scoped return refuses contradictory %s evidence without mutation", async change => {
     const f = await failedScopedReturnFixture();
+    const activeRecoveryStates: Record<string, string> = { "active recovery state": "resuming_session", "awaiting evidence": "awaiting_evidence",
+      "runner reattach": "awaiting_runner_reattach", "unknown recovery state": "unknown-recovery-owner" };
+    if (activeRecoveryStates[change]) await db.update(nativeRunFinalizations).set({ recoveryState: activeRecoveryStates[change] }).where(eq(nativeRunFinalizations.runId, f.failed.id));
+    if (change === "recovery request") await db.update(nativeRunFinalizations).set({ recoveryRequestId: randomUUID() }).where(eq(nativeRunFinalizations.runId, f.failed.id));
+    if (change === "recovery history") await db.update(nativeRunFinalizations).set({ recoveryHistory: [{ syntheticContradiction: true }] }).where(eq(nativeRunFinalizations.runId, f.failed.id));
     if (change === "claimed") await db.update(nativeRunFinalizations).set({ attempt: 1 }).where(eq(nativeRunFinalizations.runId, f.failed.id));
     if (change === "controller") await db.update(nativeRunFinalizations).set({ controllerPid: process.pid }).where(eq(nativeRunFinalizations.runId, f.failed.id));
     if (change === "lease holder") await db.update(nativeRunFinalizations).set({ leaseOwner: "another-controller" }).where(eq(nativeRunFinalizations.runId, f.failed.id));
