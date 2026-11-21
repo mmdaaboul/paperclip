@@ -238,6 +238,11 @@
       "project": "root",
       "path": "server/src/services/native-runtime/native-safe-replacement-review-budget.test.ts",
       "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/services/native-runtime/native-attributed-git-admission.test.ts",
+      "selection": "whole-file"
     }
   ],
   "retries": 0,

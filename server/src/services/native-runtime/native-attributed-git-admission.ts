@@ -38,7 +38,8 @@ async function readLoadAdmittedNativeGitWorkspace(db: Db, execution: NativeExecu
       eq(executionWorkspaces.companyId, binding.companyId), eq(executionWorkspaces.projectId, saved.binding.projectId)))
     .where(and(eq(issues.id, binding.issueId), eq(issues.companyId, binding.companyId),
       eq(issues.projectId, saved.binding.projectId), eq(issues.assigneeAgentId, binding.agentId), eq(issues.executionRunId, binding.runId)));
-  if (!current || current.workspace.providerType !== "local_fs" || current.workspace.status !== "active" || current.workspace.closedAt
+  if (!current || (current.workspace.providerType !== "local_fs" && current.workspace.providerType !== "git_worktree")
+    || current.workspace.status !== "active" || current.workspace.closedAt
     || current.workspace.cwd !== execution.workspace.cwd || current.workspace.repoUrl !== execution.workspace.repoUrl) {
     throw new Error("native_git_current_workspace_authority_unavailable");
   }
