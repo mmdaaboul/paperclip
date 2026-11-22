@@ -42,7 +42,7 @@ import {
   type PrpEvent,
   type PrpStructuredRunResult,
 } from "./codex-app-server-driver.test-support.js";
-import { NativeSessionProtocolIntegrityError, nativeRestartInterruptedTurnId } from "../../contracts/native-session-backend.js";
+import { NativeProviderStateIncompatibleError, NativeSessionProtocolIntegrityError, nativeRestartInterruptedTurnId } from "../../contracts/native-session-backend.js";
 import { canonicalJson } from "./codex-driver-values.js";
 
 function cursorProviderIdentity(mode: unknown) {
@@ -307,6 +307,41 @@ describe("Codex app-server Codex driver", () => {
       ).toBe(false);
     },
   );
+
+  it.each([false, true])("typed local scoped recovery preserves permanent identity refusal (cleanup rejects: %s)", async cleanupRejects => {
+    const originalTransport = new FakeCodexTransport();
+    const recoveryTransport = new FakeCodexTransport();
+    const fault = new NativeProviderStateIncompatibleError("workspace_policy_saved_launch_changed");
+    const request = recoveryTransport.request.bind(recoveryTransport);
+    vi.spyOn(recoveryTransport, "request").mockImplementation(async (method, params) => {
+      if (method === "thread/read") throw fault;
+      return request(method, params);
+    });
+    const close = vi.spyOn(recoveryTransport, "close");
+    if (cleanupRejects) close.mockRejectedValue(new Error("secondary cleanup failure"));
+    const driver = makeDriver([originalTransport, recoveryTransport]);
+    const original = await driver.openSession({ runId: "cold-source", normalizedSessionId: "cold-session", workingDirectory: WORKSPACE });
+    const checkpoint = await original.snapshot();
+    await original.close({ reason: "fixture cold owner" });
+    await expect(driver.recoverSession({ ...checkpoint, providerRecoveryPolicy: "allow_replacement_after_resume_failure" })).rejects.toBe(fault);
+    expect(close).toHaveBeenCalledOnce();
+    expect(recoveryTransport.calls.some(call => call.method === "thread/start" || call.method === "turn/start")).toBe(false);
+  });
+
+  it("typed local scoped recovery does not classify an ordinary error by its message", async () => {
+    const originalTransport = new FakeCodexTransport();
+    const recoveryTransport = new FakeCodexTransport();
+    const request = recoveryTransport.request.bind(recoveryTransport);
+    vi.spyOn(recoveryTransport, "request").mockImplementation(async (method, params) => {
+      if (method === "thread/read") throw new Error("NativeProviderStateIncompatibleError: workspace_policy_saved_launch_changed");
+      return request(method, params);
+    });
+    const driver = makeDriver([originalTransport, recoveryTransport]);
+    const original = await driver.openSession({ runId: "plain-source", normalizedSessionId: "plain-session", workingDirectory: WORKSPACE });
+    const checkpoint = await original.snapshot();
+    await original.close({ reason: "fixture cold owner" });
+    expect(await driver.recoverSession(checkpoint)).toEqual({ recovered: false, reason: expect.stringContaining("workspace_policy_saved_launch_changed") });
+  });
 
   it.each(["completed", "interrupted", "failed", "cancelled"])(
     "adopts a checkpointed active turn that became %s while disconnected",

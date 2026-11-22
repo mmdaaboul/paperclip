@@ -7,6 +7,8 @@ import { getNativeStageReviewAssignment, readNativeStageReviewContext } from "./
 import { providerDrainStateFromSnapshot } from "../../vendor/paperclip-runner/index.js";
 import type { WorkspaceAccessSnapshot } from "../../vendor/paperclip-runner/index.js";
 import { proveReviewerRecordedOwnerStopped, reviewerRecordedProcessIds, type ReviewerProcessEvidence } from "./reviewer-policy-process-proof.js";
+import { readReviewerProcessEvidence } from "./reviewer-policy-process-proof.js";
+import { coldContinuationHold, hasChangedManagedNativeCopy, readCompletedNativeColdSource } from "./native-scoped-cold-continuation.js";
 import { resolveNativeWorkspacePolicy, resolveNativeWorkspacePolicyForClaimedStop } from "./workspace-policy-admission.js";
 import { prepareOptionalNativeReviewerDiscussion } from "./reviewer-github-native-actions.js";
 import { recordNativeReviewerProcessAdmission } from "./reviewer-runtime-admission.js";
@@ -1990,6 +1992,7 @@ class SessionAuthorityEpoch {
   #authority: PaperclipRunnerToolAuthority;
   #revoked = false;
   #accountingRevoked = false;
+  #inFlight = 0;
   readonly #drainingRun?: { runId: string; capture?: (event: PrpEvent) => Promise<void> };
 
   constructor(runId: string, authority: PaperclipRunnerToolAuthority, private readonly toolTrace?: NativeToolTrace,
@@ -2010,6 +2013,15 @@ class SessionAuthorityEpoch {
 
   async settle(){await this.#authority.settle();}
 
+  /** Historical epochs remain registered after their transport stops. Observe
+   * unfinished callbacks, rather than mistaking map presence for a live owner.
+   * This never joins a call to its own Stop/settlement path. */
+  get hasPendingWork(): boolean { return this.#inFlight !== 0; }
+  async #observe<T>(work: () => T | Promise<T>): Promise<T> {
+    this.#inFlight++;
+    try { return await work(); } finally { this.#inFlight--; }
+  }
+
   #assertAccountingCurrent():void{
     if(this.#accountingRevoked)throw new Error("native_tool_authority_epoch_revoked");
   }
@@ -2022,34 +2034,37 @@ class SessionAuthorityEpoch {
 
   async acceptAccountingEvent(event: PrpEvent) {
     if (!isNativeUsageAccountingEvent(event)) return;
-    this.#assertAccountingCurrent();
-    if (event.runId !== this.runId && event.runId !== this.#drainingRun?.runId) throw new Error("native_usage_run_binding_mismatch");
-    await (event.runId === this.runId ? this.onAccountingEvent : this.#drainingRun?.capture)?.(event);
-    this.#assertAccountingCurrent();
+    return this.#observe(async () => {
+      this.#assertAccountingCurrent();
+      if (event.runId !== this.runId && event.runId !== this.#drainingRun?.runId) throw new Error("native_usage_run_binding_mismatch");
+      await (event.runId === this.runId ? this.onAccountingEvent : this.#drainingRun?.capture)?.(event);
+      this.#assertAccountingCurrent();
+    });
   }
 
   async acceptRecoveryAccountingEvent(event: PrpEvent, capture: () => Promise<void>) {
     if (!isNativeUsageAccountingEvent(event)) return;
-    this.#assertAccountingCurrent();
-    if (event.runId === this.runId) throw new Error("native_recovery_usage_source_unproven");
-    if (event.runId === this.#drainingRun?.runId) {
-      await this.acceptAccountingEvent(event);
-      return;
-    }
-    await capture();
-    this.#assertAccountingCurrent();
+    return this.#observe(async () => {
+      this.#assertAccountingCurrent();
+      if (event.runId === this.runId) throw new Error("native_recovery_usage_source_unproven");
+      if (event.runId === this.#drainingRun?.runId) { await this.acceptAccountingEvent(event); return; }
+      await capture();
+      this.#assertAccountingCurrent();
+    });
   }
 
   definitions() {
     this.#assertCurrent();
-    return this.#authority.definitions();
+    return this.#observe(() => this.#authority.definitions());
   }
 
   async recover(call: Parameters<PaperclipRunnerToolAuthority["recover"]>[0]) {
     this.#assertCurrent();
-    const result = await this.#authority.recover(call);
-    this.#assertCurrent();
-    return result;
+    return this.#observe(async () => {
+      const result = await this.#authority.recover(call);
+      this.#assertCurrent();
+      return result;
+    });
   }
 
   async execute(call: Parameters<PaperclipRunnerToolAuthority["execute"]>[0]) {
@@ -2057,13 +2072,21 @@ class SessionAuthorityEpoch {
     // Native API tools may intentionally interrupt their own run. Their
     // transaction/receipt owner controls that handoff; never join a call to
     // its own cancellation. Closed external actions own separate scopes.
-    return this.toolTrace
-      ? await this.toolTrace.execute(call, () => this.#authority.execute(call))
-      : await this.#authority.execute(call);
+    return this.#observe(() => this.toolTrace
+      ? this.toolTrace.execute(call, () => this.#authority.execute(call))
+      : this.#authority.execute(call));
   }
 }
 
 const sessionToolAuthorityEpochs = new Map<string, SessionAuthorityEpoch>();
+/** Read-only native-owner observation. A historical entry is not a live
+ * transport; callbacks still in flight, or a replaced entry, remain a hold. */
+export function observeNativeSessionToolWork(execution: NativeExecutionInput) {
+  const scope = nativeSessionScopeKey(execution), epoch = sessionToolAuthorityEpochs.get(scope);
+  return Object.freeze({ runId: epoch?.runId ?? null,
+    pending: () => epoch?.hasPendingWork ?? false,
+    current: () => sessionToolAuthorityEpochs.get(scope) === epoch && !(epoch?.hasPendingWork ?? false) });
+}
 const sessionHarnessBackupOwners = new WeakMap<SessionAuthorityEpoch, Awaited<ReturnType<typeof nativeHarnessBackupOwner>>>();
 const initializingSessionToolAuthorities = new Set<string>();
 const executingRunnerdSessionScopes = new Map<string, string>();
@@ -3300,6 +3323,84 @@ export async function inspectStoppedNativeReviewerOwners(input: {
   };
   if (!await recheck()) refuse("observation_changed");
   return { recheck, current };
+}
+
+type NativeColdScopedContinuationProof = {
+  recheck: (db: Db) => Promise<void>;
+  current: () => boolean;
+  receiptFor: (execution: NativeExecutionInput) => Record<string, unknown>;
+};
+const nativeColdScopedProofs = new WeakSet<NativeColdScopedContinuationProof>();
+
+/** A new managed directory cannot be attached under a stopped Codex process's
+ * old filesystem arguments. Use native's existing fresh/full-history bootstrap
+ * only after the exact successful predecessor has no remaining owner or work.
+ * Never close an owner, collect files, or modify a retained root here. */
+export async function prepareNativeColdScopedContinuation(input: {
+  db: Db; previous: NativeExecutionInput; current: NativeExecutionInput;
+  localScoped: boolean; expectedFingerprint?: string; ownerToken?: symbol;
+}): Promise<NativeColdScopedContinuationProof | null> {
+  if (!input.localScoped || !hasChangedManagedNativeCopy(input.previous, input.current)) return null;
+  const source = await readCompletedNativeColdSource(input.db, input.previous.binding.runId, input.current);
+  if (nativeSha256(source.previous) !== nativeSha256(input.previous)
+    || input.expectedFingerprint && source.fingerprint !== input.expectedFingerprint) coldContinuationHold("source_changed");
+  const scope = nativeSessionScopeKey(source.previous);
+  const savedEnvironmentId = record(record(source.run.contextSnapshot).paperclipEnvironment).id;
+  const environmentId = typeof savedEnvironmentId === "string" && savedEnvironmentId.trim() ? savedEnvironmentId : null;
+  const ownerScope = nativeSessionOwnerScope(source.previous, environmentId);
+  const epoch = observeNativeSessionToolWork(source.previous);
+  const epochSettled = () => (epoch.runId === null || epoch.runId === source.run.id) && epoch.current();
+  const idle = () => !activeNativeSessions.has(source.run.id) && !nativeSessionStartups.has(source.run.id)
+    && !nativeRunsDetachingForRestart.has(source.run.id) && !nativeCancellationsInFlight.has(source.run.id) && !nativeRunRecoveryFlushers.has(source.run.id)
+    && !warmNativeSessions.has(scope) && !closingWarmNativeSessions.has(scope) && !settlingNativeSessionScopes.has(scope)
+    && !initializingSessionToolAuthorities.has(scope) && !executingRunnerdSessionScopes.has(scope)
+    && epochSettled()
+    && (!executingNativeOwnerScopes.has(ownerScope) || executingNativeOwnerScopes.get(ownerScope) === input.ownerToken);
+  if (!idle()) coldContinuationHold("source_still_owned");
+  const events = await readReviewerProcessEvidence(input.db, source.run.companyId, [source.run.id]);
+  let physical: Awaited<ReturnType<typeof inspectStoppedNativeReviewerOwners>>;
+  try { physical = await inspectStoppedNativeReviewerOwners({ runs: [source.run], processEvidence: events }); }
+  catch { coldContinuationHold("physical_owner_unproven"); }
+  const retainedRoot = scopedRunnerdStateRoot(source.previous);
+  let rootSnapshot: ReturnType<typeof cleanupStateSnapshot>;
+  try { rootSnapshot = cleanupStateSnapshot(retainedRoot); }
+  catch { coldContinuationHold("retained_state_unavailable"); }
+  const provider = rootSnapshot.provider;
+  if (provider.goal != null && (typeof provider.goal !== "object" || Array.isArray(provider.goal) || record(provider.goal).status !== "complete")) coldContinuationHold("provider_goal_unfinished");
+  const targetBinding = nativeSha256(input.current.binding);
+  let proof: NativeColdScopedContinuationProof;
+  proof = {
+    current: () => {
+      try { return nativeColdScopedProofs.has(proof) && idle() && physical.current()
+        && cleanupStateSnapshot(retainedRoot).fingerprint === rootSnapshot.fingerprint; }
+      catch { return false; }
+    },
+    recheck: async db => {
+      if (!nativeColdScopedProofs.has(proof)) coldContinuationHold("proof_not_native");
+      const actual = await readCompletedNativeColdSource(db, source.run.id, input.current);
+      if (actual.fingerprint !== source.fingerprint) coldContinuationHold("observation_changed");
+      // Reobserve at each actual boundary, rather than caching an elapsed
+      // filesystem/process pass through preparation or a controller restart.
+      const currentEvents = await readReviewerProcessEvidence(db, source.run.companyId, [source.run.id]);
+      try { physical = await inspectStoppedNativeReviewerOwners({ runs: [actual.run], processEvidence: currentEvents }); }
+      catch { coldContinuationHold("physical_owner_unproven"); }
+      if (!proof.current()) coldContinuationHold("observation_changed");
+    },
+    receiptFor: execution => {
+      if (!proof.current() || nativeSha256(execution.binding) !== targetBinding
+        || execution.session.normalizedSessionId === source.previous.session.normalizedSessionId
+        || nativeSha256(execution.workspace) !== nativeSha256(input.current.workspace)
+        || !("runtimeContext" in execution) || !("runtimeContext" in input.current)
+        || nativeSha256(execution.runtimeContext) !== nativeSha256(input.current.runtimeContext)) coldContinuationHold("fresh_selection_changed");
+      return { schema: "paperclip.scoped-cold-continuation.v1", sourceRunId: source.run.id,
+        sourceExecutionSha256: nativeSha256(source.previous), sourceAuthoritySha256: source.fingerprint,
+        targetExecutionSha256: nativeSha256(execution) };
+    },
+  };
+  nativeColdScopedProofs.add(proof);
+  Object.freeze(proof);
+  if (!proof.current()) coldContinuationHold("observation_changed");
+  return proof;
 }
 
 export async function verifyStoppedNativeSessionForContinuation(
@@ -9396,6 +9497,8 @@ export function resolveNativeCancellationStatus(input: {
 
 export async function executePaperclipNativeSession(input: {
   workspaceAccess?: WorkspaceAccessSnapshot;
+  /** Issued and rechecked inside the native service; never a caller receipt. */
+  coldScopedContinuationProof?: NativeColdScopedContinuationProof;
   casesEnabled?: boolean;
   getFreshSessionHandoff?: () => Promise<string | null>;
   /** Retire a retained transport so recovery can replace provider tool declarations. */
@@ -9544,7 +9647,7 @@ export async function executePaperclipNativeSession(input: {
         eq(heartbeatRuns.companyId, input.execution.binding.companyId), eq(heartbeatRuns.agentId, input.execution.binding.agentId)));
       if (stoppingRun && await readClaimedNativeStopRecovery(input.db, stoppingRun, input.leaseOwner)) stopLease = input.leaseOwner;
     }
-    const [reviewRun]=await input.db.select({contextSnapshot:heartbeatRuns.contextSnapshot}).from(heartbeatRuns).where(and(eq(heartbeatRuns.id,runId),eq(heartbeatRuns.companyId,input.execution.binding.companyId),eq(heartbeatRuns.agentId,input.execution.binding.agentId)));
+    const [reviewRun]=await input.db.select({contextSnapshot:heartbeatRuns.contextSnapshot,runnerProfileJson:heartbeatRuns.runnerProfileJson}).from(heartbeatRuns).where(and(eq(heartbeatRuns.id,runId),eq(heartbeatRuns.companyId,input.execution.binding.companyId),eq(heartbeatRuns.agentId,input.execution.binding.agentId)));
     const stageContext=stopLease?null:readNativeStageReviewContext(reviewRun?.contextSnapshot);
     if(stageContext && !await getNativeStageReviewAssignment(input.db,{...input.execution.binding,contextSnapshot:stageContext}))throw new NativeProviderStateIncompatibleError("native_stage_review_assignment_no_longer_available");
     let scopedOnly=false;
@@ -9577,6 +9680,27 @@ export async function executePaperclipNativeSession(input: {
       throw new Error("native_session_supervisor_busy");
     }
     executingNativeOwnerScopes.set(ownerScope, ownerToken);
+    const coldReceiptValue = record(reviewRun?.runnerProfileJson).nativeColdScopedContinuation;
+    if (coldReceiptValue !== undefined) {
+      const receipt = record(coldReceiptValue);
+      const digest = (value: unknown) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+      if (receipt.schema !== "paperclip.scoped-cold-continuation.v1" || typeof receipt.sourceRunId !== "string"
+        || !/^[a-f0-9-]{36}$/.test(receipt.sourceRunId) || !digest(receipt.sourceExecutionSha256)
+        || !digest(receipt.sourceAuthoritySha256) || receipt.targetExecutionSha256 !== nativeSha256(input.execution)
+        || !workspaceAccess || !input.useRunnerd || input.runnerExecutionTarget?.kind === "remote") coldContinuationHold("saved_selection_invalid");
+      const [source] = await input.db.select({ profile: heartbeatRuns.runnerProfileJson }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.id, receipt.sourceRunId), eq(heartbeatRuns.companyId, input.execution.binding.companyId),
+        eq(heartbeatRuns.agentId, input.execution.binding.agentId))).limit(1);
+      let previous: NativeExecutionInput;
+      try { previous = parseNativeExecutionInput(record(source?.profile).nativeExecutionInput); }
+      catch { coldContinuationHold("saved_source_invalid"); }
+      if (nativeSha256(previous) !== receipt.sourceExecutionSha256) coldContinuationHold("saved_source_changed");
+      const proof = await prepareNativeColdScopedContinuation({ db: input.db, previous, current: input.execution,
+        localScoped: true, expectedFingerprint: String(receipt.sourceAuthoritySha256), ownerToken });
+      if (!proof) coldContinuationHold("saved_selection_not_cold");
+      input = { ...input, coldScopedContinuationProof: proof };
+      preparedInput = input;
+    } else if (input.coldScopedContinuationProof) coldContinuationHold("proof_without_native_selection");
     if (!input.useRunnerd) await retireSupersededWarmNativeSessions(
       ownerScope, nativeSessionScopeKey(input.execution), nativeSessionKey(input.execution), runId,
     );
@@ -11307,6 +11431,11 @@ async function executePaperclipNativeSessionAttempt(
               issueId: input.execution.binding.issueId,
             }),
             onSessionAdmission: async () => {
+              if (input.coldScopedContinuationProof) {
+                if (!nativeColdScopedProofs.has(input.coldScopedContinuationProof)) coldContinuationHold("proof_not_native");
+                await input.coldScopedContinuationProof.recheck(input.db);
+                if (!input.coldScopedContinuationProof.current()) coldContinuationHold("observation_changed");
+              }
               if (existingWarmSession) runnerdBackend?.bindDiagnosticSession?.(existingWarmSession);
               // Invalidate prior stop evidence before a backend can spawn.
               await appendHeartbeatRunEvent(input.db, {

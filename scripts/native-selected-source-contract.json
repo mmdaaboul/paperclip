@@ -180,7 +180,8 @@
         "native non-Git tool authority retirement > interrupt fences and joins the actual epoch before successor ownership",
         "native terminal-turn accounting > binds retained warm transport usage to the successor run authority",
         "native warm session supervision > warm session identity transitions > keeps warm owners and attachment staging untouched during exact Stop cleanup (invalidated=false)",
-        "native warm session supervision > warm session identity transitions > keeps warm owners and attachment staging untouched during exact Stop cleanup (invalidated=true)"
+        "native warm session supervision > warm session identity transitions > keeps warm owners and attachment staging untouched during exact Stop cleanup (invalidated=true)",
+        "native non-Git tool authority retirement > observes the actual historical authority epoch without treating registration as live work"
       ]
     },
     {
@@ -243,6 +244,29 @@
       "project": "root",
       "path": "server/src/services/native-runtime/native-attributed-git-admission.test.ts",
       "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/services/heartbeat/runtime-selection-cold-scoped.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "runner",
+      "path": "packages/paperclip-runner/src/drivers/codex/codex-app-server-driver.recovery.test.ts",
+      "selection": "exact-full-names",
+      "fullNames": [
+        "Codex app-server Codex driver > typed local scoped recovery preserves permanent identity refusal (cleanup rejects: false)",
+        "Codex app-server Codex driver > typed local scoped recovery preserves permanent identity refusal (cleanup rejects: true)",
+        "Codex app-server Codex driver > typed local scoped recovery does not classify an ordinary error by its message"
+      ]
+    },
+    {
+      "project": "runner",
+      "path": "packages/paperclip-runner/src/native-session-runtime.test.ts",
+      "selection": "exact-full-names",
+      "fullNames": [
+        "executeNativeSession recovery > typed local scoped recovery survives the native backend without replacement"
+      ]
     }
   ],
   "retries": 0,

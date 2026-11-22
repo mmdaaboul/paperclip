@@ -6660,6 +6660,42 @@ describe("executeNativeSession recovery", () => {
     }
   });
 
+  it("typed local scoped recovery survives the native backend without replacement", async () => {
+    const originalTransport = new FakeCodexTransport();
+    const recoveryTransport = new FakeCodexTransport();
+    const fault = new NativeProviderStateIncompatibleError("workspace_policy_saved_launch_changed");
+    recoveryTransport.rejectMethods.set("thread/read", fault);
+    const recoveryClose = vi.spyOn(recoveryTransport, "close");
+    const transports = [originalTransport, recoveryTransport];
+    const transportFactory = vi.fn(() => {
+      const next = transports.shift();
+      if (!next) throw new Error("unexpected replacement transport");
+      return next;
+    });
+    const executionInput = { ...input, workspace: { ...input.workspace, cwd: WORKSPACE } };
+    const backend = createCodexNativeSessionBackend(executionInput, { runnerInstanceId: "runner-recovery", transportFactory });
+    const original = await backend.openSession({ identity, workingDirectory: WORKSPACE });
+    await original.startTurn({ message: { role: "user", text: "Work." } });
+    const checkpoint = { ...await original.snapshot(), providerRecoveryPolicy: "allow_replacement_after_resume_failure" as const };
+    await original.close({ reason: "fixture disconnect" });
+    const savedCheckpoint = structuredClone(checkpoint);
+    const openSession = vi.spyOn(backend, "openSession");
+    const openRun = vi.fn(async () => undefined), checkpointSession = vi.fn(async () => undefined);
+    const appendEvent = vi.fn(), completeRun = vi.fn(async () => undefined);
+    const port: ControlPlanePort = { openRun, checkpointSession, appendEvent, completeRun,
+      loadSessionCheckpoint: async () => structuredClone(checkpoint),
+      replayEvents: async () => ({ events: [], highestContiguousSourceSeq: 0 }) };
+    await expect(executeNativeSession({ input: executionInput, backend, controlPlane: port, persistedSession: checkpoint,
+      runnerInstanceId: "runner-recovery", controlPlaneInstanceId: "control-recovery" })).rejects.toBe(fault);
+    expect(recoveryClose).toHaveBeenCalledOnce();
+    expect(transportFactory).toHaveBeenCalledTimes(2);
+    expect(openSession).not.toHaveBeenCalled();
+    expect(recoveryTransport.calls.some(call => call.method === "thread/start" || call.method === "turn/start")).toBe(false);
+    expect(openRun).not.toHaveBeenCalled(); expect(checkpointSession).not.toHaveBeenCalled();
+    expect(appendEvent).not.toHaveBeenCalled(); expect(completeRun).not.toHaveBeenCalled();
+    expect(checkpoint).toEqual(savedCheckpoint);
+  });
+
   it("never replaces a session after a deterministic, non-destructive recovery refusal", async () => {
     const outcomes = [
       { failureClass: PROVIDER_ATTACH_REFUSED, reason: "run.attach cannot change protected launch arguments",

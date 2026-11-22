@@ -94,6 +94,8 @@ import { buildPlanReviewContext } from "../plan-review-context.js";
 import { normalizePaperclipWakePayload, selectPaperclipTaskMarkdown } from "@paperclipai/adapter-utils/server-utils";
 import type { ProviderResourceDisposition } from "../environment-runtime.js";
 import { stageNativeRuntimeSkillAssets, bindStagedNativeRuntimeSkillAssets } from "../native-runtime/runtime-skill-preservation.js";
+import { prepareNativeColdScopedContinuation } from "../native-runtime/native-session-executor.js";
+import { coldContinuationHold } from "../native-runtime/native-scoped-cold-continuation.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
 type Agent = typeof agents.$inferSelect;
@@ -329,6 +331,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
   }
   if (!isDotRun) assertEphemeralNativeRuntime(nativeRuntimeResolution.kind === "native");
   let nativeExecution: NativeExecutionInput | null = null;
+  let coldScopedContinuation: Awaited<ReturnType<typeof prepareNativeColdScopedContinuation>> = null;
   let referenceFolderAccess: PreparedReferenceFolderAccess | null = null;
   let reviewerWorkspaceAccess: Awaited<ReturnType<typeof prepareNativeReviewerWorkspaceAdmission>> = null;
   let getNativeFreshSessionHandoff: (() => Promise<string | null>) | undefined;
@@ -947,7 +950,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
       const backendDescriptor = await measureRunPhase("runtime_selection.provider_discovery", () => describeRunnerdNativeSessionBackend(buildExecution({
         normalizedSessionId: nativeSessionId, resumedSession: previousNativeRun !== null,
       })));
-      const nativeExecutionWithCheckpoint = buildNativeExecutionWithCheckpoint({
+      let nativeExecutionWithCheckpoint = buildNativeExecutionWithCheckpoint({
         previousRun: previousNativeRun,
         normalizedSessionId: nativeSessionId,
         executionTargetKind: executionTarget?.kind ?? "local",
@@ -955,6 +958,17 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         refreshTools: context.refreshTools === true,
         buildExecution,
       });
+      if (previousNativeRun && nativeExecutionWithCheckpoint.checkpoint && referenceFolderAccess?.workspaceAccess
+        && executionTarget?.kind !== "remote" && !runOptions.nativeRestartRecovery) {
+        const previous = parseNativeExecutionInput(parseObject(previousNativeRun.runnerProfileJson).nativeExecutionInput);
+        coldScopedContinuation = await prepareNativeColdScopedContinuation({ db, previous,
+          current: nativeExecutionWithCheckpoint.execution, localScoped: true });
+        if (coldScopedContinuation) {
+          if (nativeExecutionWithCheckpoint.checkpoint.providerRecoveryPolicy === "same_session_only") coldContinuationHold("checkpoint_requires_same_session");
+          nativeExecutionWithCheckpoint = buildNativeExecutionWithCheckpoint({ previousRun: null,
+            normalizedSessionId: nativeSessionId, executionTargetKind: "local", buildExecution });
+        }
+      }
       nativeExecution = nativeExecutionWithCheckpoint.execution;
       nativeResumeCheckpoint = nativeExecutionWithCheckpoint.checkpoint;
       if (
@@ -1028,6 +1042,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         && runOptions.nativeRestartRecovery.leaseOwner === runOptions.nativeLeaseOwner
         && await readClaimedNativeStopRecovery(tx as unknown as Db, lockedRun, runOptions.nativeLeaseOwner);
       if (lockedRun.status !== "running" || (lockedRun.resultJson?.startupCancellation && !stopRecovery)) return false;
+      if (coldScopedContinuation) await coldScopedContinuation.recheck(tx as unknown as Db);
       if (lockedRun.runtimeMode === "legacy" && lockedRun.controllerBootId &&
           !(await renewLegacyControllerLease(tx as unknown as Db, lockedRun))) {
         onNativeOwnershipHeld();
@@ -1073,6 +1088,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
           runnerProfileJson: {
             ...nativeRuntimeResolution.profile,
             ...lockedProfile,
+            ...(coldScopedContinuation ? { nativeColdScopedContinuation: coldScopedContinuation.receiptFor(nativeExecution!) } : {}),
             ...(runtimeSkillPreservation ? { nativeRuntimeSkillPreservation: runtimeSkillPreservation } : {}),
             ...(nativeExecution?.provider.kind === "cursor_cloud" ? { executionPlacement: resolveProviderApiPlacement({ agent, run }) } : {}),
             nativePreparationFencingVersion: !lockedRun.runnerInstanceId && !lockedRun.nativeSessionId

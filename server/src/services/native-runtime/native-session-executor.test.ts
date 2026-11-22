@@ -406,6 +406,8 @@ import {
   createGovernedWaitEventObservation,
   createRemoteRunnerProcessLauncher,
   createRunnerdBackend,
+  observeNativeSessionToolWork,
+  scopedRunnerdStateRoot,
   noteRemoteBootstrapRestartProven,
   recordRemoteBootstrapRestartProof,
   hasRemoteBootstrapRestartProof,
@@ -20739,6 +20741,33 @@ describe("HTTP Stop during remote runner staging", () => {
 });
 
 describe("native non-Git tool authority retirement",()=>{
+ it("observes the actual historical authority epoch without treating registration as live work",async()=>{
+  const current={...execution,binding:{...execution.binding,runId:`cold-epoch-${randomUUID()}`},session:{...execution.session,normalizedSessionId:`cold-epoch-${randomUUID()}`}} as NativeExecutionInputV1;
+  const backend=await createRunnerdBackend({db:leaseDb(current),execution:current,runnerInstanceId:"cold-epoch"});
+  const observation=observeNativeSessionToolWork(current);
+  expect(observation.runId).toBe(current.binding.runId);expect(observation.current()).toBe(true);
+  let release!:()=>void,entered!:()=>void;const ready=new Promise<void>(r=>{entered=r;}),gate=new Promise<void>(r=>{release=r;});
+  state.toolAuthorityExecute.mockImplementationOnce(async()=>{entered();await gate;return {fixture:"settled"};});
+  const handler=state.createBackend.mock.calls.at(-1)![1].dynamicToolHandler!;
+  const work=handler({tool:"read_task",callId:randomUUID(),arguments:{}});await ready;
+  expect(observation.pending()).toBe(true);expect(observation.current()).toBe(false);
+  release();await work;expect(observation.pending()).toBe(false);expect(observation.current()).toBe(true);
+  const session={close:async()=>{}} as unknown as import("../../vendor/paperclip-runner/index.js").NativeSession;
+  backend.bindControllerSession!(session);await session.close({reason:"Synthetic cold owner"});
+  const closed=observeNativeSessionToolWork(current);expect(closed.runId).toBe(current.binding.runId);expect(closed.current()).toBe(true);
+  // A new server-owned epoch invalidates the old fixed observation, even if
+  // its logical run id is unchanged. No map setter/test-only owner is used.
+  // The controlled backend did not run a daemon. Supply its exact durable
+  // identity before asking the genuine migration owner to re-open the root.
+  const root=scopedRunnerdStateRoot(current), identity={runId:current.binding.runId,
+   normalizedSessionId:current.session.normalizedSessionId,runnerInstanceId:"cold-epoch",environmentLeaseId:current.binding.executionWorkspaceId};
+  await mkdir(join(root,"control-plane"),{recursive:true});
+  await writeFile(join(root,"control-plane/control-plane-state.json"),JSON.stringify(durableControlPlaneState(identity)));
+  await mkdir(join(root,"runner"),{recursive:true,mode:0o700});
+  await writeFile(join(root,"runner/runner-state.json"),JSON.stringify(durableRunnerState(identity,"suspended")));
+  await createRunnerdBackend({db:leaseDb(current),execution:current,runnerInstanceId:"cold-epoch-rebuilt"});
+  expect(closed.current()).toBe(false);
+ });
  it.each(["close","interrupt","detach","cancel"] as const)("%s fences and joins the actual epoch before successor ownership",async control=>{
   const current={...execution,binding:{...execution.binding,runId:`f08-${control}-${randomUUID()}`},session:{...execution.session,normalizedSessionId:`f08-${control}-${randomUUID()}`}} as NativeExecutionInputV1;
   const backend=await createRunnerdBackend({db:leaseDb(current),execution:current,runnerInstanceId:"f08-native-epoch"});

@@ -19,7 +19,7 @@ import type {
   PersistedHarnessSession,
   PersistedHarnessTurnTerminal,
 } from "../../contracts/harness-driver.js";
-import { NativeSessionProtocolIntegrityError, nativeRestartInterruptedTurnId } from "../../contracts/native-session-backend.js";
+import { NativeProviderStateIncompatibleError, NativeSessionProtocolIntegrityError, nativeRestartInterruptedTurnId } from "../../contracts/native-session-backend.js";
 import { HarnessReconciliationError, runnerRecoveryFailureClass } from "../../contracts/harness-driver.js";
 import {
   CODEX_CODEX_PROTOCOL_VERSION,
@@ -729,6 +729,10 @@ export class CodexAppServerDriver implements HarnessDriver {
       await cancellation.close().catch(() => {});
       if (error instanceof NativeSessionProtocolIntegrityError) throw error;
       if (options.signal.aborted) options.signal.throwIfAborted();
+      // A deterministic saved-state refusal must reach the native owner as its
+      // original typed error. A recovery-result class may permit replacement;
+      // a string wrapper loses the permanent identity and invites futile retry.
+      if (error instanceof NativeProviderStateIncompatibleError) throw error;
       const failureClass = runnerRecoveryFailureClass(error);
       return {
         recovered: false,
