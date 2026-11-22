@@ -247,7 +247,7 @@
     },
     {
       "project": "root",
-      "path": "server/src/services/heartbeat/runtime-selection-cold-scoped.test.ts",
+      "path": "server/src/__tests__/runtime-selection-cold-scoped.test.ts",
       "selection": "whole-file"
     },
     {

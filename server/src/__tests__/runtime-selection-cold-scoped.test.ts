@@ -10,17 +10,17 @@ import {
   agentReferenceFolderConfigs, agentInstructionWorkingCopies, agentTaskSessions, githubPushOperationReceipts, reviewerGithubOperations,
   toolApplications, toolConnections, toolConnectionInstalls, toolProfiles, toolProfileEntries, toolProfileBindings, type Db,
 } from "@paperclipai/db";
-import { reviewerNativeTestDatabase } from "../../__tests__/helpers/reviewer-native-database.js";
-import { resolveManagedInstructionsRoot } from "../agent-instructions.js";
-import { agentInstructionWorkingCopyService } from "../agent-instruction-working-copies.js";
-import { createHeartbeatInstructionWorkingCopy } from "./instruction-working-copy.js";
-import { prepareAndSelectHeartbeatRuntime, type HeartbeatRuntimeSelectionInput } from "./runtime-selection.js";
-import { resolveHeartbeatNativeRuntimeMode } from "../native-runtime/runtime-mode.js";
-import { createCodexNativeSessionBackend } from "../../../../packages/paperclip-runner/src/backends/codex-native-backend.js";
-import { FakeCodexTransport } from "../../../../packages/paperclip-runner/src/drivers/codex/codex-app-server-driver.test-support.js";
-import { executePaperclipNativeSession, prepareNativeColdScopedContinuation, scopedRunnerdStateRoot } from "../native-runtime/native-session-executor.js";
-import { nativeSha256 } from "../native-runtime/canonical.js";
-import { currentProcessSpaceHash } from "../controller-process-identity.js";
+import { reviewerNativeTestDatabase } from "./helpers/reviewer-native-database.js";
+import { resolveManagedInstructionsRoot } from "../services/agent-instructions.js";
+import { agentInstructionWorkingCopyService } from "../services/agent-instruction-working-copies.js";
+import { createHeartbeatInstructionWorkingCopy } from "../services/heartbeat/instruction-working-copy.js";
+import { prepareAndSelectHeartbeatRuntime, type HeartbeatRuntimeSelectionInput } from "../services/heartbeat/runtime-selection.js";
+import { resolveHeartbeatNativeRuntimeMode } from "../services/native-runtime/runtime-mode.js";
+import { createCodexNativeSessionBackend } from "../../../packages/paperclip-runner/src/backends/codex-native-backend.js";
+import { FakeCodexTransport } from "../../../packages/paperclip-runner/src/drivers/codex/codex-app-server-driver.test-support.js";
+import { executePaperclipNativeSession, prepareNativeColdScopedContinuation, scopedRunnerdStateRoot } from "../services/native-runtime/native-session-executor.js";
+import { nativeSha256 } from "../services/native-runtime/canonical.js";
+import { currentProcessSpaceHash } from "../services/controller-process-identity.js";
 
 /** Real PostgreSQL, instruction producer, MCP resolver and runtime selection.
  * The provider boundary is the SDK FakeCodexTransport; accepted-source records
