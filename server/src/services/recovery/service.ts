@@ -5376,6 +5376,27 @@ export function recoveryService(
             EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON,
           )
         ) {
+          // The generic latest-run projection deliberately omits native
+          // startup fields. Read only this exact source's cohort, not its input.
+          const [preparation]=await db.select({status:heartbeatRuns.status,runtimeMode:heartbeatRuns.runtimeMode,
+            nativeIssueId:heartbeatRuns.nativeIssueId,runtimeModeResolvedAt:heartbeatRuns.runtimeModeResolvedAt,
+            executionStage:heartbeatRuns.executionStage,errorCode:heartbeatRuns.errorCode,
+            hasNativeInput:sql<boolean>`coalesce(jsonb_typeof(${heartbeatRuns.runnerProfileJson}->'nativeExecutionInput'),'null') <> 'null'`,
+          }).from(heartbeatRuns).where(and(eq(heartbeatRuns.id,participantLatestRun.id),eq(heartbeatRuns.companyId,issue.companyId),
+            eq(heartbeatRuns.agentId,participantAgentId),eq(heartbeatRuns.issueId,issue.id)));
+          const recovery=parseObject(parseObject(participantLatestRun.resultJson).executionRecovery);
+          if(preparation?.status==="failed" && preparation.runtimeMode==="legacy" && preparation.nativeIssueId===null
+            && !preparation.runtimeModeResolvedAt && preparation.executionStage==="preparing"
+            && preparation.errorCode==="adapter_failed" && !preparation.hasNativeInput
+            && recovery?.kind==="bootstrap" && recovery.providerWorkStarted===false
+            && await getNativeStageReviewRecoveryContext(db,{companyId:issue.companyId,issueId:issue.id,agentId:participantAgentId})) {
+            // Preparation never published native identity. Preserve this exact
+            // pending stage for the existing explicit owner Task Retry instead
+            // of invalidating its canonical version through auto escalation.
+            // This is no replay/stop certificate and creates no extra attempt.
+            result.skipped+=1;
+            continue;
+          }
           const updated = await escalateStrandedAssignedIssue({
             issue,
             previousStatus: "in_review",

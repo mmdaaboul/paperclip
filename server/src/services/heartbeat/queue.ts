@@ -1,3 +1,5 @@
+import { getNativeStageReviewRecoveryContext } from "../native-runtime/native-stage-review.js";
+import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../issue-execution-policy.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
 import { mutateNativeOperationalIssue, nativeOperationalIssueSnapshot } from "../native-operational-issue-mutation.js";
 import { CONTEXT_COMPACTION_WAKE_REASON, ContextCompactionError, isContextCompactionRun, readContextCompactionRequest } from "../context-compaction.js";
@@ -3352,6 +3354,16 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               companyId: issue.companyId, issueId: issue.id, requestId: opts.taskRetryRequestId!,
               sourceRunId: readNonEmptyString(enrichedContextSnapshot.previousRunId)!,
             })) return { kind: "deferred" as const };
+            if(agent.adapterType==="paperclip_runner" && normalizeIssueExecutionPolicy(issue.executionPolicy)?.totalReviewCycles===5
+              && parseIssueExecutionState(issue.executionState)?.currentStageType==="review") {
+              // A durable user Retry owns this admission, not its failed run's
+              // missing/stale hints. Resolve the current native candidate under
+              // the same issue lock; all ordinary replay/cleanup gates remain.
+              const stage=await getNativeStageReviewRecoveryContext(tx as unknown as Db,{companyId:issue.companyId,issueId:issue.id,agentId});
+              if(!stage)throw conflict("The native review stage changed before Task Retry admission.",{code:"native_stage_review_retry_assignment_changed"});
+              Object.assign(enrichedContextSnapshot,stage);
+              payload={...payload,...stage,[DEFERRED_WAKE_CONTEXT_KEY]:{...enrichedContextSnapshot}};
+            }
           }
           const issueStateGuard = opts.issueStateGuard;
           const activeMonitorRun = issueStateGuard?.monitorNextCheckAt === undefined ? null

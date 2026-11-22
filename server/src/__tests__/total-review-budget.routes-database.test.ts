@@ -924,6 +924,65 @@ describe("actual normal PATCH + native postgres-js + native issue service (injec
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,failed.id)))[0].contextSnapshot).toEqual(failed.contextSnapshot);
     expect((await f.ledger()).admissions).toHaveLength(1);
   });
+  it("normal-stage owner TaskRetry carries canonical authority from missing-context failure through real queue and protected startup",async()=>{
+    const f=await stageFixture();
+    const [failed]=await db.update(heartbeatRuns).set({runtimeMode:"legacy",nativeIssueId:null,status:"failed",errorCode:"adapter_failed",error:"Synthetic protected Reviewer startup failure",finishedAt:new Date(),resultJson:{executionRecovery:{kind:"bootstrap",providerWorkStarted:false}},contextSnapshot:{issueId:f.issue.id,taskId:f.issue.id,source:"issue.execution_review_recovery",retryReason:"execution_review_participant_recovery"}}).where(eq(heartbeatRuns.id,f.reviewerRun.id)).returning();
+    await db.update(issues).set({executionRunId:null,checkoutRunId:null}).where(eq(issues.id,f.issue.id));
+    await db.update(agentWakeupRequests).set({status:"completed",finishedAt:new Date()}).where(eq(agentWakeupRequests.id,f.wake.id));
+    await db.update(agents).set({runtimeConfig:{heartbeat:{enabled:false,maxConcurrentRuns:1}}}).where(eq(agents.id,f.reviewer.id));
+    const [occupied]=await db.insert(heartbeatRuns).values({companyId:f.company.id,agentId:f.reviewer.id,status:"running",startedAt:new Date()}).returning();
+    executionFixture.holdTaskRetryNudge=true;
+    try {
+      const body={idempotencyKey:randomUUID(),observedRunId:failed.id};
+      const response=await request(f.board).post(`/api/issues/${f.issue.id}/retry`).send(body);
+      expect(response.status,JSON.stringify(response.body)).toBe(202);expect(response.body.accepted).toBe(true);
+      const actual=await vi.importActual<typeof import("../services/heartbeat.js")>("../services/heartbeat.js");
+      await actual.heartbeatService(db).resumeTaskRetry(f.company.id,response.body.requestId);
+      const successors=await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId,f.company.id),sql`${heartbeatRuns.contextSnapshot}->>'taskRetryRequestId' = ${response.body.requestId}`));
+      expect(successors).toHaveLength(1);const successor=successors[0];
+      expect(successor).toMatchObject({status:"queued",runtimeMode:"legacy",nativeIssueId:null,contextSnapshot:{nativeStageDecisionId:f.context.nativeStageDecisionId,nativeStageAdmissionId:f.context.nativeStageAdmissionId,nativeStageStatusVersion:f.context.nativeStageStatusVersion,nativeStatusWakeIntentId:f.wake.id,previousRunId:failed.id,forceFreshSession:true}});
+      const repeated=await request(f.board).post(`/api/issues/${f.issue.id}/retry`).send(body);expect(repeated.body.requestId).toBe(response.body.requestId);
+      await actual.heartbeatService(db).resumeTaskRetry(f.company.id,response.body.requestId);
+      expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId,f.company.id),sql`${heartbeatRuns.contextSnapshot}->>'taskRetryRequestId' = ${response.body.requestId}`))).toHaveLength(1);
+      await db.update(heartbeatRuns).set({status:"cancelled",finishedAt:new Date()}).where(eq(heartbeatRuns.id,occupied.id));
+      const {createHeartbeatQueueTestDependencies}=await import("./helpers/heartbeat-queue.js"),{createHeartbeatQueue}=await import("../services/heartbeat/queue.js"),{issueService}=await import("../services/issues.js");
+      const deps=createHeartbeatQueueTestDependencies(db),service=issueService(db);deps.getAgent.mockImplementation(async id=>(await db.select().from(agents).where(eq(agents.id,id)))[0]);deps.issuesSvc.getDependencyReadiness.mockImplementation(service.getDependencyReadiness);deps.issuesSvc.listDependencyReadiness.mockImplementation(service.listDependencyReadiness);
+      const claimed=await createHeartbeatQueue(db,deps).claimQueuedRun(successor);expect(claimed).toMatchObject({id:successor.id,status:"running"});expect(deps.executeRun).not.toHaveBeenCalled();
+      const protectedRun=await qualifyProtectedReview({...f,reviewerRun:claimed!},true);
+      try{expect(protectedRun.admission.record.assignment.kind).toBe("execution_stage_review");}finally{await protectedRun.close();}
+      expect((await f.ledger()).admissions).toHaveLength(1);expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,failed.id)))[0].contextSnapshot).toEqual(failed.contextSnapshot);
+    }finally{executionFixture.holdTaskRetryNudge=false;}
+  });
+  it.each(["status_version","policy","workspace_revision","newer_source","wrong_assignee"] as const)("normal-stage owner TaskRetry refuses changed authority before successor: %s",async change=>{
+    const f=await stageFixture();const [failed]=await db.update(heartbeatRuns).set({runtimeMode:"legacy",nativeIssueId:null,status:"failed",errorCode:"adapter_failed",finishedAt:new Date(),resultJson:{executionRecovery:{kind:"bootstrap",providerWorkStarted:false}},contextSnapshot:{issueId:f.issue.id,taskId:f.issue.id}}).where(eq(heartbeatRuns.id,f.reviewerRun.id)).returning();
+    await db.update(issues).set({executionRunId:null,checkoutRunId:null}).where(eq(issues.id,f.issue.id));await db.update(agentWakeupRequests).set({status:"completed",finishedAt:new Date()}).where(eq(agentWakeupRequests.id,f.wake.id));
+    executionFixture.holdTaskRetryNudge=true;
+    try {
+      const response=await request(f.board).post(`/api/issues/${f.issue.id}/retry`).send({idempotencyKey:randomUUID(),observedRunId:failed.id});expect(response.status,JSON.stringify(response.body)).toBe(202);expect(response.body.accepted).toBe(true);
+      if(change==="status_version")await db.update(issues).set({statusVersion:sql`${issues.statusVersion}+1`}).where(eq(issues.id,f.issue.id));
+      if(change==="workspace_revision")await db.update(issues).set({workspaceBindingRevision:sql`${issues.workspaceBindingRevision}+1`}).where(eq(issues.id,f.issue.id));
+      if(change==="policy"){const current=await f.read(),policy=structuredClone(current.executionPolicy) as any;policy.stages[0].participants[0].id=randomUUID();await db.update(issues).set({executionPolicy:policy}).where(eq(issues.id,f.issue.id));}
+      if(change==="newer_source")await db.insert(heartbeatRuns).values({companyId:f.company.id,agentId:f.reviewer.id,issueId:f.issue.id,scopeKind:"issue",status:"failed",finishedAt:new Date(),contextSnapshot:{issueId:f.issue.id}});
+      if(change==="wrong_assignee")await db.update(issues).set({assigneeAgentId:f.builder.id}).where(eq(issues.id,f.issue.id));
+      const actual=await vi.importActual<typeof import("../services/heartbeat.js")>("../services/heartbeat.js");
+      const resumed=await Promise.allSettled([actual.heartbeatService(db).resumeTaskRetry(f.company.id,response.body.requestId)]);
+      if(resumed[0].status==="rejected")expect(resumed[0].reason).toMatchObject({status:409});
+      expect(await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId,f.company.id),sql`${heartbeatRuns.contextSnapshot}->>'taskRetryRequestId' = ${response.body.requestId}`))).toHaveLength(0);expect((await f.ledger()).admissions).toHaveLength(1);
+    }finally{executionFixture.holdTaskRetryNudge=false;}
+  });
+  it.each([false,true])("normal-stage exhausted pre-native failure retains explicit owner retry only when provider work did not start: %s",async providerStarted=>{
+    const f=await stageFixture();const [failed]=await db.update(heartbeatRuns).set({runtimeMode:"legacy",nativeIssueId:null,status:"failed",executionStage:"preparing",errorCode:"adapter_failed",error:"Synthetic protected Reviewer startup failure",finishedAt:new Date(),resultJson:{executionRecovery:{kind:"bootstrap",providerWorkStarted:providerStarted}},contextSnapshot:{issueId:f.issue.id,taskId:f.issue.id,source:"issue.execution_review_recovery",retryReason:"execution_review_participant_recovery"}}).where(eq(heartbeatRuns.id,f.reviewerRun.id)).returning();
+    await db.update(issues).set({executionRunId:null,checkoutRunId:null}).where(eq(issues.id,f.issue.id));await db.update(agentWakeupRequests).set({status:"completed",finishedAt:new Date()}).where(eq(agentWakeupRequests.id,f.wake.id));
+    const stageModule=await import("../services/native-runtime/native-stage-review.js"),proofReader=vi.spyOn(stageModule,"getNativeStageReviewRecoveryContext");
+    const {recoveryService}=await import("../services/recovery/service.js"),enqueueWakeup=vi.fn(async()=>null),service=recoveryService(db,{enqueueWakeup}),before=await f.read(),outcomes=[];
+    try {
+      for(let n=0;n<2;n++)outcomes.push(await service.reconcileStrandedAssignedIssues({companyId:f.company.id,issueId:f.issue.id,skipRelatedRecovery:true,skipExternalConversationSettlement:true}));
+      expect(enqueueWakeup).not.toHaveBeenCalled();
+      if(!providerStarted){expect(proofReader).toHaveBeenCalledTimes(2);expect(outcomes.every(x=>x.escalated===0)).toBe(true);expect(await f.read()).toEqual(before);}
+      else{expect(proofReader).not.toHaveBeenCalled();expect(outcomes.some(x=>x.escalated>0)).toBe(true);}
+      expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,failed.id)))[0].contextSnapshot).toEqual(failed.contextSnapshot);expect((await f.ledger()).admissions).toHaveLength(1);
+    }finally{proofReader.mockRestore();}
+  });
   it("native scheduler consumes scoped return intent once and defers actual dispatch until Reviewer release",async()=>{
     const f=await reviewingDraftFixture();ok(await request(f.reviewerApp).post(`/api/issues/${f.issue.id}/interactions/${f.scope.interactionId}/accept`).send({}));
     const [scope]=await db.select().from(issueScopedReviews).where(eq(issueScopedReviews.id,f.scope.id));
