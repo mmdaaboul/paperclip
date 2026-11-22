@@ -8,7 +8,7 @@ import { providerDrainStateFromSnapshot } from "../../vendor/paperclip-runner/in
 import type { WorkspaceAccessSnapshot } from "../../vendor/paperclip-runner/index.js";
 import { proveReviewerRecordedOwnerStopped, reviewerRecordedProcessIds, type ReviewerProcessEvidence } from "./reviewer-policy-process-proof.js";
 import { readReviewerProcessEvidence } from "./reviewer-policy-process-proof.js";
-import { coldContinuationHold, hasChangedManagedNativeCopy, readCompletedNativeColdSource } from "./native-scoped-cold-continuation.js";
+import { coldContinuationHold, hasChangedManagedNativeCopy, readCompletedNativeColdSource, readNativeColdWarmOrigin } from "./native-scoped-cold-continuation.js";
 import { resolveNativeWorkspacePolicy, resolveNativeWorkspacePolicyForClaimedStop } from "./workspace-policy-admission.js";
 import { prepareOptionalNativeReviewerDiscussion } from "./reviewer-github-native-actions.js";
 import { recordNativeReviewerProcessAdmission } from "./reviewer-runtime-admission.js";
@@ -3230,6 +3230,20 @@ export async function inspectStoppedNativeReviewerOwners(input: {
   runs: Array<typeof heartbeatRuns.$inferSelect>;
   processEvidence: ReviewerProcessEvidence[];
 }) {
+  return inspectStoppedNativeOwners(input, run => proveReviewerRecordedOwnerStopped(run, input.processEvidence), owner => {
+    const providerEvents = input.processEvidence.filter(row => row.runId === owner.id &&
+      ["session.started", "session.resumed", "session.reconciled"].includes(row.eventType));
+    const lastProvider = record(record(record(providerEvents.at(-1)?.payload).prpEvent).payload);
+    return lastProvider.driverSessionId ?? lastProvider.providerSessionId;
+  });
+}
+
+// Private common root observation. The public Reviewer wrapper above always
+// constructs its original strict per-run proof; it accepts no caller override.
+async function inspectStoppedNativeOwners(input: {
+  runs: Array<typeof heartbeatRuns.$inferSelect>; processEvidence: ReviewerProcessEvidence[];
+}, proveRun: (run: typeof heartbeatRuns.$inferSelect) => Promise<{ recheck: () => Promise<boolean>; current: () => boolean }>,
+  providerThread: (owner: typeof heartbeatRuns.$inferSelect) => unknown) {
   const refuse = (reason: string): never => { throw new Error(`reviewer_retirement_${reason}`); };
   const deadline = Date.now() + 25_000;
   const checkBudget = () => { if (Date.now() > deadline) refuse("time_budget"); };
@@ -3251,7 +3265,7 @@ export async function inspectStoppedNativeReviewerOwners(input: {
     const scope = nativeSessionScopeKey(execution);
     if (activeNativeSessions.has(run.id) || nativeSessionStartups.has(run.id) || executingRunnerdSessionScopes.has(scope) ||
         initializingSessionToolAuthorities.has(scope) || warmNativeSessions.has(scope)) refuse("owner_active");
-    processProofs.push(await proveReviewerRecordedOwnerStopped(run, input.processEvidence));
+    processProofs.push(await proveRun(run));
     scopes.set(scope, execution);
   }
   const snapshots: Array<{ root: string; providerFile: string; fingerprint: string; pids: number[] }> = [];
@@ -3294,10 +3308,7 @@ export async function inspectStoppedNativeReviewerOwners(input: {
         !["prepared", "session_open", "closed"].includes(String(snapshot.provider.lifecycle)) ||
         snapshot.provider.startupAttempt != null || !drain.providerSettled || drain.pendingEventCount !== 0 || invalidTools) refuse("current_scope_provider_unsettled");
     const config = record(snapshot.provider.config);
-    const providerEvents = input.processEvidence.filter(row => row.runId === owner.id &&
-      ["session.started", "session.resumed", "session.reconciled"].includes(row.eventType));
-    const lastProvider = record(record(record(providerEvents.at(-1)?.payload).prpEvent).payload);
-    const providerSessionId = lastProvider.driverSessionId ?? lastProvider.providerSessionId;
+    const providerSessionId = providerThread(owner);
     // Command is diagnostic here; no executable is selected or run by a stop proof.
     // Native resolved commands can be absolute paths; never hard-code the alias.
     if (config.provider !== "codex" || config.cwd !== ownerExecution.workspace.cwd || typeof config.command !== "string" ||
@@ -3338,7 +3349,7 @@ const nativeColdScopedProofs = new WeakSet<NativeColdScopedContinuationProof>();
  * Never close an owner, collect files, or modify a retained root here. */
 export async function prepareNativeColdScopedContinuation(input: {
   db: Db; previous: NativeExecutionInput; current: NativeExecutionInput;
-  localScoped: boolean; expectedFingerprint?: string; ownerToken?: symbol;
+  localScoped: boolean; expectedFingerprint?: string; expectedWarmOriginFingerprint?: unknown; ownerToken?: symbol;
 }): Promise<NativeColdScopedContinuationProof | null> {
   if (!input.localScoped || !hasChangedManagedNativeCopy(input.previous, input.current)) return null;
   const source = await readCompletedNativeColdSource(input.db, input.previous.binding.runId, input.current);
@@ -3350,21 +3361,52 @@ export async function prepareNativeColdScopedContinuation(input: {
   const ownerScope = nativeSessionOwnerScope(source.previous, environmentId);
   const epoch = observeNativeSessionToolWork(source.previous);
   const epochSettled = () => (epoch.runId === null || epoch.runId === source.run.id) && epoch.current();
-  const idle = () => !activeNativeSessions.has(source.run.id) && !nativeSessionStartups.has(source.run.id)
-    && !nativeRunsDetachingForRestart.has(source.run.id) && !nativeCancellationsInFlight.has(source.run.id) && !nativeRunRecoveryFlushers.has(source.run.id)
+  let observedRuns = [source.run];
+  const idle = () => observedRuns.every(run => !activeNativeSessions.has(run.id) && !nativeSessionStartups.has(run.id)
+    && !nativeRunsDetachingForRestart.has(run.id) && !nativeCancellationsInFlight.has(run.id) && !nativeRunRecoveryFlushers.has(run.id))
     && !warmNativeSessions.has(scope) && !closingWarmNativeSessions.has(scope) && !settlingNativeSessionScopes.has(scope)
     && !initializingSessionToolAuthorities.has(scope) && !executingRunnerdSessionScopes.has(scope)
     && epochSettled()
     && (!executingNativeOwnerScopes.has(ownerScope) || executingNativeOwnerScopes.get(ownerScope) === input.ownerToken);
   if (!idle()) coldContinuationHold("source_still_owned");
-  const events = await readReviewerProcessEvidence(input.db, source.run.companyId, [source.run.id]);
-  let physical: Awaited<ReturnType<typeof inspectStoppedNativeReviewerOwners>>;
-  try { physical = await inspectStoppedNativeReviewerOwners({ runs: [source.run], processEvidence: events }); }
-  catch { coldContinuationHold("physical_owner_unproven"); }
   const retainedRoot = scopedRunnerdStateRoot(source.previous);
   let rootSnapshot: ReturnType<typeof cleanupStateSnapshot>;
   try { rootSnapshot = cleanupStateSnapshot(retainedRoot); }
   catch { coldContinuationHold("retained_state_unavailable"); }
+  let originFingerprint: string | null | undefined;
+  const observePhysical = async (db: Db, actual: typeof source) => {
+    const snapshot = cleanupStateSnapshot(retainedRoot);
+    const warm = await readNativeColdWarmOrigin(db, actual, input.current, snapshot.control);
+    if (input.expectedFingerprint !== undefined
+      && (input.expectedWarmOriginFingerprint ?? null) !== (warm?.fingerprint ?? null)) coldContinuationHold("saved_warm_origin_changed");
+    if (originFingerprint !== undefined && originFingerprint !== (warm?.fingerprint ?? null)) coldContinuationHold("warm_observation_changed");
+    originFingerprint = warm?.fingerprint ?? null;
+    if (!warm) {
+      const events = await readReviewerProcessEvidence(db, actual.run.companyId, [actual.run.id]);
+      return inspectStoppedNativeReviewerOwners({ runs: [actual.run], processEvidence: events });
+    }
+    observedRuns = warm.runs;
+    if (!idle() || existsSync(resolve(retainedRoot, "authority-epochs"))
+      && readdirSync(resolve(retainedRoot, "authority-epochs")).length) coldContinuationHold("warm_generation_unsettled");
+    if (snapshot.provider.threadId !== warm.threadId
+      || (snapshot.provider.providerSessionId ?? null) !== warm.accountSessionId) coldContinuationHold("warm_provider_changed");
+    const originProof = await proveReviewerRecordedOwnerStopped(warm.origin, warm.processEvents);
+    const pids = new Set(warm.runs.flatMap(run => reviewerRecordedProcessIds({
+      processId: run.processPid, processGroupId: run.processGroupId,
+      checkpoint: record(run.runnerProfileJson).sessionCheckpoint,
+    })));
+    for (const row of warm.processEvents) for (const pid of reviewerRecordedProcessIds(row.payload)) pids.add(pid);
+    const absent = () => [...pids].every(cleanupProcessAbsent);
+    if (!absent()) coldContinuationHold("warm_recorded_process_alive");
+    return inspectStoppedNativeOwners({ runs: warm.runs, processEvidence: warm.processEvents }, async run =>
+      run.id === warm.origin.id ? originProof : { current: absent, recheck: async () => absent() }, () => warm.threadId);
+  };
+  let physical: Awaited<ReturnType<typeof inspectStoppedNativeReviewerOwners>>;
+  try { physical = await observePhysical(input.db, source); }
+  catch (error) {
+    if (error instanceof NativeProviderStateIncompatibleError) throw error;
+    coldContinuationHold("physical_owner_unproven");
+  }
   const provider = rootSnapshot.provider;
   if (provider.goal != null && (typeof provider.goal !== "object" || Array.isArray(provider.goal) || record(provider.goal).status !== "complete")) coldContinuationHold("provider_goal_unfinished");
   const targetBinding = nativeSha256(input.current.binding);
@@ -3381,9 +3423,11 @@ export async function prepareNativeColdScopedContinuation(input: {
       if (actual.fingerprint !== source.fingerprint) coldContinuationHold("observation_changed");
       // Reobserve at each actual boundary, rather than caching an elapsed
       // filesystem/process pass through preparation or a controller restart.
-      const currentEvents = await readReviewerProcessEvidence(db, source.run.companyId, [source.run.id]);
-      try { physical = await inspectStoppedNativeReviewerOwners({ runs: [actual.run], processEvidence: currentEvents }); }
-      catch { coldContinuationHold("physical_owner_unproven"); }
+      try { physical = await observePhysical(db, actual); }
+      catch (error) {
+        if (error instanceof NativeProviderStateIncompatibleError) throw error;
+        coldContinuationHold("physical_owner_unproven");
+      }
       if (!proof.current()) coldContinuationHold("observation_changed");
     },
     receiptFor: execution => {
@@ -3394,6 +3438,7 @@ export async function prepareNativeColdScopedContinuation(input: {
         || nativeSha256(execution.runtimeContext) !== nativeSha256(input.current.runtimeContext)) coldContinuationHold("fresh_selection_changed");
       return { schema: "paperclip.scoped-cold-continuation.v1", sourceRunId: source.run.id,
         sourceExecutionSha256: nativeSha256(source.previous), sourceAuthoritySha256: source.fingerprint,
+        sourceWarmOriginSha256: originFingerprint,
         targetExecutionSha256: nativeSha256(execution) };
     },
   };
@@ -9696,7 +9741,8 @@ export async function executePaperclipNativeSession(input: {
       catch { coldContinuationHold("saved_source_invalid"); }
       if (nativeSha256(previous) !== receipt.sourceExecutionSha256) coldContinuationHold("saved_source_changed");
       const proof = await prepareNativeColdScopedContinuation({ db: input.db, previous, current: input.execution,
-        localScoped: true, expectedFingerprint: String(receipt.sourceAuthoritySha256), ownerToken });
+        localScoped: true, expectedFingerprint: String(receipt.sourceAuthoritySha256),
+        expectedWarmOriginFingerprint: receipt.sourceWarmOriginSha256, ownerToken });
       if (!proof) coldContinuationHold("saved_selection_not_cold");
       input = { ...input, coldScopedContinuationProof: proof };
       preparedInput = input;
