@@ -24,6 +24,7 @@ import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
 import { onboardingFirstTaskAwaitingUserSql } from "./onboarding-first-task-wait.js";
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
 import { RESTRICTED_WORKSPACE_SOURCE_REASON } from "../workspace-source-restriction.js";
+import { getNativeStageReviewRecoveryContext } from "../native-runtime/native-stage-review.js";
 import { hasCommittedNativePlanWait } from "../native-runtime/native-plan-wait.js";
 import { listExternalReviewWaits } from "../native-runtime/external-review-wait.js";
 import { isNativeWorkspaceExportRepairCause } from "@paperclipai/shared";
@@ -246,6 +247,7 @@ type RecoveryWakeupOptions = {
   issueStateGuard?: {
     statuses: string[];
     assigneeAgentId: string;
+    statusVersion?: number;
   };
   allowRunCoalescing?: boolean;
 };
@@ -2066,6 +2068,15 @@ export function recoveryService(
       )
         return null;
     }
+    let nativeStageContext: Awaited<ReturnType<typeof getNativeStageReviewRecoveryContext>> = null;
+    if(input.reason===EXECUTION_REVIEW_PARTICIPANT_RECOVERY_REASON) {
+      const [currentIssue]=await db.select().from(issues).where(eq(issues.id,input.issueId));
+      const [reviewAgent]=await db.select().from(agents).where(eq(agents.id,input.agentId));
+      if(currentIssue && reviewAgent?.adapterType==="paperclip_runner" && parseIssueExecutionState(currentIssue.executionState)?.currentStageType==="review" && normalizeIssueExecutionPolicy(currentIssue.executionPolicy)?.totalReviewCycles===5) {
+        nativeStageContext=await getNativeStageReviewRecoveryContext(db,{companyId:currentIssue.companyId,issueId:input.issueId,agentId:input.agentId});
+        if(!nativeStageContext)return null;
+      }
+    }
     const queued = await deps.enqueueWakeup(input.agentId, {
       source: "automation",
       triggerDetail: "system",
@@ -2081,11 +2092,13 @@ export function recoveryService(
             },
           }
         : {}),
+      ...(nativeStageContext?{issueStateGuard:{statuses:["in_review"],assigneeAgentId:input.agentId,statusVersion:nativeStageContext.nativeStageStatusVersion}}:{}),
       payload: withRecoveryContext(
         {
           issueId: input.issueId,
           ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
           ...(input.extraContext ?? {}),
+          ...(nativeStageContext??{}),
         },
         "normal_model",
       ),
@@ -2100,6 +2113,7 @@ export function recoveryService(
           source: input.source,
           ...(input.retryOfRunId ? { retryOfRunId: input.retryOfRunId } : {}),
           ...(input.extraContext ?? {}),
+          ...(nativeStageContext??{}),
         },
         "normal_model",
       ),

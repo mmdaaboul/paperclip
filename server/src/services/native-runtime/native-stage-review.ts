@@ -1,11 +1,36 @@
 import { NativeProviderStateIncompatibleError } from "../../vendor/paperclip-runner/index.js";
 import { z } from "zod";
 import { and, eq } from "drizzle-orm";
-import { activityLog, issueExecutionDecisions, agents, agentWakeupRequests, heartbeatRuns, issues, issueReviewCycleBudgets, nativeRunResults, nativeRunFinalizations, statusDecisions, executionWorkspaces, type Db } from "@paperclipai/db";
+import { activityLog, issueExecutionDecisions, agents, agentWakeupRequests, heartbeatRuns, issues, issueReviewCycleBudgets, nativeRunResults, nativeRunFinalizations, statusDecisions, statusDecisionEffects, executionWorkspaces, type Db } from "@paperclipai/db";
 import { issueReviewCycleBudgetSchema } from "@paperclipai/shared";
 import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../issue-execution-policy.js";
 import { parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 import { nativeSha256 } from "./canonical.js";
+
+/** Resolve the native committer's durable intent through its exact effect.
+ * The dispatcher creates a SECOND row with the same idempotency key; its
+ * delivery failure is not the original stage authority. Never select by row
+ * order, accept arbitrary caller hints or fall back to another matching wake. */
+async function nativeStageWakeIntent(db:Db,input:{companyId:string;issueId:string;agentId:string;decisionId:string;stageId:string;intentId?:string}) {
+  const effects=await db.select().from(statusDecisionEffects).where(and(eq(statusDecisionEffects.companyId,input.companyId),
+    eq(statusDecisionEffects.issueId,input.issueId),eq(statusDecisionEffects.decisionId,input.decisionId),
+    eq(statusDecisionEffects.effectKind,"execution_stage_wake"),eq(statusDecisionEffects.targetType,"agent_wakeup_request"))).limit(2);
+  if(effects.length!==1)return null;
+  const effect=effects[0]!;
+  if(effect.deliveryState!=="delivered" || !effect.targetId || effect.payload.stageId!==input.stageId || effect.payload.agentId!==input.agentId
+    || input.intentId!==undefined && input.intentId!==effect.targetId)return null;
+  const [wake]=await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.id,effect.targetId),
+    eq(agentWakeupRequests.companyId,input.companyId),eq(agentWakeupRequests.agentId,input.agentId)));
+  if(!wake || wake.requestedByActorType!=="system" || wake.requestedByActorId!=="native-status-committer"
+    || wake.idempotencyKey!==`native-execution-stage:${input.decisionId}:${input.stageId}`)return null;
+  return wake;
+}
+
+function stageWakeTupleMatches(wake:typeof agentWakeupRequests.$inferSelect,context:{nativeStageDecisionId:string;nativeStageAdmissionId:string;nativeStageStatusVersion:number}) {
+  const payload=wake.payload, nested=payload?._paperclipWakeContext as Record<string,unknown>|undefined;
+  return [payload,nested].every(value=>value?.nativeStageDecisionId===context.nativeStageDecisionId
+    && value.nativeStageAdmissionId===context.nativeStageAdmissionId && value.nativeStageStatusVersion===context.nativeStageStatusVersion);
+}
 
 /** DB-derived normal-stage assignment. Hints alone never grant a review: the
  * latest task ledger, committed native result/decision and durable stage wake
@@ -29,8 +54,8 @@ export async function getNativeStageReviewAssignment(db:Db,input:{companyId:stri
   const [coordinator]=await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId,admission.builderRunId));
   if(!sourceRun || sourceRun.runtimeMode!=="native" || !result || result.schemaStatus!=="accepted" || admission.candidateId!==`native-result:${result.id}:${result.canonicalSha256}`
     || !sourceDecision || sourceDecision.applicationState!=="applied" || coordinator?.resultId!==result.id || coordinator.decisionId!==sourceDecision.id) return null;
-  const [wake]=await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId,input.companyId),eq(agentWakeupRequests.agentId,input.agentId),eq(agentWakeupRequests.idempotencyKey,`native-execution-stage:${sourceDecision.id}:${stage.id}`)));
-  if(!wake || ["cancelled","skipped","failed"].includes(wake.status)) return null;
+  const wake=await nativeStageWakeIntent(db,{...input,decisionId:sourceDecision.id,stageId:stage.id,intentId:context.nativeStatusWakeIntentId});
+  if(!wake || ["cancelled","skipped","failed"].includes(wake.status) || !stageWakeTupleMatches(wake,context)) return null;
   const capturedStage=(wake.payload as {executionStage?:{policySha256?:unknown;workspaceBindingRevision?:unknown;executionWorkspaceId?:unknown}}|null)?.executionStage;
   if(capturedStage?.policySha256!==nativeSha256(policy) || capturedStage.workspaceBindingRevision!==issue.workspaceBindingRevision || capturedStage.executionWorkspaceId!==issue.executionWorkspaceId) return null;
   let execution;try {execution=parseNativeExecutionInput(sourceRun.runnerProfileJson?.nativeExecutionInput);}catch{return null;}
@@ -49,7 +74,7 @@ export async function getNativeStageReviewAssignment(db:Db,input:{companyId:stri
     policySha256:nativeSha256(policy),executionSha256:nativeSha256(execution)};
 }
 
-const stageContextSchema=z.object({nativeStageDecisionId:z.string().guid(),nativeStageAdmissionId:z.string().guid(),nativeStageStatusVersion:z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)});
+const stageContextSchema=z.object({nativeStageDecisionId:z.string().guid(),nativeStageAdmissionId:z.string().guid(),nativeStageStatusVersion:z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),nativeStatusWakeIntentId:z.string().guid().optional()});
 export function readNativeStageReviewContext(value:unknown) {
   if(!value || typeof value!=="object" || Array.isArray(value))return null;
   if(!["nativeStageDecisionId","nativeStageAdmissionId","nativeStageStatusVersion"].some(key=>Object.hasOwn(value,key)))return null;
@@ -57,6 +82,22 @@ export function readNativeStageReviewContext(value:unknown) {
   if(!parsed.success)throw new NativeProviderStateIncompatibleError("native_stage_review_context_incompatible");
   return parsed.data;
 }
+/** Recovery derives fresh authority from the current server-owned ledger and
+ * committer, then reuses every normal-stage guard. It never copies authority
+ * from a failed run, generic stage hints or caller-supplied recovery text. */
+export async function getNativeStageReviewRecoveryContext(db:Db,input:{companyId:string;issueId:string;agentId:string}) {
+  const [issue]=await db.select().from(issues).where(and(eq(issues.companyId,input.companyId),eq(issues.id,input.issueId)));
+  const [ledger]=await db.select().from(issueReviewCycleBudgets).where(and(eq(issueReviewCycleBudgets.companyId,input.companyId),eq(issueReviewCycleBudgets.issueId,input.issueId)));
+  const admission=ledger?issueReviewCycleBudgetSchema.parse(ledger.ledger).admissions.at(-1):null;
+  if(!issue || !admission || admission.kind!=="normal")return null;
+  const [coordinator]=await db.select().from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId,input.companyId),eq(nativeRunFinalizations.issueId,input.issueId),eq(nativeRunFinalizations.runId,admission.builderRunId)));
+  if(!coordinator?.decisionId)return null;
+  const context={nativeStageDecisionId:coordinator.decisionId,nativeStageAdmissionId:admission.id,nativeStageStatusVersion:issue.statusVersion};
+  const proof=await getNativeStageReviewAssignment(db,{...input,contextSnapshot:context});
+  if(!proof)return null;
+  return {...context,nativeStatusWakeIntentId:proof.wake.id,executionStage:proof.wake.payload?.executionStage,forceFreshSession:true};
+}
+
 export function nativeStageAssignmentRecord(proof: NonNullable<Awaited<ReturnType<typeof getNativeStageReviewAssignment>>>) {
   return {kind:"execution_stage_review" as const,stageId:proof.stage.id,admissionId:proof.admission.id,
     sourceDecisionId:proof.sourceDecision.id,sourceRunId:proof.sourceRun.id,builderAgentId:proof.sourceRun.agentId,
@@ -92,11 +133,11 @@ export async function historicalNativeStageDecision(db:Db,input:{companyId:strin
   const [sourceDecision]=await db.select().from(statusDecisions).where(and(eq(statusDecisions.id,record.sourceDecisionId),eq(statusDecisions.companyId,input.companyId),eq(statusDecisions.issueId,input.issueId),eq(statusDecisions.runId,record.sourceRunId)));
   const [result]=await db.select().from(nativeRunResults).where(and(eq(nativeRunResults.id,record.admissionId),eq(nativeRunResults.companyId,input.companyId),eq(nativeRunResults.issueId,input.issueId),eq(nativeRunResults.runId,record.sourceRunId)));
   const [coordinator]=await db.select().from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.runId,record.sourceRunId),eq(nativeRunFinalizations.companyId,input.companyId),eq(nativeRunFinalizations.issueId,input.issueId)));
-  const [wake]=await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId,input.companyId),eq(agentWakeupRequests.agentId,input.agentId),eq(agentWakeupRequests.idempotencyKey,`native-execution-stage:${record.sourceDecisionId}:${record.stageId}`)));
+  const wake=await nativeStageWakeIntent(db,{...input,decisionId:record.sourceDecisionId,stageId:record.stageId,intentId:context.nativeStatusWakeIntentId});
   const captured=(wake?.payload as {executionStage?:{policySha256?:unknown;workspaceBindingRevision?:unknown}}|null)?.executionStage;
   if(!sourceRun || sourceRun.runtimeMode!=="native" || !sourceDecision || sourceDecision.applicationState!=="applied" || !result || result.schemaStatus!=="accepted"
     || result.completionContractId!==sourceRun.completionContractId || admission.candidateId!==`native-result:${result.id}:${result.canonicalSha256}`
-    || coordinator?.resultId!==result.id || coordinator.decisionId!==sourceDecision.id || captured?.policySha256!==record.policySha256 || captured.workspaceBindingRevision!==record.workspaceBindingRevision)return null;
+    || coordinator?.resultId!==result.id || coordinator.decisionId!==sourceDecision.id || !wake || !stageWakeTupleMatches(wake,{nativeStageDecisionId:record.sourceDecisionId,nativeStageAdmissionId:record.admissionId,nativeStageStatusVersion:record.statusVersion}) || captured?.policySha256!==record.policySha256 || captured.workspaceBindingRevision!==record.workspaceBindingRevision)return null;
   let execution;try{execution=parseNativeExecutionInput(sourceRun.runnerProfileJson?.nativeExecutionInput);}catch{return null;}
   if(nativeSha256(execution)!==record.executionSha256)return null;
   return {decision,request,record,sourceRun,sourceDecision};

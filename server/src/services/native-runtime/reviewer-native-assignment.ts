@@ -35,7 +35,10 @@ export async function resolveNativeReviewerAssignment(db: Db, input: {
       : {kind:"native_completion_review",interactionId:native.interaction.id,...source});
     return {record,sourceRun:native.sourceRun,sourceDecision:native.sourceDecision};
   }
-  const stage=await getNativeStageReviewAssignment(db,{...input,...(input.actingRunId?{runId:input.actingRunId}:{})});
+  // Workspace startup carries a binding.runId before native conversion. Only
+  // the intentional actingRunId may enable the stricter post-conversion fence.
+  const stage=await getNativeStageReviewAssignment(db,{companyId:input.companyId,issueId:input.issueId,
+    agentId:input.agentId,contextSnapshot:input.contextSnapshot,...(input.actingRunId?{runId:input.actingRunId}:{})});
   if(stage)return {record:nativeReviewerAssignmentRecordSchema.parse(nativeStageAssignmentRecord(stage)),sourceRun:stage.sourceRun,sourceDecision:stage.sourceDecision};
   if(input.actingRunId && input.allowResolvedByRunId===input.actingRunId) {
     const receipt=await historicalNativeStageDecision(db,{...input,runId:input.actingRunId});

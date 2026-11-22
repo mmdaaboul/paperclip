@@ -1,3 +1,5 @@
+import { getNativeStageReviewRecoveryContext, readNativeStageReviewContext } from "../native-runtime/native-stage-review.js";
+import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../issue-execution-policy.js";
 import { runOwnerFenceHeldSql } from "../remote-workspace-writer-hold.js";
 import { isInterruptedNativePreparation } from "../cancelled-native-startup.js";
 import { isPreDispatchExecutionWaitVerified } from "../pre-dispatch-execution-wait.js";
@@ -782,7 +784,8 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
             | "issue_terminal_status"
             | "issue_not_in_progress"
             | "continuation_user_authorization_missing"
-            | "issue_execution_lock_changed";
+            | "issue_execution_lock_changed"
+              | "native_stage_review_retry_assignment_changed";
           issueId: string | null;
           details: Record<string, unknown>;
         };
@@ -1057,6 +1060,22 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
               reason: "Subscription retry suppressed because the task execution lock changed",
               details: { issueId, expectedExecutionRunId: run.id, currentExecutionRunId: lockedIssue?.executionRunId ?? null },
             };
+          }
+        }
+
+        if(issueId) {
+          const [currentIssue]=await tx.select().from(issues).where(and(eq(issues.companyId,run.companyId),eq(issues.id,issueId)));
+          const known=readNativeStageReviewContext(contextSnapshot);
+          if(known && parseObject(contextSnapshot.executionStage).stageType!=="approval" || currentIssue?.status==="in_review" && agent.adapterType==="paperclip_runner"
+            && parseIssueExecutionState(currentIssue.executionState)?.currentStageType==="review" && normalizeIssueExecutionPolicy(currentIssue.executionPolicy)?.totalReviewCycles===5) {
+            const current=await getNativeStageReviewRecoveryContext(tx as unknown as Db,{companyId:run.companyId,issueId,agentId:run.agentId});
+            if(!known || !current || known.nativeStageDecisionId!==current.nativeStageDecisionId
+              || known.nativeStageAdmissionId!==current.nativeStageAdmissionId || known.nativeStageStatusVersion!==current.nativeStageStatusVersion
+              || known.nativeStatusWakeIntentId!==undefined && known.nativeStatusWakeIntentId!==current.nativeStatusWakeIntentId) return {
+              outcome:"not_scheduled",issueId,errorCode:"native_stage_review_retry_assignment_changed",
+              reason:"Native review retry requires the unchanged current stage and canonical intent.",details:{},
+            };
+            Object.assign(retryContextSnapshot,current);
           }
         }
 

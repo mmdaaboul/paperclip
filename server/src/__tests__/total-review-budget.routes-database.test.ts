@@ -200,7 +200,7 @@ async function stageFixture() {
   return {...base,candidate,committed,wake,context,reviewerRun,reviewerApp:await base.agentApp(base.reviewer.id,reviewerRun.id)};
 }
 
-async function qualifyProtectedReview(f:Awaited<ReturnType<typeof stageFixture>>|Awaited<ReturnType<typeof reviewingDraftFixture>>) {
+async function qualifyProtectedReview(f:Awaited<ReturnType<typeof stageFixture>>|Awaited<ReturnType<typeof reviewingDraftFixture>>, convertAfterPreparation=false) {
   const previousHome=process.env.PAPERCLIP_HOME;
   let child:ReturnType<typeof spawn>|undefined;
   try {
@@ -212,6 +212,8 @@ async function qualifyProtectedReview(f:Awaited<ReturnType<typeof stageFixture>>
   const identity={companyId:f.company.id,agentId:f.reviewer.id,runId:f.reviewerRun.id,issueId:f.issue.id,projectId:f.workspace.projectId!,workspaceId:f.workspace.id,workspaceDirectory:f.workspace.cwd!,executionDriver:"local" as const};
   await (await import("../services/agent-reference-folder-admission.js")).prepareAgentReferenceFolderAdmission(db,{agent, ...identity});
   const admission=(await (await import("../services/native-runtime/reviewer-workspace-admission.js")).prepareNativeReviewerWorkspaceAdmission(db,identity))!;
+  // Actual startup prepares the protected workspace BEFORE native conversion.
+  if(convertAfterPreparation)await db.update(heartbeatRuns).set({runtimeMode:"native",nativeIssueId:f.issue.id}).where(eq(heartbeatRuns.id,f.reviewerRun.id));
   const asset=await (await import("../services/native-runtime/runtime-context.js")).materializeAsset([{path:"AGENTS.md",content:Buffer.from("Synthetic protected review"),mode:0o400},{path:admission.instructionFile.path,content:Buffer.from(admission.instructionFile.content),mode:0o400}]);
   const base=(await import("../services/native-runtime/runtime-context.test-fixture.js")).nativeRuntimeContextFixture();
   const context={...base,instructions:{entryPath:"AGENTS.md",bundle:asset}};
@@ -848,6 +850,79 @@ describe("actual normal PATCH + native postgres-js + native issue service (injec
     const [wake]=await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId,base.company.id),eq(agentWakeupRequests.agentId,base.reviewer.id)));
     const {getNativeStageReviewAssignment}=await import("../services/native-runtime/native-stage-review.js");expect(await getNativeStageReviewAssignment(db,{companyId:base.company.id,issueId:base.issue.id,agentId:base.reviewer.id,contextSnapshot:(wake.payload as any)._paperclipWakeContext})).not.toBeNull();
     expect((await base.ledger()).admissions).toHaveLength(1);
+  });
+  it("actual normal-stage pre-native workspace admission ignores incidental binding runId but keeps acting-run fences",async()=>{
+    const f=await stageFixture();
+    const {heartbeatService}=await import("../services/heartbeat.js");
+    await heartbeatService(db).dispatchPendingNativeStatusWakeups({companyId:f.company.id,requestId:f.wake.id});
+    const [delivery]=await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.requestedByActorId,`native-status-wake-dispatch:${f.wake.id}`));
+    expect(delivery).toBeDefined();
+    await db.update(agentWakeupRequests).set({status:"failed"}).where(eq(agentWakeupRequests.id,delivery.id));
+    await db.update(heartbeatRuns).set({runtimeMode:"legacy",nativeIssueId:null}).where(eq(heartbeatRuns.id,f.reviewerRun.id));
+    const protectedRun=await qualifyProtectedReview(f,true);
+    try {
+      expect(protectedRun.admission.record.assignment.kind).toBe("execution_stage_review");
+      const {resolveNativeReviewerAssignment}=await import("../services/native-runtime/reviewer-native-assignment.js");
+      const input={companyId:f.company.id,issueId:f.issue.id,agentId:f.reviewer.id,contextSnapshot:f.context,actingRunId:f.reviewerRun.id};
+      expect(await resolveNativeReviewerAssignment(db,input)).not.toBeNull();
+      expect(await resolveNativeReviewerAssignment(db,{...input,actingRunId:randomUUID()})).toBeNull();
+      await db.update(heartbeatRuns).set({runtimeMode:"legacy",nativeIssueId:null}).where(eq(heartbeatRuns.id,f.reviewerRun.id));
+      expect(await resolveNativeReviewerAssignment(db,input)).toBeNull();
+      expect((await f.ledger()).admissions).toHaveLength(1);
+    }finally{await protectedRun.close();}
+  });
+  it("normal-stage authority selects the exact committer effect intent across failed duplicate delivery and rejects forged intent",async()=>{
+    const f=await stageFixture();
+    const {heartbeatService}=await import("../services/heartbeat.js");
+    await heartbeatService(db).dispatchPendingNativeStatusWakeups({companyId:f.company.id,requestId:f.wake.id});
+    const [delivery]=await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.requestedByActorId,`native-status-wake-dispatch:${f.wake.id}`));
+    expect(delivery).toBeDefined();expect(delivery.id).not.toBe(f.wake.id);expect(delivery.idempotencyKey).toBe(f.wake.idempotencyKey);
+    await db.update(agentWakeupRequests).set({status:"failed"}).where(eq(agentWakeupRequests.id,delivery.id));
+    const {getNativeStageReviewAssignment,getNativeStageReviewRecoveryContext}=await import("../services/native-runtime/native-stage-review.js");
+    const input={companyId:f.company.id,issueId:f.issue.id,agentId:f.reviewer.id,contextSnapshot:{...f.context,nativeStatusWakeIntentId:f.wake.id}};
+    expect((await getNativeStageReviewAssignment(db,input))?.wake.id).toBe(f.wake.id);
+    expect(await getNativeStageReviewAssignment(db,{...input,contextSnapshot:{...f.context,nativeStatusWakeIntentId:delivery.id}})).toBeNull();
+    expect(await getNativeStageReviewRecoveryContext(db,input)).toMatchObject({nativeStageDecisionId:f.context.nativeStageDecisionId,nativeStageAdmissionId:f.context.nativeStageAdmissionId,nativeStageStatusVersion:f.context.nativeStageStatusVersion,nativeStatusWakeIntentId:f.wake.id,forceFreshSession:true});
+    await db.update(statusDecisionEffects).set({deliveryState:"failed"}).where(and(eq(statusDecisionEffects.decisionId,f.context.nativeStageDecisionId),eq(statusDecisionEffects.effectKind,"execution_stage_wake")));
+    expect(await getNativeStageReviewAssignment(db,input)).toBeNull();expect(await getNativeStageReviewRecoveryContext(db,input)).toBeNull();
+  });
+  it("normal-stage recovery enqueue derives native whitelist and guards current issue version without granting stale work",async()=>{
+    const f=await stageFixture();
+    await db.update(heartbeatRuns).set({status:"succeeded",finishedAt:new Date()}).where(eq(heartbeatRuns.id,f.reviewerRun.id));
+    await db.update(issues).set({executionRunId:null,checkoutRunId:null}).where(eq(issues.id,f.issue.id));
+    await db.update(agentWakeupRequests).set({status:"completed",finishedAt:new Date()}).where(eq(agentWakeupRequests.id,f.wake.id));
+    const {recoveryService}=await import("../services/recovery/service.js");
+    const enqueueWakeup=vi.fn(async()=>null);
+    const service=recoveryService(db,{enqueueWakeup});
+    await service.reconcileStrandedAssignedIssues({companyId:f.company.id,issueId:f.issue.id,skipRelatedRecovery:true,skipExternalConversationSettlement:true});
+    expect(enqueueWakeup).toHaveBeenCalledTimes(1);
+    const [agentId,options]=(enqueueWakeup.mock.calls as unknown as [string,any][])[0];
+    expect(agentId).toBe(f.reviewer.id);expect(options.contextSnapshot).toMatchObject({nativeStageDecisionId:f.context.nativeStageDecisionId,nativeStageAdmissionId:f.context.nativeStageAdmissionId,nativeStageStatusVersion:f.context.nativeStageStatusVersion,nativeStatusWakeIntentId:f.wake.id,forceFreshSession:true});
+    expect(options.payload).toMatchObject({nativeStageDecisionId:f.context.nativeStageDecisionId,nativeStageAdmissionId:f.context.nativeStageAdmissionId,nativeStageStatusVersion:f.context.nativeStageStatusVersion,nativeStatusWakeIntentId:f.wake.id});
+    expect(options.issueStateGuard).toEqual({statuses:["in_review"],assigneeAgentId:f.reviewer.id,statusVersion:f.context.nativeStageStatusVersion});
+    enqueueWakeup.mockClear();await db.update(issues).set({statusVersion:sql`${issues.statusVersion}+1`}).where(eq(issues.id,f.issue.id));
+    await service.reconcileStrandedAssignedIssues({companyId:f.company.id,issueId:f.issue.id,skipRelatedRecovery:true,skipExternalConversationSettlement:true});
+    expect(enqueueWakeup).not.toHaveBeenCalled();
+    await db.update(issues).set({statusVersion:f.context.nativeStageStatusVersion,workspaceBindingRevision:sql`${issues.workspaceBindingRevision}+1`}).where(eq(issues.id,f.issue.id));
+    await service.reconcileStrandedAssignedIssues({companyId:f.company.id,issueId:f.issue.id,skipRelatedRecovery:true,skipExternalConversationSettlement:true});
+    expect(enqueueWakeup).not.toHaveBeenCalled();expect((await f.ledger()).admissions).toHaveLength(1);
+  });
+  it.each(["current","stale_version","missing_context"] as const)("normal-stage bounded retry revalidates canonical authority under native issue lock: %s",async mode=>{
+    const f=await stageFixture();
+    const [failed]=await db.update(heartbeatRuns).set({runtimeMode:"legacy",nativeIssueId:null,status:"failed",errorCode:"adapter_failed",error:"Synthetic pre-native admission failure",resultJson:{executionRecovery:{kind:"bootstrap",providerWorkStarted:false}},finishedAt:new Date(),contextSnapshot:mode==="missing_context"?{issueId:f.issue.id}:f.context}).where(eq(heartbeatRuns.id,f.reviewerRun.id)).returning();
+    await db.update(issues).set({executionRunId:null,checkoutRunId:null,...(mode==="stale_version"?{statusVersion:sql`${issues.statusVersion}+1`}:{})}).where(eq(issues.id,f.issue.id));
+    await db.update(agentWakeupRequests).set({status:"completed",finishedAt:new Date()}).where(eq(agentWakeupRequests.id,f.wake.id));
+    const {heartbeatService}=await import("../services/heartbeat.js");
+    const result=await heartbeatService(db).scheduleBoundedRetry(failed.id,{random:()=>0,delayMs:60000,retryReason:"transient_failure",maxAttempts:1});
+    const successors=await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId,failed.id));
+    if(mode==="current") {
+      expect(result).toMatchObject({outcome:"scheduled"});expect(successors).toHaveLength(1);
+      expect(successors[0].contextSnapshot).toMatchObject({nativeStageDecisionId:f.context.nativeStageDecisionId,nativeStageAdmissionId:f.context.nativeStageAdmissionId,nativeStageStatusVersion:f.context.nativeStageStatusVersion,nativeStatusWakeIntentId:f.wake.id,forceFreshSession:true});
+      const same=await heartbeatService(db).scheduleBoundedRetry(failed.id,{random:()=>0,delayMs:60000,retryReason:"transient_failure",maxAttempts:1});
+      expect(same).toMatchObject({outcome:"scheduled",run:{id:successors[0].id}});
+    }else {expect(result).toMatchObject({outcome:"not_scheduled",errorCode:"native_stage_review_retry_assignment_changed"});expect(successors).toHaveLength(0);}
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,failed.id)))[0].contextSnapshot).toEqual(failed.contextSnapshot);
+    expect((await f.ledger()).admissions).toHaveLength(1);
   });
   it("native scheduler consumes scoped return intent once and defers actual dispatch until Reviewer release",async()=>{
     const f=await reviewingDraftFixture();ok(await request(f.reviewerApp).post(`/api/issues/${f.issue.id}/interactions/${f.scope.interactionId}/accept`).send({}));
