@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {readFileSync,mkdtempSync,mkdirSync,writeFileSync,chmodSync,symlinkSync,linkSync,rmSync} from 'node:fs';
-import {join} from 'node:path';
+import {dirname,join} from 'node:path';
 import {spawnSync} from 'node:child_process';
 import {fileURLToPath} from 'node:url';
-import {validateSandboxHost,sandboxRepairDecision,profileLoadDecision,validateProbeReceipt,namespaceRefusal,diagnosticHostIdentity,projectTrustRefusal,trustedFile,snapshotSystemTrust,attachmentMayMatch,inspectLoadedAttachments,SANDBOX_LIMITS,PROFILE_CONTRACT,validateAuthenticatedProfile,readAuthenticatedProfile,includeDirectives,validateRootStageMetadata,validateLoadedProfileDelta,verifyRootStage,inspectProfileIncludeGraph,preserveSandboxFailure} from './qualify-native-sandbox.mjs';
+import {validateSandboxHost,sandboxRepairDecision,profileLoadDecision,validateProbeReceipt,namespaceRefusal,diagnosticHostIdentity,projectTrustRefusal,trustedFile,snapshotSystemTrust,attachmentMayMatch,inspectLoadedAttachments,SANDBOX_LIMITS,PROFILE_CONTRACT,validateAuthenticatedProfile,readAuthenticatedProfile,includeDirectives,validateRootStageMetadata,validateLoadedProfileDelta,verifyRootStage,stageAuthenticatedProfile,inspectProfileIncludeGraph,preserveSandboxFailure} from './qualify-native-sandbox.mjs';
 const host=()=>({os:'ubuntu',release:'24.04',uid:1001,bwrapPresent:true,bwrapTrusted:true,bwrapPackageOwned:true,apparmor:true,restrictedUserns:1,maxUserNamespaces:10000,usernsClone:1,seccomp:0});
 const proof=()=>({schema:'paperclip.native-sandbox-probe.v1',uid:1001,codexVersion:'0.160.0',bwrapPath:'/usr/bin/bwrap',wrapperSha256:'a'.repeat(64),nativeElfSha256:'b'.repeat(64),bwrapSha256:'c'.repeat(64),nativeSandbox:true,allowedRead:true,scratchWrite:true,candidateDenied:true,referenceDenied:true,protectedDenied:true,protectedReadDenied:true,metadataDenied:true,outsideDenied:true,networkDenied:true,outsideNetworkControl:true,originalBytesPreserved:true,executionLabel:{schema:'paperclip.native-sandbox-execution-label.v1',uid:1001,path:'/proc/self/attr/apparmor/current',entry:'bwrap//&unpriv_bwrap (enforce)',exit:'bwrap//&unpriv_bwrap (enforce)',mode:'enforce',profiles:['bwrap','unpriv_bwrap'],identityBookends:true,challengeSha256:'d'.repeat(64)}});
 test('a genuine passing normal-user native sandbox requires no host change',()=>{assert.equal(sandboxRepairDecision(host(),'passed'),'none');assert.equal(validateProbeReceipt(proof()).uid,1001);});
@@ -41,13 +41,81 @@ test('actual parent/file trust diagnostic refuses foreign ownership with default
 test('trust diagnostic accepts only actual normal-user Ubuntu24 identity',()=>{const os='ID=ubuntu\nVERSION_ID="24.04"\n';assert.deepEqual(diagnosticHostIdentity(1001,os),{uid:1001,os:'ubuntu',osVersion:'24.04'});assert.throws(()=>diagnosticHostIdentity(0,os),/normal_user/);for(const wrong of ['ID=debian\nVERSION_ID="24.04"\n','ID=ubuntu\nVERSION_ID="22.04"\n','ImageOS=ubuntu24'])assert.throws(()=>diagnosticHostIdentity(1001,wrong),/unsupported/);});
 
 const authentic=()=>readFileSync(new URL('./fixtures/native-bwrap-userns-restrict',import.meta.url));
+
+function stageFixture() {
+ const source='6ce3dd9293f97d682f15f3ad6c075a558fcd9a64';
+ const directory=join('/etc/apparmor.d','.paperclip-native-'+source.slice(0,12));
+ const file=join(directory,'profile'),bytes=authentic(),executables=new Map(),metadata=new Map(),calls=[];
+ const facts=(type,mode,extra={})=>({
+  uid:0,gid:0,mode,nlink:1,size:40,dev:2049,ino:2116,
+  isFile:()=>type==='file',isDirectory:()=>type==='directory',isSymbolicLink:()=>type==='symlink',
+  ...extra,
+ });
+ for(const path of ['/usr/bin/sudo','/usr/bin/dpkg-query','/usr/bin/mkdir','/usr/bin/tee','/usr/bin/stat','/usr/bin/sha256sum','/usr/bin/install']){
+  executables.set(path,Buffer.from('native fixture for '+path));
+  metadata.set(path,facts('file',path==='/usr/bin/sudo'?0o4755:0o755));
+  for(let parent=dirname(path);;parent=dirname(parent)){metadata.set(parent,facts('directory',0o755));if(parent==='/')break;}
+ }
+ for(const parent of ['/etc','/etc/apparmor.d'])metadata.set(parent,facts('directory',0o755));
+ const io={
+  lstat(path){if(!metadata.has(path))throw Object.assign(Error('absent'),{code:'ENOENT'});return metadata.get(path);},
+  realpath:path=>path,
+  read(path){assert(executables.has(path));return executables.get(path);},
+ };
+ const controls={owner:'sudo: /usr/bin/sudo\n'};
+ function run(binary,args,input){
+  calls.push([binary,...args]);
+  if(binary==='/usr/bin/dpkg-query'){assert.deepEqual(args,['-S','/usr/bin/sudo']);return {ok:true,stdout:controls.owner};}
+  assert.equal(binary,'/usr/bin/sudo');
+  assert.equal(args[0],'-n');
+  const target=args.at(-1);
+  if(args[1]==='/usr/bin/mkdir'){assert.deepEqual(args,['-n','/usr/bin/mkdir','--mode=0700','--',directory]);return {ok:true};}
+  if(args[1]==='/usr/bin/tee'){assert.deepEqual(args,['-n','/usr/bin/tee','--',file]);assert(input.equals(bytes));return {ok:true,stdout:bytes};}
+  if(args[1]==='/usr/bin/stat'){assert(['profile',directory.split('/').at(-1)].some(name=>target.endsWith('/'+name)));return {ok:true,stdout:target===directory?'0:0:700:2:4096:2049:4242:directory':'0:0:644:1:1936:2049:4243:regular file'};}
+  assert.deepEqual(args,['-n','/usr/bin/sha256sum','--',file]);
+  return {ok:true,stdout:PROFILE_CONTRACT.profile.sha256+'  '+file+'\n'};
+ }
+ return {source,directory,file,bytes,metadata,io,controls,run,calls};
+}
+
+test('composed staging accepts the observed root-owned 04755 sudo and keeps each tool, stat and digest bound',()=>{
+ const f=stageFixture();
+ const stage=stageAuthenticatedProfile(f.bytes,f.source,f.run,f.io);
+ assert.equal(stage.proof.executor.mode,0o4755);
+ assert.equal(stage.proof.executor.path,'/usr/bin/sudo');
+ assert.equal(stage.proof.executor.package,'sudo');
+ assert.match(stage.proof.executor.sha256,/^[a-f0-9]{64}$/);
+ assert.equal(stage.path,f.file);
+ assert.equal(stage.proof.sha256,PROFILE_CONTRACT.profile.sha256);
+ assert.deepEqual(f.calls.map(([command,,tool])=>command==='/usr/bin/sudo'?tool:command),[
+  '/usr/bin/dpkg-query','/usr/bin/mkdir','/usr/bin/stat','/usr/bin/tee','/usr/bin/stat','/usr/bin/stat','/usr/bin/stat','/usr/bin/sha256sum',
+ ]);
+});
+for(const [name,change] of [
+ ['non-setuid sudo',f=>{f.metadata.get('/usr/bin/sudo').mode=0o755;}],
+ ['group-setid sudo',f=>{f.metadata.get('/usr/bin/sudo').mode=0o6755;}],
+ ['group-writable sudo',f=>{f.metadata.get('/usr/bin/sudo').mode=0o4775;}],
+ ['non-root sudo group',f=>{f.metadata.get('/usr/bin/sudo').gid=1001;}],
+ ['non-root sudo owner',f=>{f.metadata.get('/usr/bin/sudo').uid=1001;}],
+ ['hardlinked sudo',f=>{f.metadata.get('/usr/bin/sudo').nlink=2;}],
+ ['noncanonical sudo',f=>{f.io.realpath=p=>p==='/usr/bin/sudo'?'/tmp/sudo':p;}],
+ ['writable ancestor',f=>{f.metadata.get('/usr/bin').mode=0o777;}],
+ ['another setuid stage tool',f=>{f.metadata.get('/usr/bin/tee').mode=0o4755;}],
+ ['another sudo package',f=>{f.controls.owner='other: /usr/bin/sudo\n';}],
+]){
+ test('composed staging refuses '+name+' before any privileged action',()=>{
+  const f=stageFixture();change(f);
+  assert.throws(()=>stageAuthenticatedProfile(f.bytes,f.source,f.run,f.io),/sandbox_(system_(file|parent)_unsafe|stage_sudo_package_owner)/);
+  assert(f.calls.every(([command])=>command==='/usr/bin/dpkg-query'));
+ });
+}
 test('authenticated profile accepts official bytes and rejects every changed or oversized input before privilege',()=>{assert.equal(validateAuthenticatedProfile(authentic()).length,1936);for(const bytes of [Buffer.from('unconfined'),Buffer.concat([authentic(),Buffer.from('\n')]),Buffer.from(authentic()).fill(0,1,2)])assert.throws(()=>validateAuthenticatedProfile(bytes),/authenticated_profile_mismatch/);});
 test('untrusted writable ancestry may supply exact public data but never gains trusted-path status',()=>{const base=mkdtempSync(join(process.env.PAPERCLIP_DIAGNOSTIC_TEST_SCRATCH,'profile-'));try{const parent=join(base,'writable');mkdirSync(parent,{mode:0o777});chmodSync(parent,0o777);const path=join(parent,'profile');writeFileSync(path,authentic());assert(readAuthenticatedProfile(path).equals(authentic()));assert.throws(()=>trustedFile(path,65536,process.getuid()),/system_parent_unsafe/);writeFileSync(path,Buffer.from(authentic()).fill(0,0,1));assert.throws(()=>readAuthenticatedProfile(path),/authenticated_profile_mismatch/);}finally{rmSync(base,{recursive:true,force:true});}});
 test('untrusted profile data refuses symlinks and hardlink aliases',()=>{const base=mkdtempSync(join(process.env.PAPERCLIP_DIAGNOSTIC_TEST_SCRATCH,'profile-'));try{const path=join(base,'profile');writeFileSync(path,authentic());linkSync(path,join(base,'alias'));assert.throws(()=>readAuthenticatedProfile(path),/untrusted_profile_identity/);symlinkSync(path,join(base,'link'));assert.throws(()=>readAuthenticatedProfile(join(base,'link')));}finally{rmSync(base,{recursive:true,force:true});}});
 test('include parser retains mandatory ABI/tunables and both optional local imports, rejecting traversal and unknown syntax',()=>{assert.deepEqual(includeDirectives(authentic()),[{path:'abi/4.0',optional:false},{path:'tunables/global',optional:false},{path:'local/bwrap-userns-restrict',optional:true},{path:'local/unpriv_bwrap',optional:true}]);for(const text of ['include </tmp/x>','include <../x>','include "elsewhere"','abi <abi/@{X}>,'])assert.throws(()=>includeDirectives(Buffer.from(text)),/include_syntax_unknown/);});
 test('root-sealed staging rejects writable envelopes, aliases, foreign owners and mismatched size',()=>{const dir={uid:0,gid:0,mode:0o700,type:'directory',dev:1,ino:2},file={uid:0,gid:0,mode:0o644,type:'regular file',dev:1,ino:3,nlink:1,bytes:1936};assert(validateRootStageMetadata(dir,file,PROFILE_CONTRACT.profile));for(const bad of [{...dir,uid:1001},{...dir,mode:0o777},{...dir,type:'symbolic link'}])assert.throws(()=>validateRootStageMetadata(bad,file,PROFILE_CONTRACT.profile),/root_stage_unsafe/);for(const bad of [{...file,nlink:2},{...file,mode:0o666},{...file,uid:1001},{...file,bytes:1937},{...file,type:'symbolic link'}])assert.throws(()=>validateRootStageMetadata(dir,bad,PROFILE_CONTRACT.profile),/root_stage_unsafe/);});
 test('loaded-policy delta requires both exact official profile names and preserves every preexisting attachment',()=>{const base='/sys/kernel/security/apparmor/policy/profiles/',before={names:'other (enforce)\n',tree:base+'o/name:other\n'+base+'o/attach:/bin/other\n'},after={names:before.names+'bwrap (enforce)\nunpriv_bwrap (enforce)\n',tree:before.tree+base+'b/name:bwrap\n'+base+'b/attach:/usr/bin/bwrap\n'+base+'u/name:unpriv_bwrap\n'+base+'u/attach:<unknown>\n'};assert(validateLoadedProfileDelta(before,after));assert(validateLoadedProfileDelta(before,{...after,tree:after.tree.replace('u/attach:<unknown>','u/attach:unpriv_bwrap')}));for(const bad of [{...after,names:after.names.replace('unpriv_bwrap (enforce)\n','')},{...after,tree:after.tree.replace('/bin/other','/changed')},{...after,tree:after.tree.replace('/usr/bin/bwrap','/anywhere')},{...after,names:after.names+'unrelated (enforce)\n'}])assert.throws(()=>validateLoadedProfileDelta(before,bad),/unproven|changed/);});
-test('fixed parser invocation disables cache and uses authenticated comment-only config with trusted etc search roots',()=>{assert.deepEqual(PROFILE_CONTRACT.parserArgs,['--config-file','/etc/apparmor/parser.conf','-K','-b','/etc/apparmor.d','-I','/etc/apparmor.d','-a','/etc/apparmor.d/bwrap-userns-restrict']);const source=readFileSync(new URL('./qualify-native-sandbox.mjs',import.meta.url),'utf8');assert(source.includes("trustedDirectory('/etc/apparmor.d')"));assert(source.includes("'/usr/bin/tee','--',path],bytes"));assert(!source.includes("'0644',packaged,destination"));assert(!source.includes("flags=\\(unconfined\\)"));});
+test('fixed parser invocation disables cache and uses authenticated comment-only config with trusted etc search roots',()=>{assert.deepEqual(PROFILE_CONTRACT.parserArgs,['--config-file','/etc/apparmor/parser.conf','-K','-b','/etc/apparmor.d','-I','/etc/apparmor.d','-a','/etc/apparmor.d/bwrap-userns-restrict']);const source=readFileSync(new URL('./qualify-native-sandbox.mjs',import.meta.url),'utf8');assert(source.includes("trustedDirectory('/etc/apparmor.d',io)"));assert(source.includes("'/usr/bin/tee','--',path],bytes"));assert(!source.includes("'0644',packaged,destination"));assert(!source.includes("flags=\\(unconfined\\)"));});
 
 test('actual root-stage verifier joins root stat and SHA replies and refuses digest or object replacement',()=>{const directory='/etc/apparmor.d/.paperclip-native-'+'a'.repeat(12),path=directory+'/profile',dir={uid:0,gid:0,mode:448,nlink:2,bytes:4096,dev:1,ino:2,type:'directory'},file={uid:0,gid:0,mode:420,nlink:1,bytes:PROFILE_CONTRACT.profile.bytes,dev:1,ino:3,type:'regular file'},stage={directory,path,dir,file};const commands=[];const replies=(change={})=>(binary,args)=>{commands.push({binary,args});assert.equal(binary,'/usr/bin/sudo');assert.equal(args[0],'-n');if(args[1]==='/usr/bin/stat'){const value={...(args.at(-1)===directory?dir:file),...(args.at(-1)===directory?change.dir:change.file)};return {ok:true,stdout:[value.uid,value.gid,value.mode.toString(8),value.nlink,value.bytes,value.dev,value.ino,value.type].join(':')};}assert.equal(args[1],'/usr/bin/sha256sum');return {ok:true,stdout:(change.hash??PROFILE_CONTRACT.profile.sha256)+'  '+path+'\n'};};assert(verifyRootStage(stage,replies()));assert.equal(commands.length,3);assert.throws(()=>verifyRootStage(stage,replies({hash:'0'.repeat(64)})),/root_stage_changed/);assert.throws(()=>verifyRootStage(stage,replies({file:{ino:4}})),/root_stage_changed/);assert.throws(()=>verifyRootStage(stage,replies({dir:{mode:511}})),/root_stage_unsafe/);});
 

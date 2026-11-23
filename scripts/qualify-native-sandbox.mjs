@@ -211,18 +211,27 @@ function runner(deadline,home){return (binary,args,ms=15000,input)=>{
  const out=String(r.stdout??'')+'\n'+String(r.stderr??'');if(Buffer.byteLength(out)>MAX)fail('sandbox_command_output_bound');
  return {ok:!r.error&&!r.signal&&r.status===0,stdout:String(r.stdout??''),stderr:String(r.stderr??''),namespaceDenied:namespaceRefusal(out),exit:Number.isInteger(r.status)?r.status:null,signal:r.signal??null,outputSha256:hash(out),policyAlreadyExists:/Profile already exists/.test(out)};
  };}
+const STAGE_SUDO='/usr/bin/sudo';
 const SYSTEM_FILES=Object.freeze({distroBwrap:'/usr/bin/bwrap',systemTimeout:'/usr/bin/timeout',packagedProfile:'/usr/share/apparmor/extra-profiles/bwrap-userns-restrict',destinationProfile:'/etc/apparmor.d/bwrap-userns-restrict'});
 const SYSTEM_ANCESTORS=new Set(['/',...Object.values(SYSTEM_FILES).flatMap(file=>{const a=[];for(let p=dirname(file);;p=dirname(p)){a.push(p);if(p==='/')break;}return a;})]);
 export function projectTrustRefusal(requested,ancestor,predicate,st,context='file-check'){
- const entry=Object.entries(SYSTEM_FILES).find(([,path])=>path===requested),allowed=entry&&(ancestor===requested||(SYSTEM_ANCESTORS.has(ancestor)&&(ancestor==='/'||requested.startsWith(ancestor+'/'))));
- return {schema:'paperclip.system-trust-refusal.v1',operationContext:['file-check','parent-check'].includes(context)?context:'unknown',requestedClass:entry?.[0]??'unlisted',...(entry?{requestedPath:requested}:{requestedPathSha256:hash(requested)}),...(allowed?{ancestorPath:ancestor}:{ancestorPathSha256:hash(ancestor)}),failedPredicate:['regular','not-symlink','owner','not-writable-or-setid','single-link','bounded','canonical','directory','not-group-or-other-writable','absent','metadata-unreadable'].includes(predicate)?predicate:'unknown',observed:st?{type:st.isSymbolicLink()?'symlink':st.isDirectory()?'directory':st.isFile()?'regular':'other',uid:st.uid,gid:st.gid,mode:st.mode&0o7777,dev:st.dev,ino:st.ino}:null};
+ const entry=requested===STAGE_SUDO?['profileStageSudo',STAGE_SUDO]:Object.entries(SYSTEM_FILES).find(([,path])=>path===requested),allowed=entry&&(ancestor===requested||(SYSTEM_ANCESTORS.has(ancestor)&&(ancestor==='/'||requested.startsWith(ancestor+'/'))));
+ return {schema:'paperclip.system-trust-refusal.v1',operationContext:['file-check','parent-check'].includes(context)?context:'unknown',requestedClass:entry?.[0]??'unlisted',...(entry?{requestedPath:requested}:{requestedPathSha256:hash(requested)}),...(allowed?{ancestorPath:ancestor}:{ancestorPathSha256:hash(ancestor)}),failedPredicate:['regular','not-symlink','owner','not-writable-or-setid','native-stage-sudo-mode','single-link','bounded','canonical','directory','not-group-or-other-writable','absent','metadata-unreadable'].includes(predicate)?predicate:'unknown',observed:st?{type:st.isSymbolicLink()?'symlink':st.isDirectory()?'directory':st.isFile()?'regular':'other',uid:st.uid,gid:st.gid,mode:st.mode&0o7777,dev:st.dev,ino:st.ino}:null};
+}
+const SYSTEM_FILE_IO=Object.freeze({lstat:lstatSync,realpath:realpathSync,read:readFileSync});
+function readTrustedSystemFile(path,limit,expectedUid,io,stageSudo=false){
+ const refuse=(code,at,predicate,st,context)=>{const e=Object.assign(new Error(code),{sandboxCode:code,sandboxDiagnostic:projectTrustRefusal(path,at,predicate,st,context)});throw e;};
+ let st;try{st=io.lstat(path);}catch(e){refuse('sandbox_system_metadata_unavailable',path,e.code==='ENOENT'?'absent':'metadata-unreadable',null,'file-check');}
+ const modeCheck=stageSudo
+  ? ['native-stage-sudo-mode',path===STAGE_SUDO&&st.uid===0&&st.gid===0&&(st.mode&0o7777)===0o4755]
+  : ['not-writable-or-setid',(st.mode&0o6022)===0];
+ for(const [name,ok]of [['regular',st.isFile()],['not-symlink',!st.isSymbolicLink()],['owner',st.uid===expectedUid],modeCheck,['single-link',st.nlink===1],['bounded',st.size<=limit]])if(!ok)refuse('sandbox_system_file_unsafe',path,name,st,'file-check');
+ let canonical;try{canonical=io.realpath(path);}catch{refuse('sandbox_system_metadata_unavailable',path,'metadata-unreadable',st,'file-check');}if(canonical!==path)refuse('sandbox_system_file_unsafe',path,'canonical',st,'file-check');
+ for(let p=dirname(path);;p=dirname(p)){let st;try{st=io.lstat(p);}catch(e){refuse('sandbox_system_metadata_unavailable',p,e.code==='ENOENT'?'absent':'metadata-unreadable',null,'parent-check');}for(const [name,ok]of [['directory',st.isDirectory()],['not-symlink',!st.isSymbolicLink()],['owner',st.uid===expectedUid],['not-group-or-other-writable',(st.mode&0o022)===0]])if(!ok)refuse('sandbox_system_parent_unsafe',p,name,st,'parent-check');if(p==='/')break;}
+ return io.read(path);
 }
 export function trustedFile(path,limit=MAX,expectedUid=0){
- const refuse=(code,at,predicate,st,context)=>{const e=Object.assign(new Error(code),{sandboxCode:code,sandboxDiagnostic:projectTrustRefusal(path,at,predicate,st,context)});throw e;};
- let st;try{st=lstatSync(path);}catch(e){refuse('sandbox_system_metadata_unavailable',path,e.code==='ENOENT'?'absent':'metadata-unreadable',null,'file-check');}for(const [name,ok]of [['regular',st.isFile()],['not-symlink',!st.isSymbolicLink()],['owner',st.uid===expectedUid],['not-writable-or-setid',(st.mode&0o6022)===0],['single-link',st.nlink===1],['bounded',st.size<=limit]])if(!ok)refuse('sandbox_system_file_unsafe',path,name,st,'file-check');
- let canonical;try{canonical=realpathSync(path);}catch{refuse('sandbox_system_metadata_unavailable',path,'metadata-unreadable',st,'file-check');}if(canonical!==path)refuse('sandbox_system_file_unsafe',path,'canonical',st,'file-check');
- for(let p=dirname(path);;p=dirname(p)){let st;try{st=lstatSync(p);}catch(e){refuse('sandbox_system_metadata_unavailable',p,e.code==='ENOENT'?'absent':'metadata-unreadable',null,'parent-check');}for(const [name,ok]of [['directory',st.isDirectory()],['not-symlink',!st.isSymbolicLink()],['owner',st.uid===expectedUid],['not-group-or-other-writable',(st.mode&0o022)===0]])if(!ok)refuse('sandbox_system_parent_unsafe',p,name,st,'parent-check');if(p==='/')break;}
- return readFileSync(path);
+ return readTrustedSystemFile(path,limit,expectedUid,SYSTEM_FILE_IO);
 }
 export function snapshotSystemTrust(){
  return Object.entries(SYSTEM_FILES).map(([requestedClass,path])=>{const chain=[];for(let at=path;;at=dirname(at)){try{const st=lstatSync(at);chain.push({path:at,type:st.isSymbolicLink()?'symlink':st.isDirectory()?'directory':st.isFile()?'regular':'other',uid:st.uid,gid:st.gid,mode:st.mode&0o7777,dev:st.dev,ino:st.ino});}catch(e){chain.push({path:at,state:e.code==='ENOENT'?'absent':'unreadable'});}if(at==='/')break;}try{trustedFile(path,16*1024**2);return {requestedClass,path,chain,guard:'accepted'};}catch(e){return {requestedClass,path,chain,guard:'refused',failureCode:e.sandboxCode??(e.code==='ENOENT'?'file_absent':'metadata_unavailable'),...(e.sandboxDiagnostic?{refusal:e.sandboxDiagnostic}:{})};}});
@@ -244,7 +253,7 @@ export function validateAuthenticatedProfile(bytes){if(!Buffer.isBuffer(bytes)||
 export function readAuthenticatedProfile(path){
  const fd=openSync(path,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);try{const a=fstatSync(fd),named=lstatSync(path);if(!a.isFile()||a.nlink!==1||a.size!==PROFILE_CONTRACT.profile.bytes||a.dev!==named.dev||a.ino!==named.ino||named.isSymbolicLink())fail('sandbox_untrusted_profile_identity');const bytes=Buffer.alloc(a.size+1);let n=0;for(;;){const count=readSync(fd,bytes,n,bytes.length-n,null);n+=count;if(count===0||n===bytes.length)break;}const b=fstatSync(fd),last=lstatSync(path);if(n!==a.size||['dev','ino','size','mtimeMs','ctimeMs'].some(k=>a[k]!==b[k]||b[k]!==last[k])||last.nlink!==1||!last.isFile()||last.isSymbolicLink())fail('sandbox_untrusted_profile_changed');return validateAuthenticatedProfile(bytes.subarray(0,n));}finally{closeSync(fd);}
 }
-function trustedDirectory(path){for(let p=path;;p=dirname(p)){const st=lstatSync(p);if(!st.isDirectory()||st.isSymbolicLink()||st.uid!==0||(st.mode&0o022)!==0||realpathSync(p)!==p)fail('sandbox_include_directory_unsafe');if(p==='/')break;}return lstatSync(path);}
+function trustedDirectory(path,io=SYSTEM_FILE_IO){for(let p=path;;p=dirname(p)){const st=io.lstat(p);if(!st.isDirectory()||st.isSymbolicLink()||st.uid!==0||(st.mode&0o022)!==0||io.realpath(p)!==p)fail('sandbox_include_directory_unsafe');if(p==='/')break;}return io.lstat(path);}
 export function includeDirectives(raw){
  const rows=[];for(const line of raw.toString('utf8').split('\n')){if(!/^\s*(?:#\s*)?(?:include|abi)\b/.test(line))continue;const m=line.match(/^\s*(?:#\s*)?(include(?:\s+if\s+exists)?|abi)\s+<([A-Za-z0-9_./-]+)>\s*,?\s*(?:#.*)?$/);if(!m||m[2].split('/').some(x=>x==='..'||x==='.'||!x))fail('sandbox_include_syntax_unknown');rows.push({path:m[2],optional:m[1].includes('if exists')});}return rows;
 }
@@ -280,11 +289,24 @@ export function preserveSandboxFailure(error,persist,emergency){try{persist();}c
 function rootMetadata(path,run){const r=run('/usr/bin/sudo',['-n','/usr/bin/stat','--printf=%u:%g:%a:%h:%s:%d:%i:%F','--',path]);if(!r.ok)fail('sandbox_root_stage_metadata');const v=r.stdout.split(':');if(v.length!==8||!v.slice(0,7).every(x=>/^[0-9]+$/.test(x)))fail('sandbox_root_stage_metadata');return {uid:Number(v[0]),gid:Number(v[1]),mode:parseInt(v[2],8),nlink:Number(v[3]),bytes:Number(v[4]),dev:Number(v[5]),ino:Number(v[6]),type:v[7]};}
 export function validateRootStageMetadata(dir,file,expected){if(dir.uid!==0||dir.gid!==0||dir.mode!==0o700||dir.type!=='directory'||file.uid!==0||file.gid!==0||(file.mode&0o6022)!==0||file.type!=='regular file'||file.nlink!==1||file.bytes!==expected.bytes||!Number.isSafeInteger(dir.ino)||!Number.isSafeInteger(file.ino)||dir.ino<=0||file.ino<=0)fail('sandbox_root_stage_unsafe');return true;}
 export function verifyRootStage(stage,run){const dir=rootMetadata(stage.directory,run),file=rootMetadata(stage.path,run),r=run('/usr/bin/sudo',['-n','/usr/bin/sha256sum','--',stage.path]);validateRootStageMetadata(dir,file,PROFILE_CONTRACT.profile);if(!r.ok||r.stdout!==PROFILE_CONTRACT.profile.sha256+'  '+stage.path+'\n'||['dev','ino','mode','uid','gid'].some(k=>dir[k]!==stage.dir[k]||file[k]!==stage.file[k]))fail('sandbox_root_stage_changed');return true;}
-export function stageAuthenticatedProfile(bytes,source,run){
- validateAuthenticatedProfile(bytes);if(!/^[a-f0-9]{40}$/.test(source??''))fail('sandbox_stage_source_invalid');trustedDirectory('/etc/apparmor.d');const directory='/etc/apparmor.d/.paperclip-native-'+source.slice(0,12),path=directory+'/profile';try{lstatSync(directory);fail('sandbox_root_stage_exists');}catch(e){if(e.code!=='ENOENT')throw e;}
- for(const binary of ['/usr/bin/sudo','/usr/bin/mkdir','/usr/bin/tee','/usr/bin/stat','/usr/bin/sha256sum','/usr/bin/install'])trustedFile(binary,16*1024**2);
- let r=run('/usr/bin/sudo',['-n','/usr/bin/mkdir','--mode=0700','--',directory]);if(!r.ok)fail('sandbox_root_stage_create');const dir=rootMetadata(directory,run);if(dir.uid!==0||dir.gid!==0||dir.mode!==0o700||dir.type!=='directory')fail('sandbox_root_stage_unsafe');
- r=run('/usr/bin/sudo',['-n','/usr/bin/tee','--',path],bytes);if(!r.ok||!Buffer.from(r.stdout).equals(bytes))fail('sandbox_root_stage_write');const file=rootMetadata(path,run);validateRootStageMetadata(dir,file,PROFILE_CONTRACT.profile);const stage={directory,path,dir,file};verifyRootStage(stage,run);stage.proof={schema:'paperclip.authenticated-root-profile-stage.v1',directory,path,dir,file,sha256:hash(bytes),exclusiveDirectory:true,inputAuthenticated:true,rootDigestVerified:true,identityBookends:true};return stage;
+export function stageAuthenticatedProfile(bytes,source,run,io=SYSTEM_FILE_IO){
+ validateAuthenticatedProfile(bytes);
+ if(!/^[a-f0-9]{40}$/.test(source??''))fail('sandbox_stage_source_invalid');
+ trustedDirectory('/etc/apparmor.d',io);
+ const directory='/etc/apparmor.d/.paperclip-native-'+source.slice(0,12),path=directory+'/profile';
+ try{io.lstat(directory);fail('sandbox_root_stage_exists');}catch(e){if(e.code!=='ENOENT')throw e;}
+ const toolLimit=16*1024**2;
+ // Only the existing distro sudo executable needs setuid. The ordinary file
+ // validator continues to reject set-ID bits for every other file and tool.
+ const sudo=readTrustedSystemFile(STAGE_SUDO,toolLimit,0,io,true);
+ for(const binary of ['/usr/bin/dpkg-query','/usr/bin/mkdir','/usr/bin/tee','/usr/bin/stat','/usr/bin/sha256sum','/usr/bin/install']){
+  readTrustedSystemFile(binary,toolLimit,0,io);
+ }
+ const owner=run('/usr/bin/dpkg-query',['-S',STAGE_SUDO]);
+ if(!owner.ok||owner.stdout.trim()!=='sudo: '+STAGE_SUDO)fail('sandbox_stage_sudo_package_owner');
+ const executor={schema:'paperclip.native-profile-stage-sudo.v1',path:STAGE_SUDO,uid:0,gid:0,mode:0o4755,package:'sudo',sha256:hash(sudo)};
+ let r=run(STAGE_SUDO,['-n','/usr/bin/mkdir','--mode=0700','--',directory]);if(!r.ok)fail('sandbox_root_stage_create');const dir=rootMetadata(directory,run);if(dir.uid!==0||dir.gid!==0||dir.mode!==0o700||dir.type!=='directory')fail('sandbox_root_stage_unsafe');
+ r=run(STAGE_SUDO,['-n','/usr/bin/tee','--',path],bytes);if(!r.ok||!Buffer.from(r.stdout).equals(bytes))fail('sandbox_root_stage_write');const file=rootMetadata(path,run);validateRootStageMetadata(dir,file,PROFILE_CONTRACT.profile);const stage={directory,path,dir,file};verifyRootStage(stage,run);stage.proof={schema:'paperclip.authenticated-root-profile-stage.v1',directory,path,dir,file,sha256:hash(bytes),executor,exclusiveDirectory:true,inputAuthenticated:true,rootDigestVerified:true,identityBookends:true};return stage;
 }
 function readLoadedPolicy(run){const a=run('/usr/bin/sudo',['-n','/usr/bin/cat','/sys/kernel/security/apparmor/profiles']),tree=run('/usr/bin/sudo',['-n','/usr/bin/find','/sys/kernel/security/apparmor/policy/profiles','-type','f','(','-name','name','-o','-name','attach',')','-exec','/usr/bin/grep','-H','^','{}','+']),b=run('/usr/bin/sudo',['-n','/usr/bin/cat','/sys/kernel/security/apparmor/profiles']);if(!a.ok||!tree.ok||!b.ok||a.stdout!==b.stdout)fail('sandbox_loaded_policy_unknown');return {names:a.stdout,tree:tree.stdout};}
 async function diagnosePolicyConflict(){
