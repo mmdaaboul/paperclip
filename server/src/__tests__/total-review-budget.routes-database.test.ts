@@ -1037,6 +1037,150 @@ describe("actual normal PATCH + native postgres-js + native issue service (injec
       expect(returnIntent).toMatchObject({requestedByActorType:"system",requestedByActorId:"native-status-committer",agentId:f.builder.id,status:"queued"});
     }
   });
+  async function approvedStageWithBuilderReassessment() {
+    const f = await stageFixture();
+    const { getNativeStageReviewAssignment } = await import("../services/native-runtime/native-stage-review.js");
+    const { decideNativeStageReview } = await import("../services/native-runtime/native-stage-review-decision.js");
+    const { reassessNativeStatusFromSource } = await import("../services/native-runtime/native-status-reassessment.js");
+    const input = {
+      companyId: f.company.id, issueId: f.issue.id, agentId: f.reviewer.id,
+      runId: f.reviewerRun.id, contextSnapshot: f.context,
+    };
+    const assignment = (await getNativeStageReviewAssignment(db, input))!;
+    expect(assignment).not.toBeNull();
+    const request = {
+      id: randomUUID(), stageId: assignment.stage.id, admissionId: assignment.admission.id,
+      sourceDecisionId: assignment.sourceDecision.id, expectedStatusVersion: assignment.issue.statusVersion,
+      outcome: "approved" as const, body: "Exact native Reviewer approval of the admitted candidate",
+    };
+    const verdict = await decideNativeStageReview(db, { ...input, request });
+    expect(verdict.replayed).toBe(false);
+    const approved = await f.read();
+    expect(approved.executionState).toMatchObject({ currentStageType: "approval" });
+    const reassessed = await reassessNativeStatusFromSource(db, {
+      companyId: f.company.id, issueId: f.issue.id, agentId: f.builder.id, runId: f.candidate.runId,
+      issueStatus: approved.status, issueStatusVersion: approved.statusVersion,
+      issueDecisionId: approved.lastStatusDecisionId, coordinatorPhase: "committed",
+      decisionId: f.committed.decision.id, assessmentId: f.candidate.assessmentId,
+      nativeStatusWakeIntentId: null,
+    });
+    expect(reassessed).toMatchObject({ kind: "committed", result: {
+      reconciliationAction: "prior_status_terminal_preserved",
+    } });
+    const [coordinator] = await db.select().from(nativeRunFinalizations)
+      .where(eq(nativeRunFinalizations.runId, f.candidate.runId));
+    expect(coordinator).toMatchObject({ phase: "committed", resultId: f.candidate.resultId });
+    expect(coordinator.decisionId).not.toBe(f.committed.decision.id);
+    return { ...f, input, request, approved, coordinator };
+  }
+  it("settles the saved Reviewer result after the Builder preserve decision advances", async () => {
+    const f = await approvedStageWithBuilderReassessment();
+    const { getNativeStageReviewAssignment, historicalNativeStageDecision, nativeStageReviewOutcome } =
+      await import("../services/native-runtime/native-stage-review.js");
+    expect(await getNativeStageReviewAssignment(db, f.input)).toBeNull();
+    expect(await historicalNativeStageDecision(db, { ...f.input, request: f.request })).toBeNull();
+    expect(await nativeStageReviewOutcome(db, f.input)).toBe("resolved");
+    for (const input of [
+      { ...f.input, issueId: randomUUID() },
+      { ...f.input, agentId: f.builder.id },
+      { ...f.input, runId: f.candidate.runId },
+      { ...f.input, contextSnapshot: { ...f.context, nativeStageStatusVersion: f.approved.statusVersion } },
+      { ...f.input, contextSnapshot: { ...f.context, nativeStageAdmissionId: randomUUID() } },
+      { ...f.input, contextSnapshot: { ...f.context, nativeStageDecisionId: randomUUID() } },
+      { ...f.input, contextSnapshot: { ...f.context, nativeStatusWakeIntentId: randomUUID() } },
+    ]) expect(await nativeStageReviewOutcome(db, input)).toBe("stale");
+
+    const contractId = randomUUID(), resultId = randomUUID();
+    const contractSha = f.candidate.nativeSha256({ revision: "stage-preserve", criteria: [] });
+    await db.insert(completionContracts).values({
+      id: contractId, companyId: f.company.id, issueId: f.issue.id, revision: f.approved.statusVersion + 1,
+      schemaVersion: "paperclip.completion-contract.v1", policyVersion: "phase6-v13",
+      risk: "standard", completionAuthority: "server_arbiter", incompleteCriteriaPolicy: "preserve_non_terminal",
+      contractJson: { revision: "stage-preserve", objective: "Deliver the recorded review", criteria: [] },
+      canonicalSha256: contractSha, createdByActorType: "system", createdByActorId: "stage-preserve-fixture",
+    });
+    await db.update(heartbeatRuns).set({
+      completionContractId: contractId, completionContractSha256: contractSha,
+      status: "failed", errorCode: "adapter_failed", finishedAt: new Date(),
+    }).where(eq(heartbeatRuns.id, f.reviewerRun.id));
+    const resultJson = {
+      result: { reportedWorkDisposition: "done", summary: "Exact stage approval recorded", attentionRequests: [] },
+      terminal: { runTerminalState: "succeeded" },
+    };
+    const resultSha = f.candidate.nativeSha256(resultJson);
+    await db.insert(nativeRunResults).values({
+      id: resultId, companyId: f.company.id, issueId: f.issue.id, runId: f.reviewerRun.id,
+      completionContractId: contractId, serverFingerprint: resultSha, schemaStatus: "accepted",
+      canonicalSha256: resultSha, resultJson,
+    });
+    await db.insert(nativeRunFinalizations).values({
+      runId: f.reviewerRun.id, companyId: f.company.id, issueId: f.issue.id, resultId,
+      phase: "retryable_failure", failureCode: "side_effect_planning_failed",
+    });
+    const { finalizeNativeRun } = await import("../services/native-runtime/native-run-finalizer.js");
+    const finalizer = {
+      db, runId: f.reviewerRun.id, workspaceFinalizeStatus: "succeeded" as const, projectRunStatus: true,
+      skipExternalConversationSettlement: true, skipExternalAgentSettlement: true, skipNativeRecoveryNotices: true,
+    };
+    const runsBefore = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, f.company.id)).orderBy(heartbeatRuns.id);
+    const wakesBefore = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.companyId, f.company.id)).orderBy(agentWakeupRequests.id);
+    const completed = await finalizeNativeRun(finalizer);
+    expect(completed).toMatchObject({ phase: "committed", resultId });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.reviewerRun.id));
+    expect(run.status).toBe("succeeded");
+    expect(await f.read()).toMatchObject({ statusVersion: f.approved.statusVersion,
+      assigneeUserId: f.userId, executionState: { currentStageType: "approval" } });
+    expect((await f.ledger()).admissions).toHaveLength(1);
+    expect(await db.select().from(issueExecutionDecisions)
+      .where(eq(issueExecutionDecisions.createdByRunId, f.reviewerRun.id))).toHaveLength(1);
+    expect(await db.select().from(nativeRunResults)
+      .where(eq(nativeRunResults.runId, f.reviewerRun.id))).toHaveLength(1);
+    expect(await finalizeNativeRun(finalizer)).toMatchObject({ phase: "committed", decisionId: completed.decisionId });
+    expect(await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(eq(heartbeatRuns.companyId, f.company.id)).orderBy(heartbeatRuns.id))
+      .toEqual(runsBefore);
+    expect(await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.companyId, f.company.id)).orderBy(agentWakeupRequests.id))
+      .toEqual(wakesBefore);
+  });
+  it.each(["broken lineage", "cyclic lineage", "different result", "new effect", "non-preserve", "unapplied", "uncommitted"] as const)(
+    "historical stage finalization refuses a later Builder projection with %s", async change => {
+      const f = await approvedStageWithBuilderReassessment();
+      const { nativeStageReviewOutcome } = await import("../services/native-runtime/native-stage-review.js");
+      const [later] = await db.select().from(statusDecisions).where(eq(statusDecisions.id, f.coordinator.decisionId!));
+      if (change === "broken lineage" || change === "cyclic lineage") {
+        await db.update(workAssessments).set({
+          supersedesAssessmentId: change === "broken lineage" ? null : later.assessmentId,
+        }).where(eq(workAssessments.id, later.assessmentId));
+      } else if (change === "different result") {
+        const otherResultId = randomUUID();
+        const resultJson = { ...f.candidate.resultJson, result: { ...f.candidate.resultJson.result, summary: "Different result" } };
+        const digest = f.candidate.nativeSha256(resultJson);
+        await db.insert(nativeRunResults).values({
+          id: otherResultId, companyId: f.company.id, issueId: f.issue.id, runId: f.candidate.runId,
+          completionContractId: f.candidate.contractId, schemaStatus: "accepted",
+          resultJson, canonicalSha256: digest, serverFingerprint: digest,
+        });
+        await db.update(workAssessments).set({ resultId: otherResultId })
+          .where(eq(workAssessments.id, later.assessmentId));
+      } else if (change === "new effect" || change === "non-preserve") {
+        const decisionJson = change === "new effect"
+          ? { ...later.decisionJson, effects: [...(later.decisionJson.effects as unknown[]), { kind: "release_checkout" }] }
+          : { ...later.decisionJson, statusAction: "in_review" };
+        await db.update(statusDecisions).set({ decisionJson }).where(eq(statusDecisions.id, later.id));
+      } else if (change === "unapplied") {
+        await db.update(statusDecisions).set({ applicationState: "proposed" }).where(eq(statusDecisions.id, later.id));
+      } else {
+        await db.update(nativeRunFinalizations).set({ phase: "retryable_failure" })
+          .where(eq(nativeRunFinalizations.runId, f.candidate.runId));
+      }
+      expect(await nativeStageReviewOutcome(db, f.input)).toBe("stale");
+      expect((await f.ledger()).admissions).toHaveLength(1);
+      expect(await db.select().from(issueExecutionDecisions)
+        .where(eq(issueExecutionDecisions.createdByRunId, f.reviewerRun.id))).toHaveLength(1);
+    });
   it("counts five manual Builder candidates, holds fifth, records one allowance, restarts same Reviewer and retains decision/audit history", async () => {
     const f = await seed();
     for (let n=1;n<=5;n++) {

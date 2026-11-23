@@ -1,7 +1,7 @@
 import { NativeProviderStateIncompatibleError } from "../../vendor/paperclip-runner/index.js";
 import { z } from "zod";
 import { and, eq } from "drizzle-orm";
-import { activityLog, issueExecutionDecisions, agents, agentWakeupRequests, heartbeatRuns, issues, issueReviewCycleBudgets, nativeRunResults, nativeRunFinalizations, statusDecisions, statusDecisionEffects, executionWorkspaces, type Db } from "@paperclipai/db";
+import { activityLog, issueExecutionDecisions, agents, agentWakeupRequests, heartbeatRuns, issues, issueReviewCycleBudgets, nativeRunResults, nativeRunFinalizations, statusDecisions, statusDecisionEffects, executionWorkspaces, workAssessments, type Db } from "@paperclipai/db";
 import { issueReviewCycleBudgetSchema } from "@paperclipai/shared";
 import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../issue-execution-policy.js";
 import { parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
@@ -105,11 +105,66 @@ export function nativeStageAssignmentRecord(proof: NonNullable<Awaited<ReturnTyp
     policySha256:proof.policySha256,executionSha256:proof.executionSha256};
 }
 
+type HistoricalStageDecisionInput = {
+  companyId: string; issueId: string; agentId: string; runId: string;
+  request?: import("./native-stage-review-decision.js").NativeStageReviewDecisionRequest;
+};
+
+async function isLaterBuilderPreserveProjection(
+  db: Db,
+  original: typeof statusDecisions.$inferSelect,
+  result: typeof nativeRunResults.$inferSelect,
+  coordinator: typeof nativeRunFinalizations.$inferSelect,
+) {
+  if (coordinator.phase !== "committed" || !coordinator.decisionId || !coordinator.assessmentId
+    || coordinator.companyId !== original.companyId || coordinator.issueId !== original.issueId) return false;
+  const [later] = await db.select().from(statusDecisions).where(and(
+    eq(statusDecisions.id, coordinator.decisionId),
+    eq(statusDecisions.companyId, original.companyId),
+    eq(statusDecisions.issueId, original.issueId),
+    eq(statusDecisions.runId, original.runId),
+    eq(statusDecisions.assessmentId, coordinator.assessmentId),
+  ));
+  if (!later || later.applicationState !== "applied" || later.decisionVersion <= original.decisionVersion
+    || later.fromStatus !== later.toStatus || later.reasonCode !== "prior_status_terminal_preserved") return false;
+  const decision = later.decisionJson;
+  if (decision.statusAction !== "preserve" || decision.toStatus !== later.toStatus
+    || decision.reasonCode !== later.reasonCode || decision.unblockDescriptor !== null
+    || nativeSha256(decision.effects) !== nativeSha256([{ kind: "append_superseding_assessment" }])) return false;
+
+  // Reassessment can advance the coordinator while keeping the accepted
+  // result. Follow only assessments of that exact result and contract.
+  const assessments = await db.select({
+    id: workAssessments.id,
+    supersedes: workAssessments.supersedesAssessmentId,
+  }).from(workAssessments).where(and(
+    eq(workAssessments.companyId, original.companyId),
+    eq(workAssessments.issueId, original.issueId),
+    eq(workAssessments.runId, original.runId),
+    eq(workAssessments.resultId, result.id),
+    eq(workAssessments.contractId, result.completionContractId),
+  ));
+  const lineage = new Map(assessments.map(({ id, supersedes }) => [id, supersedes]));
+  let next: string | null = later.assessmentId;
+  while (next && lineage.has(next)) {
+    if (next === original.assessmentId) return true;
+    const previous: string | null = lineage.get(next) ?? null;
+    lineage.delete(next);
+    next = previous;
+  }
+  return false;
+}
+
 /** Exact historical acknowledgement only. Never a grant for new provider work,
  * PR discussion or credentials. The native activity receipt commits atomically
  * with its decision and binds the complete original request and assignment. */
-export async function historicalNativeStageDecision(db:Db,input:{companyId:string;issueId:string;agentId:string;runId:string;
-  request?:import("./native-stage-review-decision.js").NativeStageReviewDecisionRequest}) {
+export function historicalNativeStageDecision(db: Db, input: HistoricalStageDecisionInput) {
+  return readHistoricalNativeStageDecision(db, input, false);
+}
+
+async function readHistoricalNativeStageDecision(
+  db: Db, input: HistoricalStageDecisionInput, allowBuilderPreserveForFinalization: boolean,
+) {
   const [run]=await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id,input.runId),eq(heartbeatRuns.companyId,input.companyId),eq(heartbeatRuns.agentId,input.agentId),eq(heartbeatRuns.nativeIssueId,input.issueId)));
   const context=readNativeStageReviewContext(run?.contextSnapshot);
   if(!run || run.runtimeMode!=="native" || !context)return null;
@@ -137,16 +192,22 @@ export async function historicalNativeStageDecision(db:Db,input:{companyId:strin
   const captured=(wake?.payload as {executionStage?:{policySha256?:unknown;workspaceBindingRevision?:unknown}}|null)?.executionStage;
   if(!sourceRun || sourceRun.runtimeMode!=="native" || !sourceDecision || sourceDecision.applicationState!=="applied" || !result || result.schemaStatus!=="accepted"
     || result.completionContractId!==sourceRun.completionContractId || admission.candidateId!==`native-result:${result.id}:${result.canonicalSha256}`
-    || coordinator?.resultId!==result.id || coordinator.decisionId!==sourceDecision.id || !wake || !stageWakeTupleMatches(wake,{nativeStageDecisionId:record.sourceDecisionId,nativeStageAdmissionId:record.admissionId,nativeStageStatusVersion:record.statusVersion}) || captured?.policySha256!==record.policySha256 || captured.workspaceBindingRevision!==record.workspaceBindingRevision)return null;
+    || coordinator?.resultId!==result.id || !wake || !stageWakeTupleMatches(wake,{nativeStageDecisionId:record.sourceDecisionId,nativeStageAdmissionId:record.admissionId,nativeStageStatusVersion:record.statusVersion}) || captured?.policySha256!==record.policySha256 || captured.workspaceBindingRevision!==record.workspaceBindingRevision)return null;
   let execution;try{execution=parseNativeExecutionInput(sourceRun.runnerProfileJson?.nativeExecutionInput);}catch{return null;}
   if(nativeSha256(execution)!==record.executionSha256)return null;
-  return {decision,request,record,sourceRun,sourceDecision};
+  if (coordinator.decisionId !== sourceDecision.id && (!allowBuilderPreserveForFinalization
+    || !await isLaterBuilderPreserveProjection(db, sourceDecision, result, coordinator))) return null;
+  return {decision,request,record,sourceRun,sourceDecision,sourceWakeId:wake.id};
 }
 
 /** A terminal provider report cannot act as its own stage verdict. */
 export async function nativeStageReviewOutcome(db:Db,input:{companyId:string;issueId:string;agentId:string;runId:string;contextSnapshot:unknown}):Promise<"pending"|"resolved"|"stale"|null> {
   const context=readNativeStageReviewContext(input.contextSnapshot);if(!context)return null;
   if(await getNativeStageReviewAssignment(db,input))return "pending";
-  const receipt=await historicalNativeStageDecision(db,input);
-  return receipt && receipt.record.sourceDecisionId===context.nativeStageDecisionId && receipt.record.admissionId===context.nativeStageAdmissionId && receipt.record.statusVersion===context.nativeStageStatusVersion?"resolved":"stale";
+  const receipt=await readHistoricalNativeStageDecision(db,input,true);
+  return receipt && receipt.record.sourceDecisionId===context.nativeStageDecisionId
+    && receipt.record.admissionId===context.nativeStageAdmissionId
+    && receipt.record.statusVersion===context.nativeStageStatusVersion
+    && (context.nativeStatusWakeIntentId===undefined || context.nativeStatusWakeIntentId===receipt.sourceWakeId)
+    ? "resolved" : "stale";
 }
