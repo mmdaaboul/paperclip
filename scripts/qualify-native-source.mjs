@@ -78,11 +78,16 @@ async function qualify(diagnostic=null){
   evidence.capacity=[nativeCapacity(root,contract.resources.sourceBuild,'before-native-source-build')];save();assert.equal(command('git',['rev-parse','HEAD']).trim(),e.SOURCE_SHA);command('git',['diff','--exit-code','HEAD','--']);
   command('corepack',['enable','pnpm','--install-directory',join(tmp,'bin')]);env.PATH=join(tmp,'bin')+':'+env.PATH;
   command('corepack',['pnpm','install','--frozen-lockfile'],workspace,600000);
-  evidence.phase='native-sandbox-prerequisite';save();await qualifyNativeSandbox({workspace,root,ambient:e,onReceipt:r=>{evidence.sandboxPrerequisite=r;save();},postAcquisitionDiagnostic:diagnostic==='launch-transport',policyDeltaDiagnostic:diagnostic==='policy-delta'});
+  evidence.phase='native-sandbox-prerequisite';save();await qualifyNativeSandbox({workspace,root,ambient:e,onReceipt:r=>{evidence.sandboxPrerequisite=r;save();},postAcquisitionDiagnostic:diagnostic==='launch-transport',policyDeltaDiagnostic:diagnostic==='policy-delta',canaryDiagnostic:diagnostic==='canary-controls'});
   if(diagnostic==='launch-transport'){evidence.phase='native-launch-transport-observed';const receipt=evidence.sandboxPrerequisite;const probe=receipt.afterAcquisitionProbe??receipt.initialProbe;evidence.status=probe?.transport?'diagnostic-completed':'diagnostic-inconclusive';return;}
   if(diagnostic==='policy-delta'){
    evidence.phase='native-policy-delta-observed';
    evidence.status=evidence.sandboxPrerequisite.profile?.afterAdd?.delta?'diagnostic-completed':'diagnostic-inconclusive';
+   return;
+  }
+  if(diagnostic==='canary-controls'){
+   evidence.phase='native-canary-controls-observed';
+   evidence.status=evidence.sandboxPrerequisite.status==='diagnostic-observed'?'diagnostic-completed':'diagnostic-inconclusive';
    return;
   }
   evidence.phase='frozen-native-build';save();
@@ -102,5 +107,6 @@ if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)){
  if(mode.length===0)await qualify();
  else if(mode.length===1&&mode[0]==='--diagnose-launch-transport')await qualify('launch-transport');
  else if(mode.length===1&&mode[0]==='--diagnose-policy-delta')await qualify('policy-delta');
+ else if(mode.length===1&&mode[0]==='--diagnose-canary-controls')await qualify('canary-controls');
  else throw Error('native_source_command_closed');
 }

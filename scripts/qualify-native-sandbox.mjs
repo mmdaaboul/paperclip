@@ -191,8 +191,61 @@ export function parseSandboxProbeResult(r){
  if(!r.ok)return {status:r.exit===1&&!r.signal&&r.namespaceDenied&&!r.stdout.trim()?'namespace_denied':'native_probe_refused',exit:r.exit,signal:r.signal,outputSha256:r.outputSha256,...context,...(r.stdout.trim()?{safeFailure:projectProbeFailure(r.stdout)}:{})};
  try{return {status:'passed',proof:validateProbeReceipt(JSON.parse(r.stdout)),...context};}catch(error){return {status:'native_probe_refused',failureCode:error.sandboxCode??'sandbox_native_probe_receipt_invalid',outputSha256:r.outputSha256,...context};}
 }
+const CANARY_NAMES=['candidate-read','reference-read','candidate-write','reference-write','protected-write','metadata-write','outside-write','protected-read','scratch-write'];
+const CANARY_ERRNOS=['EACCES','EPERM','EROFS','ENOENT','ENOTDIR','EISDIR','ENOSPC','EIO','EBADF','ELOOP','OTHER'];
+export function projectCanaryObservation(raw){
+ if(raw?.schema!=='paperclip.native-canary-observation.v1'||!Array.isArray(raw.filesystem)||raw.filesystem.length!==CANARY_NAMES.length
+  ||!['denied','connected'].includes(raw.network))return null;
+ const filesystem=[];
+ for(const [index,row] of raw.filesystem.entries()){
+  const outcomes=index<2?['retained','different','error']:['completed','error'];
+  if(row?.name!==CANARY_NAMES[index]||!outcomes.includes(row.outcome)
+   ||(row.outcome==='error'?!CANARY_ERRNOS.includes(row.errno):row.errno!==null))return null;
+  const expected=index<2?'retained':index===CANARY_NAMES.length-1?'completed':'error';
+  if(row.passed!==(row.outcome===expected))return null;
+  filesystem.push({name:row.name,outcome:row.outcome,errno:row.errno,passed:row.passed});
+ }
+ return {schema:raw.schema,filesystem,network:raw.network};
+}
+const PRESERVATION_KEYS=['candidateUnchanged','referenceUnchanged','protectedUnchanged','metadataUnchanged','scratchContentPresent','outsideFileAbsent'];
+function projectCanaryParent(raw){
+ if(typeof raw?.outsideNetworkControl!=='boolean'||!PRESERVATION_KEYS.every(key=>typeof raw[key]==='boolean'))return null;
+ return {outsideNetworkControl:raw.outsideNetworkControl,...Object.fromEntries(PRESERVATION_KEYS.map(key=>[key,raw[key]]))};
+}
+function projectCanaryIdentity(raw){
+ if(!Number.isSafeInteger(raw?.uid)||raw.uid<=0||raw.entry!==EXPECTED_KERNEL_LABEL||raw.exit!==raw.entry)return null;
+ return {uid:raw.uid,entry:raw.entry,exit:raw.exit};
+}
+export function completeCanaryObservation(probe,uid){
+ const transport=probe?.transport,passed=probe?.status==='passed';
+ if(!Number.isSafeInteger(uid)||uid<=0||transport?.schema!==TRANSPORT_SCHEMA||transport.spawnError!==null||transport.signal!==null
+  ||transport.childEntryObserved!==true||transport.childTerminalObserved!==true)return false;
+ const record=passed?probe.proof:probe.safeFailure;
+ const expectedExit=passed||record?.code==='sandbox_probe_mutated_canary'?0:25;
+ if(!record||!['passed','native_probe_refused'].includes(probe.status)||transport.exit!==expectedExit)return false;
+ const controls=projectCanaryObservation(passed?record.canaryObservation:record.controls);
+ const parent=projectCanaryParent(passed?record.canaryParentObservation:record.parent);
+ const identity=projectCanaryIdentity(passed?record.executionLabel:record.canaryIdentity);
+ if(!controls||parent?.outsideNetworkControl!==true||identity?.uid!==uid)return false;
+ const childPassed=controls.network==='denied'&&controls.filesystem.every(row=>row.passed);
+ const preserved=PRESERVATION_KEYS.every(key=>parent[key]);
+ if(passed)return childPassed&&preserved;
+ if(record.code==='sandbox_probe_mutated_canary')return childPassed&&!preserved;
+ return record.code==='sandbox_child_boundary_refused'&&!childPassed;
+}
+function projectObservedLabel(raw){
+ const text=typeof raw==='string'?raw:raw?.text;
+ if(typeof text==='string'){
+  return [EXPECTED_KERNEL_LABEL,EXPECTED_KERNEL_LABEL+'\n','unconfined','unconfined\n'].includes(text)
+   ?{text}:opaquePolicyValue(text);
+ }
+ return /^[a-f0-9]{64}$/.test(raw?.sha256??'')?{sha256:raw.sha256}:null;
+}
 function projectProbeFailure(raw){
- try{const r=JSON.parse(raw);if(r.schema==='paperclip.native-sandbox-probe-failure.v1')return {schema:r.schema,code:['sandbox_execution_label_refused','sandbox_execution_label_bound','sandbox_execution_label_io_refused','sandbox_child_label_identity_refused','sandbox_child_label_protocol_refused','sandbox_child_label_changed','sandbox_child_boundary_refused'].includes(r.code)?r.code:'sandbox_child_boundary_refused',...(typeof r.observedLabel==='string'?{observedLabel:policyText(r.observedLabel)}:typeof r.observedLabel?.text==='string'?{observedLabel:policyText(r.observedLabel.text)}:/^[a-f0-9]{64}$/.test(r.observedLabel?.sha256??'')?{observedLabel:{sha256:r.observedLabel.sha256}}:{}),...(r.labelIo?.path===KERNEL_LABEL_PATH&&['open','read','close'].includes(r.labelIo.operation)&&['EACCES','EPERM','ENOENT','EINVAL','EIO','EBADF','ELOOP','ENOTDIR','OTHER'].includes(r.labelIo.errno)?{labelIo:{path:KERNEL_LABEL_PATH,operation:r.labelIo.operation,errno:r.labelIo.errno}}:{})};}catch{}return {code:'sandbox_child_boundary_refused'};
+ try{const r=JSON.parse(raw);if(r.schema==='paperclip.native-sandbox-probe-failure.v1'){
+  const controls=projectCanaryObservation(r.controls),parent=projectCanaryParent(r.parent),canaryIdentity=projectCanaryIdentity(r.canaryIdentity),observedLabel=projectObservedLabel(r.observedLabel);
+  return {schema:r.schema,code:['sandbox_execution_label_refused','sandbox_execution_label_bound','sandbox_execution_label_io_refused','sandbox_child_label_identity_refused','sandbox_child_label_protocol_refused','sandbox_child_label_changed','sandbox_child_boundary_refused','sandbox_probe_mutated_canary'].includes(r.code)?r.code:'sandbox_child_boundary_refused',...(observedLabel?{observedLabel}:{}),...(r.labelIo?.path===KERNEL_LABEL_PATH&&['open','read','close'].includes(r.labelIo.operation)&&['EACCES','EPERM','ENOENT','EINVAL','EIO','EBADF','ELOOP','ENOTDIR','OTHER'].includes(r.labelIo.errno)?{labelIo:{path:KERNEL_LABEL_PATH,operation:r.labelIo.operation,errno:r.labelIo.errno}}:{}),...(controls?{controls}:{}),...(parent?{parent}:{}),...(canaryIdentity?{canaryIdentity}:{})};
+ }}catch{}return {code:'sandbox_child_boundary_refused'};
 }
 export function validateProbeReceipt(r){
  if(r?.schema!=='paperclip.native-sandbox-probe.v1'||!Number.isSafeInteger(r.uid)||r.uid<=0||r.codexVersion!=='0.160.0'||r.bwrapPath!=='/usr/bin/bwrap'||!['wrapperSha256','nativeElfSha256','bwrapSha256'].every(k=>/^[a-f0-9]{64}$/.test(r[k]??''))||!['nativeSandbox','allowedRead','scratchWrite','candidateDenied','referenceDenied','protectedDenied','protectedReadDenied','metadataDenied','outsideDenied','networkDenied','outsideNetworkControl','originalBytesPreserved'].every(k=>r[k]===true))fail('sandbox_native_probe_incomplete');
@@ -440,7 +493,7 @@ export function collectHostFacts(run){
  return validateSandboxHost({os:value('ID'),release:value('VERSION_ID'),kernelRelease:/^[A-Za-z0-9_.+\-]{1,128}$/.test(kernelRelease())?kernelRelease():null,uid:process.getuid(),bwrapPresent,bwrapTrusted,bwrapPackageOwned,bwrapSha256,bwrapVersion,bwrapPackageVersion,bwrapMode,bwrapSystemLaunchSupported,apparmor:optional('/sys/module/apparmor/parameters/enabled')==='Y',restrictedUserns:number('/proc/sys/kernel/apparmor_restrict_unprivileged_userns'),maxUserNamespaces:number('/proc/sys/user/max_user_namespaces'),usernsClone:number('/proc/sys/kernel/unprivileged_userns_clone'),seccomp:Number(status.match(/^Seccomp:\s+(\d+)$/m)?.[1]??-1)});
 }
 function hosted(e){if(process.platform!=='linux'||process.arch!=='x64'||e.GITHUB_REPOSITORY!=='mmdaaboul/paperclip'||e.GITHUB_JOB!=='selected_native_source'||e.GITHUB_ACTIONS!=='true'||e.RUNNER_ENVIRONMENT!=='github-hosted')fail('sandbox_disposable_job_only');}
-export async function qualifyNativeSandbox({workspace,root,ambient=process.env,onReceipt=()=>{},postAcquisitionDiagnostic=false,policyDeltaDiagnostic=false}){
+export async function qualifyNativeSandbox({workspace,root,ambient=process.env,onReceipt=()=>{},postAcquisitionDiagnostic=false,policyDeltaDiagnostic=false,canaryDiagnostic=false}){
  hosted(ambient);const deadline=Date.now()+SANDBOX_LIMITS.aggregateMs,run=runner(deadline,root);
  const receipt={schema:'paperclip.native-sandbox-prerequisite.v1',status:'running',normalUser:true,retry:false,productionPolicyChanged:false,globalRestrictionChanged:false,initialProbe:null,postProbe:null,operations:[]};
  const save=()=>{assert(Buffer.byteLength(JSON.stringify(receipt))<=MAX);onReceipt(receipt);};
@@ -448,6 +501,7 @@ export async function qualifyNativeSandbox({workspace,root,ambient=process.env,o
   receipt.before=collectHostFacts(run);save();
   const probe=()=>parseSandboxProbeResult(run(process.execPath,['--import',join(workspace,'packages/paperclip-runner/node_modules/tsx/dist/loader.mjs'),SELF,'--probe',root],SANDBOX_LIMITS.probeMs));
   receipt.initialProbe=receipt.before.bwrapPresent?await probe():{status:'not-run-missing-distro-bwrap'};save();
+  if(canaryDiagnostic&&completeCanaryObservation(receipt.initialProbe,receipt.before.uid)){receipt.status='diagnostic-observed';save();return receipt;}
   const decision=sandboxRepairDecision(receipt.before,receipt.initialProbe.status);receipt.decision=decision;save();
   if(postAcquisitionDiagnostic&&decision==='none'){receipt.status='diagnostic-observed';save();return receipt;}
   if(policyDeltaDiagnostic&&decision==='none'){receipt.status='diagnostic-inconclusive';save();return receipt;}
@@ -487,7 +541,9 @@ export async function qualifyNativeSandbox({workspace,root,ambient=process.env,o
     receipt.profile.previousPolicyRowsPreserved=true;receipt.profile.addedProfileCount=2;receipt.profile.loadedAfter=true;receipt.profile.loadedNames=[...PROFILE_CONTRACT.profileNames];receipt.profile.cacheDisabled=true;save();
    }
    if(policyDeltaDiagnostic){receipt.status='diagnostic-inconclusive';save();return receipt;}
-   receipt.postProbe=afterDecision==='none'?receipt.afterAcquisitionProbe:await probe();save();if(receipt.postProbe.status!=='passed')fail('sandbox_post_prerequisite_refused');
+   receipt.postProbe=afterDecision==='none'?receipt.afterAcquisitionProbe:await probe();save();
+   if(canaryDiagnostic){receipt.status=completeCanaryObservation(receipt.postProbe,receipt.before.uid)?'diagnostic-observed':'diagnostic-inconclusive';save();return receipt;}
+   if(receipt.postProbe.status!=='passed')fail('sandbox_post_prerequisite_refused');
    if(opaqueBwrapReadback){
     receipt.profile.opaqueAttachmentProof=bindOpaqueBwrapProbe({loaded:opaqueBwrapReadback,readback:readLoadedPolicy(run),probe:receipt.postProbe,expectedBwrapSha256:after.bwrapSha256});
     save();
@@ -496,8 +552,68 @@ export async function qualifyNativeSandbox({workspace,root,ambient=process.env,o
   receipt.after=collectHostFacts(run);receipt.globalRestrictionChanged=['apparmor','restrictedUserns','maxUserNamespaces','usernsClone','seccomp'].some(k=>receipt.before[k]!==receipt.after[k]);if(receipt.globalRestrictionChanged)fail('sandbox_global_host_policy_changed');receipt.proof=validateProbeReceipt((receipt.postProbe??receipt.initialProbe).proof);if(receipt.after.bwrapSha256!==receipt.proof.bwrapSha256||(receipt.afterAcquisitionDecision==='documented-loopback-profile-prerequisite'&&receipt.after.bwrapSha256!==receipt.afterAcquisition.bwrapSha256))fail('sandbox_bwrap_changed');receipt.status='passed';save();return receipt;
  }catch(error){receipt.status='failed';receipt.failureCode=error.sandboxCode??'sandbox_prerequisite_refused';if(error.sandboxDiagnostic)receipt.trustRefusal=error.sandboxDiagnostic;preserveSandboxFailure(error,save,summary=>console.error(JSON.stringify(summary)));}
 }
+export function observeFilesystemCanaries(fs,[candidate,reference,protectedRoot,scratch,outside],errnos){
+ const results=[];
+ const check=(name,expected,action)=>{
+  let outcome,errno=null;
+  try{outcome=action();}catch(error){outcome='error';errno=errnos.includes(error?.code)?error.code:'OTHER';}
+  results.push({name,outcome,errno,passed:outcome===expected});
+ };
+ const retained=(path,value)=>fs.readFileSync(path,'utf8')===value?'retained':'different';
+ const write=(path,value)=>{fs.writeFileSync(path,value);return 'completed';};
+ check('candidate-read','retained',()=>retained(candidate+'/canary','retained-candidate'));
+ check('reference-read','retained',()=>retained(reference+'/canary','retained-reference'));
+ check('candidate-write','error',()=>write(candidate+'/canary','forbidden'));
+ check('reference-write','error',()=>write(reference+'/canary','forbidden'));
+ check('protected-write','error',()=>write(protectedRoot+'/canary','forbidden'));
+ check('metadata-write','error',()=>write(candidate+'/.git/canary','forbidden'));
+ check('outside-write','error',()=>write(outside+'/outside','forbidden'));
+ check('protected-read','error',()=>{fs.readFileSync(protectedRoot+'/canary');return 'completed';});
+ check('scratch-write','completed',()=>write(scratch+'/allowed','allowed'));
+ return results;
+}
 export function nativeBoundaryProbeProgram(){
- return `const fs=require('node:fs'),net=require('node:net');const [c,r,p,s,o,port,challenge]=process.argv.slice(1);const KERNEL_LABEL_PATH=${JSON.stringify(KERNEL_LABEL_PATH)},EXPECTED_KERNEL_LABEL=${JSON.stringify(EXPECTED_KERNEL_LABEL)};const fail=code=>{throw Object.assign(Error(code),{sandboxCode:code});};const validateExecutionLabel=${validateExecutionLabel.toString()},readExecutionLabel=${readExecutionLabel.toString()};let entry=null,lastLabel=null;const reportError=e=>{fs.writeSync(1,JSON.stringify({schema:'paperclip.native-sandbox-probe-failure.v1',challenge,code:e.sandboxCode??'sandbox_child_boundary_refused',...(typeof lastLabel==='string'?{observedLabel:lastLabel}:{}),...(e.labelIo?{labelIo:e.labelIo}:{})}));process.exit(25);};try{if(process.getuid()===0)fail('sandbox_child_boundary_refused');fs.writeSync(2,'PAPERCLIP_CHILD_ENTRY:'+challenge+'\\n');entry=readExecutionLabel(fs);lastLabel=entry;validateExecutionLabel(entry);if(fs.readFileSync(c+'/canary','utf8')!=='retained-candidate'||fs.readFileSync(r+'/canary','utf8')!=='retained-reference')fail('sandbox_child_boundary_refused');for(const f of [c+'/canary',r+'/canary',p+'/canary',c+'/.git/canary',o+'/outside']){let denied=false;try{fs.writeFileSync(f,'forbidden');}catch{denied=true;}if(!denied)fail('sandbox_child_boundary_refused');}let protectedReadDenied=false;try{fs.readFileSync(p+'/canary');}catch{protectedReadDenied=true;}if(!protectedReadDenied)fail('sandbox_child_boundary_refused');fs.writeFileSync(s+'/allowed','allowed');let finished=false;const finish=()=>{if(finished)return;finished=true;try{const exit=readExecutionLabel(fs);lastLabel=exit;validateExecutionLabel(exit);if(entry!==exit)fail('sandbox_child_label_changed');fs.writeSync(1,JSON.stringify({schema:'paperclip.native-sandbox-child-label.v1',challenge,uid:process.getuid(),path:KERNEL_LABEL_PATH,entry,exit}));process.exit(0);}catch(e){reportError(e);}};const socket=net.connect(Number(port),'127.0.0.1',()=>process.exit(23));socket.on('error',finish);socket.setTimeout(500,()=>{socket.destroy();finish();});}catch(e){reportError(e);}`;
+ return `const fs=require('node:fs'),net=require('node:net');
+ const [c,r,p,s,o,port,challenge]=process.argv.slice(1);
+ const KERNEL_LABEL_PATH=${JSON.stringify(KERNEL_LABEL_PATH)},EXPECTED_KERNEL_LABEL=${JSON.stringify(EXPECTED_KERNEL_LABEL)};
+ const fail=code=>{throw Object.assign(Error(code),{sandboxCode:code});};
+ const validateExecutionLabel=${validateExecutionLabel.toString()},readExecutionLabel=${readExecutionLabel.toString()};
+ const observeFilesystemCanaries=${observeFilesystemCanaries.toString()};
+ let entry=null,lastLabel=null,controls=null,canaryIdentity=null;
+ const reportError=e=>{
+  fs.writeSync(1,JSON.stringify({schema:'paperclip.native-sandbox-probe-failure.v1',challenge,code:e.sandboxCode??'sandbox_child_boundary_refused',
+   ...(typeof lastLabel==='string'?{observedLabel:lastLabel}:{}),...(e.labelIo?{labelIo:e.labelIo}:{}),...(controls?{controls}:{}),...(canaryIdentity?{canaryIdentity}:{})}));
+  process.exit(25);
+ };
+ try{
+  if(process.getuid()===0)fail('sandbox_child_boundary_refused');
+  fs.writeSync(2,'PAPERCLIP_CHILD_ENTRY:'+challenge+'\\n');
+  entry=readExecutionLabel(fs);lastLabel=entry;validateExecutionLabel(entry);
+  const filesystem=observeFilesystemCanaries(fs,[c,r,p,s,o],${JSON.stringify(CANARY_ERRNOS)});
+  let finished=false;
+  const finish=network=>{
+   if(finished)return;finished=true;
+   controls={schema:'paperclip.native-canary-observation.v1',filesystem,network};
+   try{
+    const exit=readExecutionLabel(fs);lastLabel=exit;validateExecutionLabel(exit);
+    if(entry!==exit)fail('sandbox_child_label_changed');
+    canaryIdentity={uid:process.getuid(),entry:EXPECTED_KERNEL_LABEL,exit:EXPECTED_KERNEL_LABEL};
+    if(network!=='denied'||filesystem.some(result=>!result.passed))fail('sandbox_child_boundary_refused');
+    fs.writeSync(1,JSON.stringify({schema:'paperclip.native-sandbox-child-label.v1',challenge,uid:process.getuid(),path:KERNEL_LABEL_PATH,entry,exit,controls}));
+    process.exit(0);
+   }catch(e){reportError(e);}
+  };
+  const socket=net.connect(Number(port),'127.0.0.1',()=>finish('connected'));
+  socket.on('error',()=>finish('denied'));
+  socket.setTimeout(500,()=>{socket.destroy();finish('denied');});
+ }catch(e){reportError(e);}`;
+}
+function observeCanaryParent(p,base,outsideNetworkControl){
+ const matches=(path,expected)=>{try{return readFileSync(path,'utf8')===expected;}catch{return false;}};
+ return {outsideNetworkControl,candidateUnchanged:matches(p.candidate+'/canary','retained-candidate'),
+  referenceUnchanged:matches(p.reference+'/canary','retained-reference'),protectedUnchanged:matches(p.protected+'/canary','retained-protected'),
+  metadataUnchanged:matches(p.candidate+'/.git/canary','retained-metadata'),scratchContentPresent:matches(p.scratch+'/allowed','allowed'),
+  outsideFileAbsent:!existsSync(join(base,'outside'))};
 }
 async function nativeProbe(root){
  if(process.platform!=='linux'||process.arch!=='x64'||process.getuid()===0)fail('sandbox_probe_platform');
@@ -517,14 +633,20 @@ async function nativeProbe(root){
   writeFileSync(2,'PAPERCLIP_NATIVE_LAUNCH_TRANSPORT:'+JSON.stringify(transport)+'\n');
   if(r.error||r.signal||r.status!==0){
    const {typedNamespaceRefusal,failure}=projectNativeProbeFailure(r,transport);
-   if(failure)console.log(JSON.stringify({schema:'paperclip.native-sandbox-probe-failure.v1',...failure}));
+   if(failure)console.log(JSON.stringify({schema:'paperclip.native-sandbox-probe-failure.v1',...failure,...(transport.childTerminalObserved?{parent:observeCanaryParent(p,base,outsideControl)}:{})}));
    process.stderr.write(typedNamespaceRefusal?'bwrap: No permissions to create new namespace\n':'native sandbox boundary probe refused\n');
    process.exitCode=1;
    return;
   }
   const childProof=inspectChildLabelProof(r.stdout,challenge,process.getuid());if(!childProof.ok){console.log(JSON.stringify(childProof.failure));process.stderr.write('native sandbox label proof refused\n');process.exitCode=1;return;}const executionLabel=childProof.proof;
-  for(const n of ['candidate','reference','protected'])if(readFileSync(join(p[n],'canary'),'utf8')!=='retained-'+n)fail('sandbox_probe_mutated_canary');if(readFileSync(join(p.candidate,'.git/canary'),'utf8')!=='retained-metadata'||readFileSync(join(p.scratch,'allowed'),'utf8')!=='allowed'||existsSync(join(base,'outside')))fail('sandbox_probe_mutated_canary');
-  console.log(JSON.stringify({schema:'paperclip.native-sandbox-probe.v1',uid:process.getuid(),codexVersion:pkg.version,wrapperSha256:hash(readFileSync(codex)),nativeElfSha256,bwrapPath:'/usr/bin/bwrap',bwrapSha256:hash(bwrap),nativeSandbox:true,allowedRead:true,scratchWrite:true,candidateDenied:true,referenceDenied:true,protectedDenied:true,protectedReadDenied:true,metadataDenied:true,outsideDenied:true,networkDenied:true,outsideNetworkControl:outsideControl,originalBytesPreserved:true,executionLabel}));
+  const canaryObservation=projectCanaryObservation(JSON.parse(r.stdout).controls);
+  if(!canaryObservation||canaryObservation.network!=='denied'||canaryObservation.filesystem.some(x=>!x.passed))fail('sandbox_child_boundary_refused');
+  const parent=observeCanaryParent(p,base,outsideControl);
+  if(!PRESERVATION_KEYS.every(key=>parent[key]===true)){
+   console.log(JSON.stringify({schema:'paperclip.native-sandbox-probe-failure.v1',code:'sandbox_probe_mutated_canary',observedLabel:executionLabel.exit,canaryIdentity:executionLabel,controls:canaryObservation,parent}));
+   process.exitCode=1;return;
+  }
+  console.log(JSON.stringify({schema:'paperclip.native-sandbox-probe.v1',uid:process.getuid(),codexVersion:pkg.version,wrapperSha256:hash(readFileSync(codex)),nativeElfSha256,bwrapPath:'/usr/bin/bwrap',bwrapSha256:hash(bwrap),nativeSandbox:true,allowedRead:true,scratchWrite:true,candidateDenied:true,referenceDenied:true,protectedDenied:true,protectedReadDenied:true,metadataDenied:true,outsideDenied:true,networkDenied:true,outsideNetworkControl:outsideControl,originalBytesPreserved:true,executionLabel,canaryObservation,canaryParentObservation:parent}));
  }finally{await new Promise(yes=>server.close(yes));}
 }
 if(process.argv[1]&&resolve(process.argv[1])===SELF){

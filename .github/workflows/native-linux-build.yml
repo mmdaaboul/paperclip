@@ -1,64 +1,14 @@
-name: Native candidate qualification
+name: Native hosted sandbox controls diagnostic
 on:
   push:
     branches: [qualification/native-linux-build]
 permissions:
   contents: read
 jobs:
-  native_install:
-    needs: selected_native_source
-    if: needs.selected_native_source.result == 'success' && github.repository == 'mmdaaboul/paperclip' && github.ref == 'refs/heads/qualification/native-linux-build'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    env:
-      SOURCE_SHA: ${{ github.sha }}
-      WORKFLOW_SHA: ${{ github.workflow_sha }}
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-        with:
-          ref: ${{ github.sha }}
-          fetch-depth: 2
-          persist-credentials: false
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
-        with:
-          node-version: 24.21.0
-          package-manager-cache: false
-      - name: Start native user systemd session
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo loginctl enable-linger "$(id -un)"
-          uid="$(id -u)"
-          for _ in $(seq 1 30); do
-            [[ -S "/run/user/$uid/bus" ]] && break
-            sleep 1
-          done
-          [[ -S "/run/user/$uid/bus" ]]
-          {
-            echo "XDG_RUNTIME_DIR=/run/user/$uid"
-            echo "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus"
-          } >> "$GITHUB_ENV"
-      - name: Focused packaging and qualification contracts
-        run: node --test scripts/prepare-workspace-publish-assets.test.mjs scripts/qualify-native-install.test.mjs scripts/qualify-native-maintenance.test.mjs scripts/qualify-native-capacity.test.mjs
-      - name: Complete official bootstrap install and authenticated service lifecycle
-        env:
-          NATIVE_INSTALL_GITHUB_TOKEN: ${{ github.token }}
-          NATIVE_REHEARSAL_MODE: same-tree-parent
-        run: node scripts/qualify-native-install.mjs
-      - name: Upload only structured nonsecret evidence
-        if: always()
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
-        with:
-          name: native-install-evidence
-          path: ${{ runner.temp }}/f03-native-install/evidence.json
-          include-hidden-files: false
-          if-no-files-found: warn
-          retention-days: 14
-
   selected_native_source:
     if: github.repository == 'mmdaaboul/paperclip' && github.ref == 'refs/heads/qualification/native-linux-build'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 12
     env:
       SOURCE_SHA: ${{ github.sha }}
       WORKFLOW_SHA: ${{ github.workflow_sha }}
@@ -76,16 +26,16 @@ jobs:
       - name: Focused native source producer contracts
         env:
           PAPERCLIP_DIAGNOSTIC_TEST_SCRATCH: ${{ runner.temp }}
-        run: node --test scripts/qualify-native-source.test.mjs scripts/qualify-native-capacity.test.mjs scripts/qualify-native-sandbox.test.mjs scripts/qualify-native-policy-diagnostic.test.mjs scripts/qualify-native-add-only.test.mjs scripts/qualify-native-launch-transport.test.mjs scripts/qualify-native-loopback-proof.test.mjs scripts/qualify-native-policy-delta.test.mjs scripts/qualify-native-opaque-attachment.test.mjs
-      - name: Frozen native workspace build and selected source qualification
+        run: node --test scripts/qualify-native-source.test.mjs scripts/qualify-native-capacity.test.mjs scripts/qualify-native-sandbox.test.mjs scripts/qualify-native-policy-diagnostic.test.mjs scripts/qualify-native-add-only.test.mjs scripts/qualify-native-launch-transport.test.mjs scripts/qualify-native-canary-controls.test.mjs
+      - name: Observe every scoped sandbox canary
         env:
           NATIVE_INSTALL_GITHUB_TOKEN: ${{ github.token }}
-        run: node scripts/qualify-native-source.mjs
+        run: node scripts/qualify-native-source.mjs --diagnose-canary-controls
       - name: Upload only structured native source evidence
         if: always()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
         with:
-          name: native-source-evidence
+          name: native-canary-controls-evidence
           path: ${{ runner.temp }}/f10-native-source/evidence.json
           include-hidden-files: false
           if-no-files-found: warn

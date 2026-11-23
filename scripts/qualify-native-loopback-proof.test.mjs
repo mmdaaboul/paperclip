@@ -46,7 +46,7 @@ test('the selected host requires signed system executable identity and unchanged
 
 test('the full workflow requires source success before invoking the installer',()=>{
  const active = readFileSync(new URL('../.github/workflows/native-linux-build.yml', import.meta.url), 'utf8');
- const workflow = active.includes('--diagnose-policy-delta') ? readFileSync(new URL('./fixtures/native-stage-executor-full.yml', import.meta.url), 'utf8') : active;
+ const workflow = active.includes('--diagnose-canary-controls') ? readFileSync(new URL('./fixtures/native-opaque-attachment-full.yml', import.meta.url), 'utf8') : active.includes('--diagnose-policy-delta') ? readFileSync(new URL('./fixtures/native-stage-executor-full.yml', import.meta.url), 'utf8') : active;
  const source=readFileSync(new URL('./qualify-native-sandbox.mjs',import.meta.url),'utf8');
  assert(workflow.includes('needs: selected_native_source'));
  assert(workflow.includes("needs.selected_native_source.result == 'success'"));

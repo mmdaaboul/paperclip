@@ -68,7 +68,8 @@ test('opaque attachment checks gate the actual source build and source-first ins
  assert(sandbox.indexOf('receipt.profile.opaqueAttachmentProof=bindOpaqueBwrapProbe')<sandbox.indexOf("receipt.status='passed';save();return receipt"));
  const source=text('./qualify-native-source.mjs');
  assert(source.indexOf('await qualifyNativeSandbox(')<source.indexOf("'--workspace-concurrency=1'"));
- const workflow=text('../.github/workflows/native-linux-build.yml');
+ const active=text('../.github/workflows/native-linux-build.yml');
+ const workflow=active.includes('--diagnose-canary-controls')?text('./fixtures/native-opaque-attachment-full.yml'):active;
  assert(workflow.includes("needs.selected_native_source.result == 'success'"));
  assert(workflow.includes('scripts/qualify-native-opaque-attachment.test.mjs'));
  assert(!workflow.includes('--diagnose-policy-delta'));

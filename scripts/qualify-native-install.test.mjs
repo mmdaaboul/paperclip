@@ -90,7 +90,7 @@ test('closure includes native peer and optional package versions and rejects mis
 });
 test('qualification only uploads a structured receipt and uses one read-only-token installer', () => {
   const active = readFileSync(new URL('../.github/workflows/native-linux-build.yml', import.meta.url), 'utf8');
-  const workflow = active.includes('--diagnose-policy-delta') ? readFileSync(new URL('./fixtures/native-stage-executor-full.yml', import.meta.url), 'utf8') : active;
+  const workflow = active.includes('--diagnose-canary-controls') ? readFileSync(new URL('./fixtures/native-opaque-attachment-full.yml', import.meta.url), 'utf8') : active.includes('--diagnose-policy-delta') ? readFileSync(new URL('./fixtures/native-stage-executor-full.yml', import.meta.url), 'utf8') : active;
   assert.match(workflow, /timeout-minutes: 45/); assert.match(workflow, /contents: read/);
   assert.doesNotMatch(workflow, /contents: write|workflow_dispatch|pull_request|secrets\./);
   assert.match(workflow, /path: \$\{\{ runner.temp \}\}\/f03-native-install\/evidence.json/);
