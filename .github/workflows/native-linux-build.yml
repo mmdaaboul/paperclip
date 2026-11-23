@@ -70,8 +70,10 @@ jobs:
         with:
           node-version: 24.21.0
           package-manager-cache: false
+      - name: Inspect native Linux sandbox host prerequisites
+        run: node scripts/qualify-native-sandbox.mjs --facts
       - name: Focused native source producer contracts
-        run: node --test scripts/qualify-native-source.test.mjs scripts/qualify-native-capacity.test.mjs
+        run: node --test scripts/qualify-native-source.test.mjs scripts/qualify-native-capacity.test.mjs scripts/qualify-native-sandbox.test.mjs
       - name: Frozen native workspace build and selected source qualification
         env:
           NATIVE_INSTALL_GITHUB_TOKEN: ${{ github.token }}

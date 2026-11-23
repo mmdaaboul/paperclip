@@ -9,6 +9,7 @@ import {join,resolve,sep,dirname} from 'node:path';
 import {readClaudeDependencyFacts} from './qualify-native-maintenance.mjs';
 import {fileURLToPath} from 'node:url';
 import {validateTarget,diagnosticCodes} from './qualify-native-install.mjs';
+import {qualifyNativeSandbox} from './qualify-native-sandbox.mjs';
 import {projectSelectedGroupFailure,classifySelectedFailureText} from './native-source-failure-evidence.mjs';
 const hash=b=>createHash('sha256').update(b).digest('hex');
 export function validateSourceContract(contract){
@@ -77,6 +78,7 @@ async function qualify(){
   evidence.capacity=[nativeCapacity(root,contract.resources.sourceBuild,'before-native-source-build')];save();assert.equal(command('git',['rev-parse','HEAD']).trim(),e.SOURCE_SHA);command('git',['diff','--exit-code','HEAD','--']);
   command('corepack',['enable','pnpm','--install-directory',join(tmp,'bin')]);env.PATH=join(tmp,'bin')+':'+env.PATH;
   command('corepack',['pnpm','install','--frozen-lockfile'],workspace,600000);
+  evidence.phase='native-sandbox-prerequisite';save();await qualifyNativeSandbox({workspace,root,ambient:e,onReceipt:r=>{evidence.sandboxPrerequisite=r;save();}});evidence.phase='frozen-native-build';save();
   command('corepack',['pnpm','-r','--workspace-concurrency=1','--filter','@paperclipai/server...','--if-present','run','build'],workspace,1500000,{PAPERCLIP_BUILD_COMMIT:e.SOURCE_SHA,PAPERCLIP_README_ASSET_REF:e.SOURCE_SHA,GH_TOKEN:e.NATIVE_INSTALL_GITHUB_TOKEN});
   command('git',['diff','--exit-code','HEAD','--']);const dependency=readClaudeDependencyFacts(join(workspace,'packages/paperclip-runner/package.json'),workspace);evidence.claudeRuntime={...dependency,frozenPatchedDependency:true};evidence.nativeWorkspaceBuild=true;evidence.capacity.push(nativeCapacity(root,contract.resources.sourceTests,'before-selected-source-tests'));save();const deadline=Date.now()+20*60*1000;
   for(const [index,group]of contract.groups.entries()){
