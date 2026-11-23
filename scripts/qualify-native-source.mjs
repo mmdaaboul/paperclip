@@ -66,10 +66,10 @@ export function runSelectedSourceGroup({execute,group,workspace,report,commandFa
   throw original;
  }
 }
-async function qualify(){
+async function qualify(diagnostic=false){
  validateTarget(process.env);assert(process.platform==='linux'&&process.arch==='x64'&&process.getuid()>0);const e=process.env,workspace=realpathSync(process.cwd()),root=join(realpathSync(e.RUNNER_TEMP),'f10-native-source');assert(!existsSync(root),'fresh_source_root_required');mkdirSync(root,{mode:0o700});const home=join(root,'home'),tmp=join(root,'tmp');mkdirSync(home,{mode:0o700});mkdirSync(tmp,{mode:0o700});mkdirSync(join(tmp,'bin'),{mode:0o700});
  const contractBytes=readFileSync(join(workspace,'scripts/native-selected-source-contract.json')),contract=validateSourceContract(JSON.parse(contractBytes));
- const evidence={schema:'paperclip.native-selected-qualification.v2',sourceRevision:e.SOURCE_SHA,status:'running',phase:'frozen-native-build',retry:false,contractSha256:hash(contractBytes),lockSha256:hash(readFileSync(join(workspace,'pnpm-lock.yaml'))),claudePatchSha256:hash(readFileSync(join(workspace,'patches/@agentclientprotocol__claude-agent-acp@0.73.0.patch'))),groups:[],liveProviderAcceptance:false,optionalSdkKernelCampaign:false};
+ const evidence={schema:'paperclip.native-selected-qualification.v2',sourceRevision:e.SOURCE_SHA,status:'running',phase:'frozen-native-build',retry:false,contractSha256:hash(contractBytes),lockSha256:hash(readFileSync(join(workspace,'pnpm-lock.yaml'))),claudePatchSha256:hash(readFileSync(join(workspace,'patches/@agentclientprotocol__claude-agent-acp@0.73.0.patch'))),groups:[],liveProviderAcceptance:false,optionalSdkKernelCampaign:false,...(diagnostic?{authority:'DIAGNOSTIC_ONLY_NOT_QUALIFICATION'}:{})};
  const save=()=>writeFileSync(join(root,'evidence.json'),JSON.stringify(evidence,null,2)+'\n',{mode:0o600});let env=sourceEnvironment(e,home,tmp);
  function command(binary,args,cwd=workspace,timeout=120000,extra={}){
   const r=spawnSync(binary,args,{cwd,env:{...env,...extra},encoding:'utf8',timeout,maxBuffer:32*1024**2,shell:false});const text=(String(r.stdout??'')+'\n'+String(r.stderr??'')).split(e.NATIVE_INSTALL_GITHUB_TOKEN).join('[redacted]');writeFileSync(join(root,evidence.phase+'.private.log'),text.slice(-256*1024),{mode:0o600});if(r.error||r.signal||r.status!==0){evidence.commandFailure={exit:r.status,signal:r.signal,reason:r.error?.code??'nonzero_exit',diagnostics:diagnosticCodes(text,e.NATIVE_INSTALL_GITHUB_TOKEN),selectedOutputDiagnostics:classifySelectedFailureText(text).filter(x=>x.kind!=='inspector_command')};save();assert.fail('native_source_command_failed');}return text;
@@ -78,7 +78,9 @@ async function qualify(){
   evidence.capacity=[nativeCapacity(root,contract.resources.sourceBuild,'before-native-source-build')];save();assert.equal(command('git',['rev-parse','HEAD']).trim(),e.SOURCE_SHA);command('git',['diff','--exit-code','HEAD','--']);
   command('corepack',['enable','pnpm','--install-directory',join(tmp,'bin')]);env.PATH=join(tmp,'bin')+':'+env.PATH;
   command('corepack',['pnpm','install','--frozen-lockfile'],workspace,600000);
-  evidence.phase='native-sandbox-prerequisite';save();await qualifyNativeSandbox({workspace,root,ambient:e,onReceipt:r=>{evidence.sandboxPrerequisite=r;save();}});evidence.phase='frozen-native-build';save();
+  evidence.phase='native-sandbox-prerequisite';save();await qualifyNativeSandbox({workspace,root,ambient:e,onReceipt:r=>{evidence.sandboxPrerequisite=r;save();},postAcquisitionDiagnostic:diagnostic});
+  if(diagnostic){evidence.phase='native-launch-transport-observed';const receipt=evidence.sandboxPrerequisite;const probe=receipt.afterAcquisitionProbe??receipt.initialProbe;evidence.status=probe?.transport?'diagnostic-completed':'diagnostic-inconclusive';return;}
+  evidence.phase='frozen-native-build';save();
   command('corepack',['pnpm','-r','--workspace-concurrency=1','--filter','@paperclipai/server...','--if-present','run','build'],workspace,1500000,{PAPERCLIP_BUILD_COMMIT:e.SOURCE_SHA,PAPERCLIP_README_ASSET_REF:e.SOURCE_SHA,GH_TOKEN:e.NATIVE_INSTALL_GITHUB_TOKEN});
   command('git',['diff','--exit-code','HEAD','--']);const dependency=readClaudeDependencyFacts(join(workspace,'packages/paperclip-runner/package.json'),workspace);evidence.claudeRuntime={...dependency,frozenPatchedDependency:true};evidence.nativeWorkspaceBuild=true;evidence.capacity.push(nativeCapacity(root,contract.resources.sourceTests,'before-selected-source-tests'));save();const deadline=Date.now()+20*60*1000;
   for(const [index,group]of contract.groups.entries()){
@@ -90,4 +92,9 @@ async function qualify(){
  }catch(error){const capacity=nativeCapacityFailure(error);if(capacity)evidence.capacityRefusal=capacity;evidence.status='failed';evidence.failedPhase=evidence.phase;evidence.failureCode=error?.code==='ERR_ASSERTION'?'ERR_ASSERTION':'NATIVE_SOURCE_FAILED';evidence.failureCheck=sourceQualificationFailureCheck(error);process.exitCode=1;}
  finally{evidence.finishedAt=new Date().toISOString();save();console.log(JSON.stringify(evidence));}
 }
-if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url))await qualify();
+if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)){
+ const mode=process.argv.slice(2);
+ if(mode.length===0)await qualify();
+ else if(mode.length===1&&mode[0]==='--diagnose-launch-transport')await qualify(true);
+ else throw Error('native_source_command_closed');
+}

@@ -113,9 +113,61 @@ export function validateChildLabelProof(raw,challenge,uid){
 export function inspectChildLabelProof(raw,challenge,uid){
  try{return {ok:true,proof:validateChildLabelProof(raw,challenge,uid)};}catch(error){return {ok:false,failure:{schema:'paperclip.native-sandbox-probe-failure.v1',code:error.sandboxCode??'sandbox_child_label_protocol_refused'}};}
 }
+const TRANSPORT_SCHEMA='paperclip.native-probe-transport.v1';
+const transportCodes=Object.freeze({
+ namespace_refusal: /bwrap: (?:No permissions to creat(?:e|ing) new namespace|Creating new namespace failed: Operation not permitted)(?:[.,]|$)/i,
+ namespace_loopback_denied: /bwrap: loopback: Failed RTM_NEWADDR: Operation not permitted/i,
+ bwrap_namespace_or_mount: /bwrap:.*(?:unshare|namespace|mount|pivot_root|setns)/i,
+ bwrap_exec_refusal: /bwrap:.*(?:execute|execvp|no such file|not found)/i,
+ sandbox_profile_or_config: /(?:permissions profile|sandbox profile|permission profile|config override)/i,
+ codex_cli_usage: /^(?:error: (?:unexpected argument|invalid value|unrecognized subcommand)|Usage: codex)/i,
+ sandbox_runtime_unavailable: /(?:landlock|sandbox runner|linux-sandbox|Seccomp|could not start|failed to launch)/i,
+ runtime_module_missing: /(?:ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND|Cannot find module)/i,
+ node_execution_error: /^(?:node:|SyntaxError:|ReferenceError:|TypeError:)/,
+ process_permission_denied: /(?:Permission denied|Operation not permitted)/i,
+});
+const transportErrnos=new Set(['ENOENT','EACCES','EPERM','ENOTDIR','EINVAL','EIO','ENOBUFS','ETIMEDOUT','EAGAIN','EMFILE','E2BIG','ENOMEM']);
+const transportSignals=new Set(['SIGHUP','SIGINT','SIGQUIT','SIGILL','SIGABRT','SIGBUS','SIGFPE','SIGKILL','SIGUSR1','SIGSEGV','SIGUSR2','SIGPIPE','SIGALRM','SIGTERM','SIGSYS','SIGXCPU','SIGXFSZ']);
+export function projectLaunchTransport(result,challenge){
+ const stdout=String(result.stdout??''),stderr=String(result.stderr??'');
+ const marker=`PAPERCLIP_CHILD_ENTRY:${challenge}`;
+ const stderrLines=stderr.split(/\r?\n/);
+ const terminal=(()=>{try{const receipt=JSON.parse(stdout);return receipt?.challenge===challenge&&['paperclip.native-sandbox-child-label.v1','paperclip.native-sandbox-probe-failure.v1'].includes(receipt.schema);}catch{return false;}})();
+ const codes=Object.entries(transportCodes).filter(([,pattern])=>stderrLines.some(line=>pattern.test(line))).map(([code])=>code);
+ return {schema:TRANSPORT_SCHEMA,exit:Number.isInteger(result.status)&&result.status>=0&&result.status<=255?result.status:null,
+  signal:result.signal?(transportSignals.has(result.signal)?result.signal:'OTHER'):null,
+  spawnError:result.error?(transportErrnos.has(result.error.code)?result.error.code:'OTHER'):null,
+  stdoutBytes:Buffer.byteLength(stdout),stderrBytes:Buffer.byteLength(stderr),stdoutSha256:hash(stdout),stderrSha256:hash(stderr),
+  childEntryObserved:stderrLines.includes(marker),childTerminalObserved:terminal,stderrCategories:codes,
+  unclassifiedStderr:stderrLines.some(line=>line.trim()&&line!==marker&&!Object.values(transportCodes).some(pattern=>pattern.test(line)))};
+}
+export function projectNativeProbeFailure(result,transport){
+ const stdout=String(result.stdout??'');
+ const typedNamespaceRefusal=!result.error&&!result.signal&&result.status===1&&!stdout.trim()&&!transport.childEntryObserved&&namespaceRefusal(String(result.stderr??''));
+ const failure=stdout.trim()?(transport.childTerminalObserved?projectProbeFailure(stdout):{code:'sandbox_child_boundary_refused'}):null;
+ return {typedNamespaceRefusal,failure};
+}
+function readLaunchTransport(stderr){
+ // Only the outer wrapper creates this line. The inner peer's raw output is never forwarded.
+ const prefix='PAPERCLIP_NATIVE_LAUNCH_TRANSPORT:';
+ const rows=String(stderr??'').split('\n').filter(line=>line.startsWith(prefix));
+ if(rows.length!==1||Buffer.byteLength(rows[0])>2048)return null;
+ try{
+  const report=JSON.parse(rows[0].slice(prefix.length));
+  if(report.schema!==TRANSPORT_SCHEMA||!Array.isArray(report.stderrCategories)||report.stderrCategories.length>Object.keys(transportCodes).length||!report.stderrCategories.every(code=>Object.hasOwn(transportCodes,code))||!['stdoutSha256','stderrSha256'].every(key=>/^[a-f0-9]{64}$/.test(report[key]))||!['stdoutBytes','stderrBytes'].every(key=>Number.isSafeInteger(report[key])&&report[key]>=0&&report[key]<=MAX)||!['childEntryObserved','childTerminalObserved','unclassifiedStderr'].every(key=>typeof report[key]==='boolean'))return null;
+  return {schema:TRANSPORT_SCHEMA,exit:Number.isInteger(report.exit)&&report.exit>=0&&report.exit<=255?report.exit:null,
+   signal:transportSignals.has(report.signal)||report.signal==='OTHER'?report.signal:null,
+   spawnError:transportErrnos.has(report.spawnError)||report.spawnError==='OTHER'?report.spawnError:null,
+   stdoutBytes:report.stdoutBytes,stderrBytes:report.stderrBytes,stdoutSha256:report.stdoutSha256,stderrSha256:report.stderrSha256,
+   childEntryObserved:report.childEntryObserved,childTerminalObserved:report.childTerminalObserved,
+   stderrCategories:report.stderrCategories,unclassifiedStderr:report.unclassifiedStderr};
+ }catch{return null;}
+}
 export function parseSandboxProbeResult(r){
- if(!r.ok)return {status:r.exit===1&&!r.signal&&r.namespaceDenied&&!r.stdout.trim()?'namespace_denied':'native_probe_refused',exit:r.exit,signal:r.signal,outputSha256:r.outputSha256,...(r.stdout.trim()?{safeFailure:projectProbeFailure(r.stdout)}:{})};
- try{return {status:'passed',proof:validateProbeReceipt(JSON.parse(r.stdout))};}catch(error){return {status:'native_probe_refused',failureCode:error.sandboxCode??'sandbox_native_probe_receipt_invalid',outputSha256:r.outputSha256};}
+ const transport=readLaunchTransport(r.stderr);
+ const context=transport?{transport}:{};
+ if(!r.ok)return {status:r.exit===1&&!r.signal&&r.namespaceDenied&&!r.stdout.trim()?'namespace_denied':'native_probe_refused',exit:r.exit,signal:r.signal,outputSha256:r.outputSha256,...context,...(r.stdout.trim()?{safeFailure:projectProbeFailure(r.stdout)}:{})};
+ try{return {status:'passed',proof:validateProbeReceipt(JSON.parse(r.stdout)),...context};}catch(error){return {status:'native_probe_refused',failureCode:error.sandboxCode??'sandbox_native_probe_receipt_invalid',outputSha256:r.outputSha256,...context};}
 }
 function projectProbeFailure(raw){
  try{const r=JSON.parse(raw);if(r.schema==='paperclip.native-sandbox-probe-failure.v1')return {schema:r.schema,code:['sandbox_execution_label_refused','sandbox_execution_label_bound','sandbox_execution_label_io_refused','sandbox_child_label_identity_refused','sandbox_child_label_protocol_refused','sandbox_child_label_changed','sandbox_child_boundary_refused'].includes(r.code)?r.code:'sandbox_child_boundary_refused',...(typeof r.observedLabel==='string'?{observedLabel:policyText(r.observedLabel)}:typeof r.observedLabel?.text==='string'?{observedLabel:policyText(r.observedLabel.text)}:/^[a-f0-9]{64}$/.test(r.observedLabel?.sha256??'')?{observedLabel:{sha256:r.observedLabel.sha256}}:{}),...(r.labelIo?.path===KERNEL_LABEL_PATH&&['open','read','close'].includes(r.labelIo.operation)&&['EACCES','EPERM','ENOENT','EINVAL','EIO','EBADF','ELOOP','ENOTDIR','OTHER'].includes(r.labelIo.errno)?{labelIo:{path:KERNEL_LABEL_PATH,operation:r.labelIo.operation,errno:r.labelIo.errno}}:{})};}catch{}return {code:'sandbox_child_boundary_refused'};
@@ -135,7 +187,7 @@ function runner(deadline,home){return (binary,args,ms=15000,input)=>{
  const command=privileged?binary:'/usr/bin/timeout',argv=privileged?['-n','/usr/bin/timeout','--signal=KILL',seconds,...args.slice(1)]:['--signal=KILL',seconds,binary,...args];
  const r=spawnSync(command,argv,{...(input===undefined?{}:{input}),env:safeEnv(home),encoding:'utf8',timeout:effective,killSignal:'SIGKILL',maxBuffer:MAX/2,shell:false});
  const out=String(r.stdout??'')+'\n'+String(r.stderr??'');if(Buffer.byteLength(out)>MAX)fail('sandbox_command_output_bound');
- return {ok:!r.error&&!r.signal&&r.status===0,stdout:String(r.stdout??''),namespaceDenied:namespaceRefusal(out),exit:Number.isInteger(r.status)?r.status:null,signal:r.signal??null,outputSha256:hash(out),policyAlreadyExists:/Profile already exists/.test(out)};
+ return {ok:!r.error&&!r.signal&&r.status===0,stdout:String(r.stdout??''),stderr:String(r.stderr??''),namespaceDenied:namespaceRefusal(out),exit:Number.isInteger(r.status)?r.status:null,signal:r.signal??null,outputSha256:hash(out),policyAlreadyExists:/Profile already exists/.test(out)};
  };}
 const SYSTEM_FILES=Object.freeze({distroBwrap:'/usr/bin/bwrap',systemTimeout:'/usr/bin/timeout',packagedProfile:'/usr/share/apparmor/extra-profiles/bwrap-userns-restrict',destinationProfile:'/etc/apparmor.d/bwrap-userns-restrict'});
 const SYSTEM_ANCESTORS=new Set(['/',...Object.values(SYSTEM_FILES).flatMap(file=>{const a=[];for(let p=dirname(file);;p=dirname(p)){a.push(p);if(p==='/')break;}return a;})]);
@@ -249,7 +301,7 @@ export function collectHostFacts(run){
  return validateSandboxHost({os:value('ID'),release:value('VERSION_ID'),kernelRelease:/^[A-Za-z0-9_.+\-]{1,128}$/.test(kernelRelease())?kernelRelease():null,uid:process.getuid(),bwrapPresent,bwrapTrusted,bwrapPackageOwned,bwrapSha256,bwrapVersion,bwrapPackageVersion,bwrapMode,apparmor:optional('/sys/module/apparmor/parameters/enabled')==='Y',restrictedUserns:number('/proc/sys/kernel/apparmor_restrict_unprivileged_userns'),maxUserNamespaces:number('/proc/sys/user/max_user_namespaces'),usernsClone:number('/proc/sys/kernel/unprivileged_userns_clone'),seccomp:Number(status.match(/^Seccomp:\s+(\d+)$/m)?.[1]??-1)});
 }
 function hosted(e){if(process.platform!=='linux'||process.arch!=='x64'||e.GITHUB_REPOSITORY!=='mmdaaboul/paperclip'||e.GITHUB_JOB!=='selected_native_source'||e.GITHUB_ACTIONS!=='true'||e.RUNNER_ENVIRONMENT!=='github-hosted')fail('sandbox_disposable_job_only');}
-export async function qualifyNativeSandbox({workspace,root,ambient=process.env,onReceipt=()=>{}}){
+export async function qualifyNativeSandbox({workspace,root,ambient=process.env,onReceipt=()=>{},postAcquisitionDiagnostic=false}){
  hosted(ambient);const deadline=Date.now()+SANDBOX_LIMITS.aggregateMs,run=runner(deadline,root);
  const receipt={schema:'paperclip.native-sandbox-prerequisite.v1',status:'running',normalUser:true,retry:false,productionPolicyChanged:false,globalRestrictionChanged:false,initialProbe:null,postProbe:null,operations:[]};
  const save=()=>{assert(Buffer.byteLength(JSON.stringify(receipt))<=MAX);onReceipt(receipt);};
@@ -258,11 +310,13 @@ export async function qualifyNativeSandbox({workspace,root,ambient=process.env,o
   const probe=()=>parseSandboxProbeResult(run(process.execPath,['--import',join(workspace,'packages/paperclip-runner/node_modules/tsx/dist/loader.mjs'),SELF,'--probe',root],SANDBOX_LIMITS.probeMs));
   receipt.initialProbe=receipt.before.bwrapPresent?await probe():{status:'not-run-missing-distro-bwrap'};save();
   const decision=sandboxRepairDecision(receipt.before,receipt.initialProbe.status);receipt.decision=decision;save();
+  if(postAcquisitionDiagnostic&&decision==='none'){receipt.status='diagnostic-observed';save();return receipt;}
   if(decision!=='none'){
    const aptDeadline=Math.min(deadline,Date.now()+SANDBOX_LIMITS.aptMs);
    for(const args of [['update','-qq'],['install','-y','-qq','--no-install-recommends','bubblewrap','apparmor-profiles','apparmor-utils']]){const r=run('/usr/bin/sudo',['-n','/usr/bin/apt-get',...args],Math.max(1,aptDeadline-Date.now()));if(!r.ok)fail('sandbox_distro_acquisition_failed');receipt.operations.push(args[0]==='update'?'signed-distro-index':'named-distro-prerequisites');save();}
    const after=collectHostFacts(run);if(!after.bwrapPresent)fail('sandbox_distro_bwrap_missing');receipt.afterAcquisition=after;save();
    receipt.afterAcquisitionProbe=await probe();save();
+   if(postAcquisitionDiagnostic){receipt.status='diagnostic-observed';save();return receipt;}
    const afterDecision=sandboxRepairDecision(after,receipt.afterAcquisitionProbe.status);receipt.afterAcquisitionDecision=afterDecision;save();
    if(afterDecision!=='none'){
     const profileDeadline=Math.min(deadline,Date.now()+SANDBOX_LIMITS.profileMs),profileRun=(binary,args)=>run(binary,args,Math.max(1,profileDeadline-Date.now()));
@@ -287,7 +341,7 @@ export async function qualifyNativeSandbox({workspace,root,ambient=process.env,o
  }catch(error){receipt.status='failed';receipt.failureCode=error.sandboxCode??'sandbox_prerequisite_refused';if(error.sandboxDiagnostic)receipt.trustRefusal=error.sandboxDiagnostic;preserveSandboxFailure(error,save,summary=>console.error(JSON.stringify(summary)));}
 }
 export function nativeBoundaryProbeProgram(){
- return `const fs=require('node:fs'),net=require('node:net');const [c,r,p,s,o,port,challenge]=process.argv.slice(1);const KERNEL_LABEL_PATH=${JSON.stringify(KERNEL_LABEL_PATH)},EXPECTED_KERNEL_LABEL=${JSON.stringify(EXPECTED_KERNEL_LABEL)};const fail=code=>{throw Object.assign(Error(code),{sandboxCode:code});};const validateExecutionLabel=${validateExecutionLabel.toString()},readExecutionLabel=${readExecutionLabel.toString()};let entry=null,lastLabel=null;const reportError=e=>{process.stdout.write(JSON.stringify({schema:'paperclip.native-sandbox-probe-failure.v1',code:e.sandboxCode??'sandbox_child_boundary_refused',...(typeof lastLabel==='string'?{observedLabel:lastLabel}:{}),...(e.labelIo?{labelIo:e.labelIo}:{})}));process.exit(25);};try{if(process.getuid()===0)fail('sandbox_child_boundary_refused');entry=readExecutionLabel(fs);lastLabel=entry;validateExecutionLabel(entry);if(fs.readFileSync(c+'/canary','utf8')!=='retained-candidate'||fs.readFileSync(r+'/canary','utf8')!=='retained-reference')fail('sandbox_child_boundary_refused');for(const f of [c+'/canary',r+'/canary',p+'/canary',c+'/.git/canary',o+'/outside']){let denied=false;try{fs.writeFileSync(f,'forbidden');}catch{denied=true;}if(!denied)fail('sandbox_child_boundary_refused');}let protectedReadDenied=false;try{fs.readFileSync(p+'/canary');}catch{protectedReadDenied=true;}if(!protectedReadDenied)fail('sandbox_child_boundary_refused');fs.writeFileSync(s+'/allowed','allowed');let finished=false;const finish=()=>{if(finished)return;finished=true;try{const exit=readExecutionLabel(fs);lastLabel=exit;validateExecutionLabel(exit);if(entry!==exit)fail('sandbox_child_label_changed');process.stdout.write(JSON.stringify({schema:'paperclip.native-sandbox-child-label.v1',challenge,uid:process.getuid(),path:KERNEL_LABEL_PATH,entry,exit}));process.exit(0);}catch(e){reportError(e);}};const socket=net.connect(Number(port),'127.0.0.1',()=>process.exit(23));socket.on('error',finish);socket.setTimeout(500,()=>{socket.destroy();finish();});}catch(e){reportError(e);}`;
+ return `const fs=require('node:fs'),net=require('node:net');const [c,r,p,s,o,port,challenge]=process.argv.slice(1);const KERNEL_LABEL_PATH=${JSON.stringify(KERNEL_LABEL_PATH)},EXPECTED_KERNEL_LABEL=${JSON.stringify(EXPECTED_KERNEL_LABEL)};const fail=code=>{throw Object.assign(Error(code),{sandboxCode:code});};const validateExecutionLabel=${validateExecutionLabel.toString()},readExecutionLabel=${readExecutionLabel.toString()};let entry=null,lastLabel=null;const reportError=e=>{fs.writeSync(1,JSON.stringify({schema:'paperclip.native-sandbox-probe-failure.v1',challenge,code:e.sandboxCode??'sandbox_child_boundary_refused',...(typeof lastLabel==='string'?{observedLabel:lastLabel}:{}),...(e.labelIo?{labelIo:e.labelIo}:{})}));process.exit(25);};try{if(process.getuid()===0)fail('sandbox_child_boundary_refused');fs.writeSync(2,'PAPERCLIP_CHILD_ENTRY:'+challenge+'\\n');entry=readExecutionLabel(fs);lastLabel=entry;validateExecutionLabel(entry);if(fs.readFileSync(c+'/canary','utf8')!=='retained-candidate'||fs.readFileSync(r+'/canary','utf8')!=='retained-reference')fail('sandbox_child_boundary_refused');for(const f of [c+'/canary',r+'/canary',p+'/canary',c+'/.git/canary',o+'/outside']){let denied=false;try{fs.writeFileSync(f,'forbidden');}catch{denied=true;}if(!denied)fail('sandbox_child_boundary_refused');}let protectedReadDenied=false;try{fs.readFileSync(p+'/canary');}catch{protectedReadDenied=true;}if(!protectedReadDenied)fail('sandbox_child_boundary_refused');fs.writeFileSync(s+'/allowed','allowed');let finished=false;const finish=()=>{if(finished)return;finished=true;try{const exit=readExecutionLabel(fs);lastLabel=exit;validateExecutionLabel(exit);if(entry!==exit)fail('sandbox_child_label_changed');fs.writeSync(1,JSON.stringify({schema:'paperclip.native-sandbox-child-label.v1',challenge,uid:process.getuid(),path:KERNEL_LABEL_PATH,entry,exit}));process.exit(0);}catch(e){reportError(e);}};const socket=net.connect(Number(port),'127.0.0.1',()=>process.exit(23));socket.on('error',finish);socket.setTimeout(500,()=>{socket.destroy();finish();});}catch(e){reportError(e);}`;
 }
 async function nativeProbe(root){
  if(process.platform!=='linux'||process.arch!=='x64'||process.getuid()===0)fail('sandbox_probe_platform');
@@ -303,7 +357,15 @@ async function nativeProbe(root){
   await new Promise((yes,no)=>{const socket=net.connect(port,'127.0.0.1',()=>{outsideControl=true;socket.end();yes();});socket.once('error',no);socket.setTimeout(1000,()=>socket.destroy(new Error('control_timeout')));});
   const program=nativeBoundaryProbeProgram();
   const r=spawnSync(codex.endsWith('.js')?process.execPath:codex,[...(codex.endsWith('.js')?[codex]:[]),'sandbox',...config,'-P',CODEX_SKILLLESS_PERMISSION_PROFILE,'-C',p.candidate,'--',process.execPath,'-e',program,p.candidate,p.reference,p.protected,p.scratch,base,String(port),challenge],{cwd:p.candidate,env,encoding:'utf8',timeout:10000,killSignal:'SIGKILL',maxBuffer:MAX/2});
-  if(r.error||r.signal||r.status!==0){const text=String(r.stdout??'')+'\n'+String(r.stderr??'');if(r.stdout.trim())console.log(JSON.stringify({schema:'paperclip.native-sandbox-probe-failure.v1',...projectProbeFailure(r.stdout)}));process.stderr.write(!r.error&&!r.signal&&r.status===1&&!r.stdout.trim()&&namespaceRefusal(text)?'bwrap: No permissions to create new namespace\n':'native sandbox boundary probe refused\n');process.exitCode=1;return;}
+  const transport=projectLaunchTransport(r,challenge);
+  writeFileSync(2,'PAPERCLIP_NATIVE_LAUNCH_TRANSPORT:'+JSON.stringify(transport)+'\n');
+  if(r.error||r.signal||r.status!==0){
+   const {typedNamespaceRefusal,failure}=projectNativeProbeFailure(r,transport);
+   if(failure)console.log(JSON.stringify({schema:'paperclip.native-sandbox-probe-failure.v1',...failure}));
+   process.stderr.write(typedNamespaceRefusal?'bwrap: No permissions to create new namespace\n':'native sandbox boundary probe refused\n');
+   process.exitCode=1;
+   return;
+  }
   const childProof=inspectChildLabelProof(r.stdout,challenge,process.getuid());if(!childProof.ok){console.log(JSON.stringify(childProof.failure));process.stderr.write('native sandbox label proof refused\n');process.exitCode=1;return;}const executionLabel=childProof.proof;
   for(const n of ['candidate','reference','protected'])if(readFileSync(join(p[n],'canary'),'utf8')!=='retained-'+n)fail('sandbox_probe_mutated_canary');if(readFileSync(join(p.candidate,'.git/canary'),'utf8')!=='retained-metadata'||readFileSync(join(p.scratch,'allowed'),'utf8')!=='allowed'||existsSync(join(base,'outside')))fail('sandbox_probe_mutated_canary');
   console.log(JSON.stringify({schema:'paperclip.native-sandbox-probe.v1',uid:process.getuid(),codexVersion:pkg.version,wrapperSha256:hash(readFileSync(codex)),nativeElfSha256,bwrapPath:'/usr/bin/bwrap',bwrapSha256:hash(bwrap),nativeSandbox:true,allowedRead:true,scratchWrite:true,candidateDenied:true,referenceDenied:true,protectedDenied:true,protectedReadDenied:true,metadataDenied:true,outsideDenied:true,networkDenied:true,outsideNetworkControl:outsideControl,originalBytesPreserved:true,executionLabel}));
