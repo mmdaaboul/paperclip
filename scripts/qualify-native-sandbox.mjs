@@ -8,6 +8,7 @@ import {join,dirname,resolve} from 'node:path';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 import {createRequire} from 'node:module';
 import net from 'node:net';
+import {release as kernelRelease} from 'node:os';
 const SELF=fileURLToPath(import.meta.url),MAX=65536;
 export const SANDBOX_LIMITS=Object.freeze({aggregateMs:600000,aptMs:300000,profileMs:60000,probeMs:15000,outputBytes:MAX});
 const hash=b=>createHash('sha256').update(b).digest('hex');
@@ -63,11 +64,34 @@ function runner(deadline,home){return (binary,args,ms=15000)=>{
  const out=String(r.stdout??'')+'\n'+String(r.stderr??'');if(Buffer.byteLength(out)>MAX)fail('sandbox_command_output_bound');
  return {ok:!r.error&&!r.signal&&r.status===0,stdout:String(r.stdout??''),namespaceDenied:namespaceRefusal(out),exit:Number.isInteger(r.status)?r.status:null,signal:r.signal??null,outputSha256:hash(out)};
  };}
-function trustedFile(path,limit=MAX){
- const st=lstatSync(path);if(!st.isFile()||st.isSymbolicLink()||st.uid!==0||(st.mode&0o6022)!==0||st.nlink!==1||st.size>limit||realpathSync(path)!==path)fail('sandbox_system_file_unsafe');
- for(let p=dirname(path);;p=dirname(p)){const s=lstatSync(p);if(!s.isDirectory()||s.isSymbolicLink()||s.uid!==0||(s.mode&0o022)!==0)fail('sandbox_system_parent_unsafe');if(p==='/')break;}
+const SYSTEM_FILES=Object.freeze({distroBwrap:'/usr/bin/bwrap',systemTimeout:'/usr/bin/timeout',packagedProfile:'/usr/share/apparmor/extra-profiles/bwrap-userns-restrict',destinationProfile:'/etc/apparmor.d/bwrap-userns-restrict'});
+const SYSTEM_ANCESTORS=new Set(['/',...Object.values(SYSTEM_FILES).flatMap(file=>{const a=[];for(let p=dirname(file);;p=dirname(p)){a.push(p);if(p==='/')break;}return a;})]);
+export function projectTrustRefusal(requested,ancestor,predicate,st,context='file-check'){
+ const entry=Object.entries(SYSTEM_FILES).find(([,path])=>path===requested),allowed=entry&&(ancestor===requested||(SYSTEM_ANCESTORS.has(ancestor)&&(ancestor==='/'||requested.startsWith(ancestor+'/'))));
+ return {schema:'paperclip.system-trust-refusal.v1',operationContext:['file-check','parent-check'].includes(context)?context:'unknown',requestedClass:entry?.[0]??'unlisted',...(entry?{requestedPath:requested}:{requestedPathSha256:hash(requested)}),...(allowed?{ancestorPath:ancestor}:{ancestorPathSha256:hash(ancestor)}),failedPredicate:['regular','not-symlink','owner','not-writable-or-setid','single-link','bounded','canonical','directory','not-group-or-other-writable','absent','metadata-unreadable'].includes(predicate)?predicate:'unknown',observed:st?{type:st.isSymbolicLink()?'symlink':st.isDirectory()?'directory':st.isFile()?'regular':'other',uid:st.uid,gid:st.gid,mode:st.mode&0o7777,dev:st.dev,ino:st.ino}:null};
+}
+export function trustedFile(path,limit=MAX,expectedUid=0){
+ const refuse=(code,at,predicate,st,context)=>{const e=Object.assign(new Error(code),{sandboxCode:code,sandboxDiagnostic:projectTrustRefusal(path,at,predicate,st,context)});throw e;};
+ let st;try{st=lstatSync(path);}catch(e){refuse('sandbox_system_metadata_unavailable',path,e.code==='ENOENT'?'absent':'metadata-unreadable',null,'file-check');}for(const [name,ok]of [['regular',st.isFile()],['not-symlink',!st.isSymbolicLink()],['owner',st.uid===expectedUid],['not-writable-or-setid',(st.mode&0o6022)===0],['single-link',st.nlink===1],['bounded',st.size<=limit]])if(!ok)refuse('sandbox_system_file_unsafe',path,name,st,'file-check');
+ let canonical;try{canonical=realpathSync(path);}catch{refuse('sandbox_system_metadata_unavailable',path,'metadata-unreadable',st,'file-check');}if(canonical!==path)refuse('sandbox_system_file_unsafe',path,'canonical',st,'file-check');
+ for(let p=dirname(path);;p=dirname(p)){let st;try{st=lstatSync(p);}catch(e){refuse('sandbox_system_metadata_unavailable',p,e.code==='ENOENT'?'absent':'metadata-unreadable',null,'parent-check');}for(const [name,ok]of [['directory',st.isDirectory()],['not-symlink',!st.isSymbolicLink()],['owner',st.uid===expectedUid],['not-group-or-other-writable',(st.mode&0o022)===0]])if(!ok)refuse('sandbox_system_parent_unsafe',p,name,st,'parent-check');if(p==='/')break;}
  return readFileSync(path);
 }
+export function snapshotSystemTrust(){
+ return Object.entries(SYSTEM_FILES).map(([requestedClass,path])=>{const chain=[];for(let at=path;;at=dirname(at)){try{const st=lstatSync(at);chain.push({path:at,type:st.isSymbolicLink()?'symlink':st.isDirectory()?'directory':st.isFile()?'regular':'other',uid:st.uid,gid:st.gid,mode:st.mode&0o7777,dev:st.dev,ino:st.ino});}catch(e){chain.push({path:at,state:e.code==='ENOENT'?'absent':'unreadable'});}if(at==='/')break;}try{trustedFile(path,16*1024**2);return {requestedClass,path,chain,guard:'accepted'};}catch(e){return {requestedClass,path,chain,guard:'refused',failureCode:e.sandboxCode??(e.code==='ENOENT'?'file_absent':'metadata_unavailable'),...(e.sandboxDiagnostic?{refusal:e.sandboxDiagnostic}:{})};}});
+}
+export function diagnosticHostIdentity(uid,raw){
+ if(!Number.isSafeInteger(uid)||uid<=0)fail('diagnostic_normal_user_required');if(Buffer.byteLength(raw)>65536)fail('diagnostic_host_unsupported');const value=k=>{const line=raw.split('\n').find(x=>x.startsWith(k+'='));return line?.slice(k.length+1).replace(/^"(.*)"$/,'$1');};if(value('ID')!=='ubuntu'||value('VERSION_ID')!=='24.04')fail('diagnostic_host_unsupported');return {uid,os:'ubuntu',osVersion:'24.04'};
+}
+async function diagnoseSystemTrust(){
+ hosted(process.env);diagnosticHostIdentity(process.getuid(),readFileSync('/etc/os-release','utf8'));const root=realpathSync(process.env.RUNNER_TEMP),out=join(root,'native-system-trust-diagnostic.json');if(existsSync(out))fail('diagnostic_destination_exists');
+ const evidence={schema:'paperclip.system-trust-diagnostic.v1',authority:'DIAGNOSTIC_ONLY_NOT_QUALIFICATION',source:process.env.SOURCE_SHA,status:'running',retry:false,normalUid:process.getuid(),os:'ubuntu',osVersion:'24.04',kernel:/^[A-Za-z0-9_.+\-]{1,128}$/.test(kernelRelease())?kernelRelease():null,imageOS:/^[A-Za-z0-9_.-]{1,80}$/.test(process.env.ImageOS??'')?process.env.ImageOS:null,imageVersion:/^[A-Za-z0-9_.-]{1,80}$/.test(process.env.ImageVersion??'')?process.env.ImageVersion:null,before:snapshotSystemTrust(),operations:[],profileLoaded:false,nativeProbeRun:false,sourceBuilt:false,appInstalled:false};
+ const save=()=>{const raw=JSON.stringify(evidence,null,2)+'\n';if(Buffer.byteLength(raw)>MAX)fail('diagnostic_evidence_bound');writeFileSync(out,raw,{mode:0o600});};save();
+ try{const deadline=Date.now()+300000,run=runner(deadline,root);for(const args of [['update','-qq'],['install','-y','-qq','--no-install-recommends','bubblewrap','apparmor-profiles','apparmor-utils']]){const r=run('/usr/bin/sudo',['-n','/usr/bin/apt-get',...args],Math.max(1,deadline-Date.now()));if(!r.ok)fail('diagnostic_distro_acquisition_failed');evidence.operations.push(args[0]==='update'?'signed-distro-index':'named-distro-prerequisites');save();}evidence.after=snapshotSystemTrust();evidence.status='diagnostic-completed';}
+ catch(e){evidence.status='diagnostic-stopped';evidence.failureCode=e.sandboxCode??'diagnostic_refused';if(e.sandboxDiagnostic)evidence.refusal=e.sandboxDiagnostic;evidence.after=snapshotSystemTrust();process.exitCode=1;}
+ finally{evidence.finishedAt=new Date().toISOString();save();console.log(JSON.stringify(evidence));}
+}
+
 function nativeElfDigest(path){
  const fd=openSync(path,'r');try{const before=fstatSync(fd),digest=createHash('sha256'),chunk=Buffer.alloc(1024*1024);if(!before.isFile()||before.size<4||before.size>512*1024**2)fail('sandbox_codex_elf_bound');let offset=0;for(;;){const n=readSync(fd,chunk,0,chunk.length,null);if(!n)break;if(offset===0&&!chunk.subarray(0,4).equals(Buffer.from([127,69,76,70])))fail('sandbox_codex_elf_required');offset+=n;digest.update(chunk.subarray(0,n));}const after=fstatSync(fd);if(offset!==before.size||after.dev!==before.dev||after.ino!==before.ino||after.size!==before.size||after.mtimeMs!==before.mtimeMs)fail('sandbox_codex_elf_changed');return digest.digest('hex');}finally{closeSync(fd);}
 }
@@ -117,7 +141,7 @@ export async function qualifyNativeSandbox({workspace,root,ambient=process.env,o
    receipt.postProbe=await probe();save();if(receipt.postProbe.status!=='passed')fail('sandbox_post_prerequisite_refused');
   }
   receipt.after=collectHostFacts(run);receipt.globalRestrictionChanged=['apparmor','restrictedUserns','maxUserNamespaces','usernsClone','seccomp'].some(k=>receipt.before[k]!==receipt.after[k]);if(receipt.globalRestrictionChanged)fail('sandbox_global_host_policy_changed');receipt.proof=validateProbeReceipt((receipt.postProbe??receipt.initialProbe).proof);if(receipt.after.bwrapSha256!==receipt.proof.bwrapSha256)fail('sandbox_bwrap_changed');receipt.status='passed';save();return receipt;
- }catch(error){receipt.status='failed';receipt.failureCode=error.sandboxCode??'sandbox_prerequisite_refused';save();throw error;}
+ }catch(error){receipt.status='failed';receipt.failureCode=error.sandboxCode??'sandbox_prerequisite_refused';if(error.sandboxDiagnostic)receipt.trustRefusal=error.sandboxDiagnostic;save();throw error;}
 }
 async function nativeProbe(root){
  if(process.platform!=='linux'||process.arch!=='x64'||process.getuid()===0)fail('sandbox_probe_platform');
@@ -139,7 +163,8 @@ async function nativeProbe(root){
  }finally{await new Promise(yes=>server.close(yes));}
 }
 if(process.argv[1]&&resolve(process.argv[1])===SELF){
- if(process.argv[2]==='--probe')await nativeProbe(resolve(process.argv[3]));
+ if(process.argv[2]==='--diagnose-system-trust')await diagnoseSystemTrust();
+ else if(process.argv[2]==='--probe')await nativeProbe(resolve(process.argv[3]));
  else if(process.argv[2]==='--facts'){hosted(process.env);const run=runner(Date.now()+60000,process.env.RUNNER_TEMP);console.log(JSON.stringify({schema:'paperclip.native-sandbox-host-facts.v1',facts:collectHostFacts(run)}));}
  else fail('sandbox_command_closed');
 }
