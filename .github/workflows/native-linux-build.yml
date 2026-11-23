@@ -6,7 +6,8 @@ permissions:
   contents: read
 jobs:
   native_install:
-    if: github.repository == 'mmdaaboul/paperclip' && github.ref == 'refs/heads/qualification/native-linux-build'
+    needs: selected_native_source
+    if: needs.selected_native_source.result == 'success' && github.repository == 'mmdaaboul/paperclip' && github.ref == 'refs/heads/qualification/native-linux-build'
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:
