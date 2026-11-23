@@ -267,6 +267,11 @@
       "fullNames": [
         "executeNativeSession recovery > typed local scoped recovery survives the native backend without replacement"
       ]
+    },
+    {
+      "project": "runner",
+      "path": "packages/paperclip-runner/src/drivers/codex/reviewer-candidate-inspection.test.ts",
+      "selection": "whole-file"
     }
   ],
   "retries": 0,
