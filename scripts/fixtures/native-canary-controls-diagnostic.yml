@@ -1,0 +1,42 @@
+name: Native hosted sandbox controls diagnostic
+on:
+  push:
+    branches: [qualification/native-linux-build]
+permissions:
+  contents: read
+jobs:
+  selected_native_source:
+    if: github.repository == 'mmdaaboul/paperclip' && github.ref == 'refs/heads/qualification/native-linux-build'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    env:
+      SOURCE_SHA: ${{ github.sha }}
+      WORKFLOW_SHA: ${{ github.workflow_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.21.0
+          package-manager-cache: false
+      - name: Inspect native Linux sandbox host prerequisites
+        run: node scripts/qualify-native-sandbox.mjs --facts
+      - name: Focused native source producer contracts
+        env:
+          PAPERCLIP_DIAGNOSTIC_TEST_SCRATCH: ${{ runner.temp }}
+        run: node --test scripts/qualify-native-source.test.mjs scripts/qualify-native-capacity.test.mjs scripts/qualify-native-sandbox.test.mjs scripts/qualify-native-policy-diagnostic.test.mjs scripts/qualify-native-add-only.test.mjs scripts/qualify-native-launch-transport.test.mjs scripts/qualify-native-canary-controls.test.mjs
+      - name: Observe every scoped sandbox canary
+        env:
+          NATIVE_INSTALL_GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/qualify-native-source.mjs --diagnose-canary-controls
+      - name: Upload only structured native source evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: native-canary-controls-evidence
+          path: ${{ runner.temp }}/f10-native-source/evidence.json
+          include-hidden-files: false
+          if-no-files-found: warn
+          retention-days: 14

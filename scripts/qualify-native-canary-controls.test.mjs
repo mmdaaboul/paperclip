@@ -1,14 +1,22 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import {readFileSync} from 'node:fs';
+import {mkdirSync,mkdtempSync,readFileSync,renameSync,rmSync,symlinkSync,writeFileSync} from 'node:fs';
+import {join} from 'node:path';
 import {Script} from 'node:vm';
-import {completeCanaryObservation,nativeBoundaryProbeProgram,observeFilesystemCanaries,projectCanaryObservation,parseSandboxProbeResult,projectLaunchTransport,projectNativeProbeFailure} from './qualify-native-sandbox.mjs';
+import {completeCanaryObservation,nativeBoundaryProbeProgram,observeCanaryParent,observeFilesystemCanaries,outsideHostWitness,projectCanaryObservation,parseSandboxProbeResult,projectLaunchTransport,projectNativeProbeFailure} from './qualify-native-sandbox.mjs';
 
 const roots=['/candidate','/reference','/protected','/scratch','/outside'];
 const deny=code=>{throw Object.assign(Error('PRIVATE_PATH /never/disclose'),{code});};
 function fixture(failures={}){
  const calls=[];
  const reader={
+  constants:{O_WRONLY:1,O_NOFOLLOW:0x20000},
+  openSync(path,flags){
+   calls.push(['open',path,flags]);
+   if(failures[path])deny(failures[path]);
+   deny('EROFS');
+  },
+  closeSync(){},
   readFileSync(path){
    calls.push(['read',path]);
    if(failures[path])deny(failures[path]);
@@ -16,8 +24,8 @@ function fixture(failures={}){
    if(path==='/reference/canary')return 'retained-reference';
    return deny('ENOENT');
   },
-  writeFileSync(path){
-   calls.push(['write',path]);
+  writeFileSync(path,value,options){
+   calls.push(['write',path,options?.flag??null]);
    if(path==='/scratch/allowed')return;
    if(failures[path]==='ALLOW')return;
    deny('EROFS');
@@ -25,30 +33,68 @@ function fixture(failures={}){
  };
  return {reader,calls};
 }
-const observe=reader=>observeFilesystemCanaries(reader,roots,['ENOENT','EROFS','EACCES']);
-const report=filesystem=>({schema:'paperclip.native-canary-observation.v1',filesystem,network:'denied'});
-const parent={outsideNetworkControl:true,candidateUnchanged:true,referenceUnchanged:true,protectedUnchanged:true,metadataUnchanged:true,scratchContentPresent:true,outsideFileAbsent:true};
+const observe=reader=>observeFilesystemCanaries(reader,roots,['ENOENT','EROFS','EACCES','EIO','ENOSPC']);
+const report=filesystem=>({schema:'paperclip.native-canary-observation.v2',filesystem,network:'denied'});
+const parent={outsideNetworkControl:true,outsideHostAccessibleBefore:true,outsideHostDirectoryUnchanged:true,outsideHostSentinelUnchanged:true,candidateUnchanged:true,referenceUnchanged:true,protectedUnchanged:true,metadataUnchanged:true,scratchContentPresent:true,outsideFileAbsent:true};
 
 test('canary controls enumerate every fixed operation in one child and disclose no contents',()=>{
  const {reader,calls}=fixture();
  const result=observe(reader);
- assert.equal(calls.length,9);
- assert.equal(result.length,9);
+ assert.equal(calls.length,11);
+ assert.equal(result.length,11);
  assert(result.every(row=>row.passed));
  assert.equal(result[0].outcome,'retained');
- assert.equal(result[7].errno,'ENOENT');
- assert.equal(result[8].name,'scratch-write');
+ assert.equal(result[9].errno,'ENOENT');
+ assert.equal(result[10].name,'scratch-write');
+ assert.deepEqual(calls.slice(6,9),[
+  ['read','/outside/retained'],['open','/outside/retained',reader.constants.O_WRONLY|reader.constants.O_NOFOLLOW],['write','/outside/created','wx'],
+ ]);
  assert.deepEqual(projectCanaryObservation(report(result)),report(result));
  assert(!JSON.stringify(result).includes('/candidate'));
 });
 test('canary controls retain failures in several roles without stopping at the first failure',()=>{
- const {reader,calls}=fixture({'/candidate/canary':'EACCES','/outside/outside':'ALLOW'});
+ const {reader,calls}=fixture({'/candidate/canary':'EACCES','/outside/created':'ALLOW'});
  const result=observe(reader);
- assert.equal(calls.length,9);
+ assert.equal(calls.length,11);
  assert.deepEqual(result.filter(row=>!row.passed).map(row=>[row.name,row.outcome,row.errno]),[
-  ['candidate-read','error','EACCES'],['outside-write','completed',null],
+  ['candidate-read','error','EACCES'],['outside-create','completed',null],
  ]);
  assert(!JSON.stringify(result).includes('PRIVATE_PATH'));
+});
+test('canary controls detect a write-only exposure and refuse unrelated outside I/O errors',()=>{
+ const {reader}=fixture();
+ const open=reader.openSync;
+ reader.openSync=(path,flags)=>{
+  if(path!=='/outside/retained')return open(path,flags);
+  assert.equal(flags,reader.constants.O_WRONLY|reader.constants.O_NOFOLLOW);
+  return 77;
+ };
+ const write=reader.writeFileSync;
+ reader.writeFileSync=(target,value,options)=>{if(target!==77)write(target,value,options);};
+ const result=observe(reader);
+ assert.equal(result[6].passed,true);
+ assert.deepEqual(result[7],{name:'outside-write',outcome:'completed',errno:null,passed:false});
+ const unavailable=observe(fixture({'/outside/retained':'EIO'}).reader);
+ assert.deepEqual(unavailable.slice(6,8).map(row=>[row.errno,row.passed]),[['EIO',false],['EIO',false]]);
+ assert(projectCanaryObservation(report(unavailable)));
+});
+test('canary controls retain evidence of host sentinel replacement and reject a dangling created entry',()=>{
+ const scratch=process.env.PAPERCLIP_DIAGNOSTIC_TEST_SCRATCH;
+ assert(scratch,'explicit physical scratch is required');
+ const root=mkdtempSync(join(scratch,'host-canary-'));
+ try{
+  const outside=join(root,'outside');mkdirSync(outside,{mode:0o700});
+  const witness=outsideHostWitness(outside);
+  const roots={candidate:root,reference:root,protected:root,scratch:root,outside};
+  const preserved=observeCanaryParent(roots,witness,true);
+  assert(preserved.outsideHostAccessibleBefore&&preserved.outsideHostDirectoryUnchanged&&preserved.outsideHostSentinelUnchanged&&preserved.outsideFileAbsent);
+  const sentinel=join(outside,'retained'),bytes=readFileSync(sentinel);
+  renameSync(sentinel,join(outside,'retained-original'));
+  writeFileSync(sentinel,bytes,{flag:'wx',mode:0o600});
+  symlinkSync('absent-test-file',join(outside,'created'));
+  const changed=observeCanaryParent(roots,witness,true);
+  assert(!changed.outsideHostDirectoryUnchanged&&!changed.outsideHostSentinelUnchanged&&!changed.outsideFileAbsent);
+ }finally{rmSync(root,{recursive:true,force:true});}
 });
 test('canary controls redact unexpected errno and enforce exact role, status and order',()=>{
  const {reader}=fixture({'/reference/canary':'PRIVATE_CODE'});
@@ -76,11 +122,11 @@ test('canary controls survive current parent failure projection with no untruste
 });
 for(const shouldFail of [false,true]){
  test('canary controls execute the generated child and correlate '+(shouldFail?'complete refusal':'all passing operations'),()=>{
-  const {reader}=fixture(shouldFail?{'/reference/canary':'EACCES','/outside/outside':'ALLOW'}:{});
+  const {reader}=fixture(shouldFail?{'/reference/canary':'EACCES','/outside/created':'ALLOW'}:{});
   const label=Buffer.from('bwrap//&unpriv_bwrap (enforce)\n'),challenge='local-observer-fixture';
   const output={status:null,stdout:'',stderr:''};let remaining,networkDenied;
-  const fs={...reader,constants:{O_RDONLY:0},
-   openSync(path){assert.equal(path,'/proc/self/attr/apparmor/current');remaining=label.length;return 42;},
+  const fs={...reader,constants:{...reader.constants,O_RDONLY:0},
+   openSync(path,flags){if(path!=='/proc/self/attr/apparmor/current')return reader.openSync(path,flags);remaining=label.length;return 42;},
    readSync(fd,target,offset){label.copy(target,offset,0,remaining);const read=remaining;remaining=0;return read;},
    closeSync(){},writeSync(stream,text){output[stream===1?'stdout':'stderr']+=text;},
   };
@@ -93,11 +139,11 @@ for(const shouldFail of [false,true]){
   const transport=projectLaunchTransport(output,challenge);
   assert(transport.childEntryObserved&&transport.childTerminalObserved);
   const child=JSON.parse(output.stdout);
-  assert.equal(child.controls.filesystem.length,9);
+  assert.equal(child.controls.filesystem.length,11);
   if(shouldFail){
    assert.equal(output.status,25);
    const result=projectNativeProbeFailure(output,transport).failure;
-   assert.deepEqual(result.controls.filesystem.filter(row=>!row.passed).map(row=>row.name),['reference-read','outside-write']);
+   assert.deepEqual(result.controls.filesystem.filter(row=>!row.passed).map(row=>row.name),['reference-read','outside-create']);
    assert(completeCanaryObservation({status:'native_probe_refused',transport,safeFailure:{...result,parent}},1001));
   }else{
    assert.equal(output.status,0);
@@ -123,7 +169,7 @@ test('canary controls require actual transport, stable enforcing entry and exit,
 test('canary controls diagnostic runs one real child and cannot build or install',()=>{
  assert(new Script(nativeBoundaryProbeProgram()));
  const get=(path)=>readFileSync(new URL(path,import.meta.url),'utf8');
- const active=get('../.github/workflows/native-linux-build.yml');
+ const active=get('./fixtures/native-canary-controls-diagnostic.yml');
  assert(active.includes('timeout-minutes: 12'));
  assert(active.includes('--diagnose-canary-controls'));
  assert(!active.includes('native_install:'));

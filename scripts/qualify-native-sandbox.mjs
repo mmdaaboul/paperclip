@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import {spawnSync} from 'node:child_process';
 import {createHash,randomUUID} from 'node:crypto';
-import {readFileSync,lstatSync,realpathSync,existsSync,writeFileSync,mkdirSync,mkdtempSync,openSync,readSync,closeSync,fstatSync,readdirSync,constants} from 'node:fs';
+import {readFileSync,lstatSync,realpathSync,existsSync,writeFileSync,mkdirSync,mkdtempSync,openSync,readSync,closeSync,fstatSync,readdirSync,accessSync,constants} from 'node:fs';
 import {join,dirname,resolve} from 'node:path';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 import {createRequire} from 'node:module';
@@ -191,10 +191,16 @@ export function parseSandboxProbeResult(r){
  if(!r.ok)return {status:r.exit===1&&!r.signal&&r.namespaceDenied&&!r.stdout.trim()?'namespace_denied':'native_probe_refused',exit:r.exit,signal:r.signal,outputSha256:r.outputSha256,...context,...(r.stdout.trim()?{safeFailure:projectProbeFailure(r.stdout)}:{})};
  try{return {status:'passed',proof:validateProbeReceipt(JSON.parse(r.stdout)),...context};}catch(error){return {status:'native_probe_refused',failureCode:error.sandboxCode??'sandbox_native_probe_receipt_invalid',outputSha256:r.outputSha256,...context};}
 }
-const CANARY_NAMES=['candidate-read','reference-read','candidate-write','reference-write','protected-write','metadata-write','outside-write','protected-read','scratch-write'];
+const CANARY_NAMES=['candidate-read','reference-read','candidate-write','reference-write','protected-write','metadata-write','outside-read','outside-write','outside-create','protected-read','scratch-write'];
 const CANARY_ERRNOS=['EACCES','EPERM','EROFS','ENOENT','ENOTDIR','EISDIR','ENOSPC','EIO','EBADF','ELOOP','OTHER'];
+function canaryOutcomePassed(name,expected,outcome,errno){
+ if(outcome!==expected)return false;
+ if(!name.startsWith('outside-'))return true;
+ const denied=['EACCES','EPERM','ENOENT'];
+ return denied.includes(errno)||(name!=='outside-read'&&errno==='EROFS');
+}
 export function projectCanaryObservation(raw){
- if(raw?.schema!=='paperclip.native-canary-observation.v1'||!Array.isArray(raw.filesystem)||raw.filesystem.length!==CANARY_NAMES.length
+ if(raw?.schema!=='paperclip.native-canary-observation.v2'||!Array.isArray(raw.filesystem)||raw.filesystem.length!==CANARY_NAMES.length
   ||!['denied','connected'].includes(raw.network))return null;
  const filesystem=[];
  for(const [index,row] of raw.filesystem.entries()){
@@ -202,15 +208,15 @@ export function projectCanaryObservation(raw){
   if(row?.name!==CANARY_NAMES[index]||!outcomes.includes(row.outcome)
    ||(row.outcome==='error'?!CANARY_ERRNOS.includes(row.errno):row.errno!==null))return null;
   const expected=index<2?'retained':index===CANARY_NAMES.length-1?'completed':'error';
-  if(row.passed!==(row.outcome===expected))return null;
+  if(row.passed!==canaryOutcomePassed(row.name,expected,row.outcome,row.errno))return null;
   filesystem.push({name:row.name,outcome:row.outcome,errno:row.errno,passed:row.passed});
  }
  return {schema:raw.schema,filesystem,network:raw.network};
 }
-const PRESERVATION_KEYS=['candidateUnchanged','referenceUnchanged','protectedUnchanged','metadataUnchanged','scratchContentPresent','outsideFileAbsent'];
+const PRESERVATION_KEYS=['candidateUnchanged','referenceUnchanged','protectedUnchanged','metadataUnchanged','scratchContentPresent','outsideHostDirectoryUnchanged','outsideHostSentinelUnchanged','outsideFileAbsent'];
 function projectCanaryParent(raw){
- if(typeof raw?.outsideNetworkControl!=='boolean'||!PRESERVATION_KEYS.every(key=>typeof raw[key]==='boolean'))return null;
- return {outsideNetworkControl:raw.outsideNetworkControl,...Object.fromEntries(PRESERVATION_KEYS.map(key=>[key,raw[key]]))};
+ if(typeof raw?.outsideNetworkControl!=='boolean'||raw.outsideHostAccessibleBefore!==true||!PRESERVATION_KEYS.every(key=>typeof raw[key]==='boolean'))return null;
+ return {outsideNetworkControl:raw.outsideNetworkControl,outsideHostAccessibleBefore:true,...Object.fromEntries(PRESERVATION_KEYS.map(key=>[key,raw[key]]))};
 }
 function projectCanaryIdentity(raw){
  if(!Number.isSafeInteger(raw?.uid)||raw.uid<=0||raw.entry!==EXPECTED_KERNEL_LABEL||raw.exit!==raw.entry)return null;
@@ -549,7 +555,11 @@ export async function qualifyNativeSandbox({workspace,root,ambient=process.env,o
     save();
    }
   }
-  receipt.after=collectHostFacts(run);receipt.globalRestrictionChanged=['apparmor','restrictedUserns','maxUserNamespaces','usernsClone','seccomp'].some(k=>receipt.before[k]!==receipt.after[k]);if(receipt.globalRestrictionChanged)fail('sandbox_global_host_policy_changed');receipt.proof=validateProbeReceipt((receipt.postProbe??receipt.initialProbe).proof);if(receipt.after.bwrapSha256!==receipt.proof.bwrapSha256||(receipt.afterAcquisitionDecision==='documented-loopback-profile-prerequisite'&&receipt.after.bwrapSha256!==receipt.afterAcquisition.bwrapSha256))fail('sandbox_bwrap_changed');receipt.status='passed';save();return receipt;
+  receipt.after=collectHostFacts(run);receipt.globalRestrictionChanged=['apparmor','restrictedUserns','maxUserNamespaces','usernsClone','seccomp'].some(k=>receipt.before[k]!==receipt.after[k]);if(receipt.globalRestrictionChanged)fail('sandbox_global_host_policy_changed');
+  const decisiveProbe=receipt.postProbe??receipt.initialProbe;
+  receipt.proof=validateProbeReceipt(decisiveProbe.proof);
+  if(!completeCanaryObservation(decisiveProbe,receipt.before.uid))fail('sandbox_outside_host_proof_unbound');
+  if(receipt.after.bwrapSha256!==receipt.proof.bwrapSha256||(receipt.afterAcquisitionDecision==='documented-loopback-profile-prerequisite'&&receipt.after.bwrapSha256!==receipt.afterAcquisition.bwrapSha256))fail('sandbox_bwrap_changed');receipt.status='passed';save();return receipt;
  }catch(error){receipt.status='failed';receipt.failureCode=error.sandboxCode??'sandbox_prerequisite_refused';if(error.sandboxDiagnostic)receipt.trustRefusal=error.sandboxDiagnostic;preserveSandboxFailure(error,save,summary=>console.error(JSON.stringify(summary)));}
 }
 export function observeFilesystemCanaries(fs,[candidate,reference,protectedRoot,scratch,outside],errnos){
@@ -557,18 +567,26 @@ export function observeFilesystemCanaries(fs,[candidate,reference,protectedRoot,
  const check=(name,expected,action)=>{
   let outcome,errno=null;
   try{outcome=action();}catch(error){outcome='error';errno=errnos.includes(error?.code)?error.code:'OTHER';}
-  results.push({name,outcome,errno,passed:outcome===expected});
+  results.push({name,outcome,errno,passed:canaryOutcomePassed(name,expected,outcome,errno)});
  };
  const retained=(path,value)=>fs.readFileSync(path,'utf8')===value?'retained':'different';
- const write=(path,value)=>{fs.writeFileSync(path,value);return 'completed';};
+ const write=(path,value,options)=>{fs.writeFileSync(path,value,options);return 'completed';};
+ const read=(path)=>{fs.readFileSync(path);return 'completed';};
+ const writeExisting=(path)=>{
+  const fd=fs.openSync(path,fs.constants.O_WRONLY|fs.constants.O_NOFOLLOW);
+  try{fs.writeFileSync(fd,'forbidden');}finally{fs.closeSync(fd);}
+  return 'completed';
+ };
  check('candidate-read','retained',()=>retained(candidate+'/canary','retained-candidate'));
  check('reference-read','retained',()=>retained(reference+'/canary','retained-reference'));
  check('candidate-write','error',()=>write(candidate+'/canary','forbidden'));
  check('reference-write','error',()=>write(reference+'/canary','forbidden'));
  check('protected-write','error',()=>write(protectedRoot+'/canary','forbidden'));
  check('metadata-write','error',()=>write(candidate+'/.git/canary','forbidden'));
- check('outside-write','error',()=>write(outside+'/outside','forbidden'));
- check('protected-read','error',()=>{fs.readFileSync(protectedRoot+'/canary');return 'completed';});
+ check('outside-read','error',()=>read(outside+'/retained'));
+ check('outside-write','error',()=>writeExisting(outside+'/retained'));
+ check('outside-create','error',()=>write(outside+'/created','forbidden',{flag:'wx'}));
+ check('protected-read','error',()=>read(protectedRoot+'/canary'));
  check('scratch-write','completed',()=>write(scratch+'/allowed','allowed'));
  return results;
 }
@@ -578,7 +596,7 @@ export function nativeBoundaryProbeProgram(){
  const KERNEL_LABEL_PATH=${JSON.stringify(KERNEL_LABEL_PATH)},EXPECTED_KERNEL_LABEL=${JSON.stringify(EXPECTED_KERNEL_LABEL)};
  const fail=code=>{throw Object.assign(Error(code),{sandboxCode:code});};
  const validateExecutionLabel=${validateExecutionLabel.toString()},readExecutionLabel=${readExecutionLabel.toString()};
- const observeFilesystemCanaries=${observeFilesystemCanaries.toString()};
+ const canaryOutcomePassed=${canaryOutcomePassed.toString()},observeFilesystemCanaries=${observeFilesystemCanaries.toString()};
  let entry=null,lastLabel=null,controls=null,canaryIdentity=null;
  const reportError=e=>{
   fs.writeSync(1,JSON.stringify({schema:'paperclip.native-sandbox-probe-failure.v1',challenge,code:e.sandboxCode??'sandbox_child_boundary_refused',
@@ -593,7 +611,7 @@ export function nativeBoundaryProbeProgram(){
   let finished=false;
   const finish=network=>{
    if(finished)return;finished=true;
-   controls={schema:'paperclip.native-canary-observation.v1',filesystem,network};
+   controls={schema:'paperclip.native-canary-observation.v2',filesystem,network};
    try{
     const exit=readExecutionLabel(fs);lastLabel=exit;validateExecutionLabel(exit);
     if(entry!==exit)fail('sandbox_child_label_changed');
@@ -608,16 +626,59 @@ export function nativeBoundaryProbeProgram(){
   socket.setTimeout(500,()=>{socket.destroy();finish('denied');});
  }catch(e){reportError(e);}`;
 }
-function observeCanaryParent(p,base,outsideNetworkControl){
+const OUTSIDE_SENTINEL='retained-outside-host-sentinel';
+function noFileEntry(path){
+ try{lstatSync(path);return false;}catch(error){return error.code==='ENOENT';}
+}
+function sameCanaryObject(before,after){
+ return ['dev','ino','uid','gid','mode','nlink','size','mtimeMs','ctimeMs'].every(key=>before[key]===after[key]);
+}
+function unchangedOutsideSentinel(path,before){
+ const expected=Buffer.from(OUTSIDE_SENTINEL);
+ let fd;
+ try{
+  if(!sameCanaryObject(before,lstatSync(path)))return false;
+  fd=openSync(path,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
+  if(!sameCanaryObject(before,fstatSync(fd)))return false;
+  const bytes=Buffer.alloc(expected.length+1);let used=0;
+  while(used<bytes.length){
+   const count=readSync(fd,bytes,used,bytes.length-used,null);
+   if(count===0)break;
+   used+=count;
+  }
+  return used===expected.length&&expected.equals(bytes.subarray(0,used))
+   &&sameCanaryObject(before,fstatSync(fd))&&sameCanaryObject(before,lstatSync(path));
+ }catch{return false;}
+ finally{if(fd!==undefined)closeSync(fd);}
+}
+export function outsideHostWitness(directory){
+ const file=join(directory,'retained');
+ writeFileSync(file,OUTSIDE_SENTINEL,{flag:'wx',mode:0o600});
+ const dir=lstatSync(directory),sentinel=lstatSync(file);
+ if(realpathSync(directory)!==directory||!dir.isDirectory()||dir.uid!==process.getuid()||(dir.mode&0o7777)!==0o700
+  ||realpathSync(file)!==file||!sentinel.isFile()||sentinel.nlink!==1||sentinel.uid!==dir.uid||(sentinel.mode&0o7777)!==0o600
+  ||!unchangedOutsideSentinel(file,sentinel)||!noFileEntry(join(directory,'created')))fail('sandbox_outside_host_fixture_invalid');
+ accessSync(directory,constants.R_OK|constants.W_OK|constants.X_OK);
+ accessSync(file,constants.R_OK|constants.W_OK);
+ return {dir,sentinel};
+}
+export function observeCanaryParent(p,outsideWitness,outsideNetworkControl){
  const matches=(path,expected)=>{try{return readFileSync(path,'utf8')===expected;}catch{return false;}};
- return {outsideNetworkControl,candidateUnchanged:matches(p.candidate+'/canary','retained-candidate'),
+ const sameObject=(path,before)=>{
+  try{return sameCanaryObject(before,lstatSync(path));}
+  catch{return false;}
+ };
+ return {outsideNetworkControl,outsideHostAccessibleBefore:true,candidateUnchanged:matches(p.candidate+'/canary','retained-candidate'),
   referenceUnchanged:matches(p.reference+'/canary','retained-reference'),protectedUnchanged:matches(p.protected+'/canary','retained-protected'),
   metadataUnchanged:matches(p.candidate+'/.git/canary','retained-metadata'),scratchContentPresent:matches(p.scratch+'/allowed','allowed'),
-  outsideFileAbsent:!existsSync(join(base,'outside'))};
+  outsideHostDirectoryUnchanged:sameObject(p.outside,outsideWitness.dir),
+  outsideHostSentinelUnchanged:unchangedOutsideSentinel(join(p.outside,'retained'),outsideWitness.sentinel),
+  outsideFileAbsent:noFileEntry(join(p.outside,'created'))};
 }
 async function nativeProbe(root){
  if(process.platform!=='linux'||process.arch!=='x64'||process.getuid()===0)fail('sandbox_probe_platform');
- const workspace=resolve(dirname(SELF),'..'),base=mkdtempSync(join(root,'sandbox-probe-'));const p=Object.fromEntries(['candidate','scratch','runtime','home','reference','protected'].map(n=>{const path=join(base,n);mkdirSync(path,{mode:0o700});return[n,path];}));
+ const workspace=resolve(dirname(SELF),'..'),base=mkdtempSync(join(root,'sandbox-probe-'));const p=Object.fromEntries(['candidate','scratch','runtime','home','reference','protected','outside'].map(n=>{const path=join(base,n);mkdirSync(path,{mode:0o700});return[n,path];}));
+ const outsideWitness=outsideHostWitness(p.outside);
  for(const n of ['candidate','reference','protected'])writeFileSync(join(p[n],'canary'),'retained-'+n,{mode:0o600});mkdirSync(join(p.candidate,'.git'),{mode:0o700});writeFileSync(join(p.candidate,'.git','canary'),'retained-metadata',{mode:0o600});
  const {resolvePinnedCodexCommand}=await import(pathToFileURL(join(workspace,'packages/paperclip-runner/src/drivers/codex/codex-command.ts'))),{createIsolatedCodexAppServerArgs,codexExecutableReadOnlyRoots,CODEX_SKILLLESS_PERMISSION_PROFILE}=await import(pathToFileURL(join(workspace,'packages/paperclip-runner/src/drivers/codex/codex-security-config.ts')));
  const codex=resolvePinnedCodexCommand(pathToFileURL(join(workspace,'packages/paperclip-runner/src/drivers/codex/reviewer-candidate-inspection.ts')),{PATH:''},p.home),manifest=join(dirname(codex),'../package.json'),pkg=JSON.parse(readFileSync(manifest));if(pkg.name!=='@openai/codex'||pkg.version!=='0.160.0'||hash(readFileSync(codex))!=='61b0194f3bb6534439c8d26a3ed57d0805f84b884588b761795323eeb92fcf70')fail('sandbox_codex_pin_changed');
@@ -628,12 +689,12 @@ async function nativeProbe(root){
  try{
   await new Promise((yes,no)=>{const socket=net.connect(port,'127.0.0.1',()=>{outsideControl=true;socket.end();yes();});socket.once('error',no);socket.setTimeout(1000,()=>socket.destroy(new Error('control_timeout')));});
   const program=nativeBoundaryProbeProgram();
-  const r=spawnSync(codex.endsWith('.js')?process.execPath:codex,[...(codex.endsWith('.js')?[codex]:[]),'sandbox',...config,'-P',CODEX_SKILLLESS_PERMISSION_PROFILE,'-C',p.candidate,'--',process.execPath,'-e',program,p.candidate,p.reference,p.protected,p.scratch,base,String(port),challenge],{cwd:p.candidate,env,encoding:'utf8',timeout:10000,killSignal:'SIGKILL',maxBuffer:MAX/2});
+  const r=spawnSync(codex.endsWith('.js')?process.execPath:codex,[...(codex.endsWith('.js')?[codex]:[]),'sandbox',...config,'-P',CODEX_SKILLLESS_PERMISSION_PROFILE,'-C',p.candidate,'--',process.execPath,'-e',program,p.candidate,p.reference,p.protected,p.scratch,p.outside,String(port),challenge],{cwd:p.candidate,env,encoding:'utf8',timeout:10000,killSignal:'SIGKILL',maxBuffer:MAX/2});
   const transport=projectLaunchTransport(r,challenge);
   writeFileSync(2,'PAPERCLIP_NATIVE_LAUNCH_TRANSPORT:'+JSON.stringify(transport)+'\n');
   if(r.error||r.signal||r.status!==0){
    const {typedNamespaceRefusal,failure}=projectNativeProbeFailure(r,transport);
-   if(failure)console.log(JSON.stringify({schema:'paperclip.native-sandbox-probe-failure.v1',...failure,...(transport.childTerminalObserved?{parent:observeCanaryParent(p,base,outsideControl)}:{})}));
+   if(failure)console.log(JSON.stringify({schema:'paperclip.native-sandbox-probe-failure.v1',...failure,...(transport.childTerminalObserved?{parent:observeCanaryParent(p,outsideWitness,outsideControl)}:{})}));
    process.stderr.write(typedNamespaceRefusal?'bwrap: No permissions to create new namespace\n':'native sandbox boundary probe refused\n');
    process.exitCode=1;
    return;
@@ -641,7 +702,7 @@ async function nativeProbe(root){
   const childProof=inspectChildLabelProof(r.stdout,challenge,process.getuid());if(!childProof.ok){console.log(JSON.stringify(childProof.failure));process.stderr.write('native sandbox label proof refused\n');process.exitCode=1;return;}const executionLabel=childProof.proof;
   const canaryObservation=projectCanaryObservation(JSON.parse(r.stdout).controls);
   if(!canaryObservation||canaryObservation.network!=='denied'||canaryObservation.filesystem.some(x=>!x.passed))fail('sandbox_child_boundary_refused');
-  const parent=observeCanaryParent(p,base,outsideControl);
+  const parent=observeCanaryParent(p,outsideWitness,outsideControl);
   if(!PRESERVATION_KEYS.every(key=>parent[key]===true)){
    console.log(JSON.stringify({schema:'paperclip.native-sandbox-probe-failure.v1',code:'sandbox_probe_mutated_canary',observedLabel:executionLabel.exit,canaryIdentity:executionLabel,controls:canaryObservation,parent}));
    process.exitCode=1;return;
