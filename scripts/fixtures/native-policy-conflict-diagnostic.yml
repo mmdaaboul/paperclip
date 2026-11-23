@@ -1,0 +1,36 @@
+name: Native policy conflict diagnostic
+on:
+  push:
+    branches: [qualification/native-linux-build]
+permissions:
+  contents: read
+jobs:
+  selected_native_source:
+    if: github.repository == 'mmdaaboul/paperclip' && github.ref == 'refs/heads/qualification/native-linux-build'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      SOURCE_SHA: ${{ github.sha }}
+      WORKFLOW_SHA: ${{ github.workflow_sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version: 24.21.0
+          package-manager-cache: false
+      - name: Focused policy diagnostic contracts
+        run: node --test scripts/qualify-native-policy-diagnostic.test.mjs
+      - name: Observe installed policy conflict without helper profile mutations
+        run: node scripts/qualify-native-sandbox.mjs --diagnose-policy-conflict
+      - name: Upload only structured nonsecret diagnostic evidence
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+        with:
+          name: native-policy-conflict-diagnostic
+          path: ${{ runner.temp }}/native-policy-conflict-diagnostic.json
+          include-hidden-files: false
+          if-no-files-found: error
+          retention-days: 14

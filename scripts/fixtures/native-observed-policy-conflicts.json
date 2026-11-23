@@ -1,0 +1,76 @@
+{
+  "schema": "paperclip.observed-policy-conflict-fixture.v1",
+  "diagnosticRun": 45224487858,
+  "receiptSha256": "7ce9434425fdde33c8a0d8118190ee428e3dc6be6fe53c3364f52ab9342d69fc",
+  "actualProfiles": 145,
+  "actualConflicts": 119,
+  "retainedExamples": 16,
+  "truncated": true,
+  "rows": [
+    {
+      "name": "traceroute",
+      "attach": "<unknown>"
+    },
+    {
+      "name": "smbldap-useradd",
+      "attach": "<unknown>"
+    },
+    {
+      "name": "smbd",
+      "attach": "<unknown>"
+    },
+    {
+      "name": "nscd",
+      "attach": "<unknown>"
+    },
+    {
+      "name": "nmbd",
+      "attach": "<unknown>"
+    },
+    {
+      "name": "mdnsd",
+      "attach": "<unknown>"
+    },
+    {
+      "name": "identd",
+      "attach": "<unknown>"
+    },
+    {
+      "name": "dnsmasq",
+      "attach": "<unknown>"
+    },
+    {
+      "name": "avahi-daemon",
+      "attach": "<unknown>"
+    },
+    {
+      "name": "syslogd",
+      "attach": "<unknown>"
+    },
+    {
+      "name": "syslog-ng",
+      "attach": "<unknown>"
+    },
+    {
+      "name": "klogd",
+      "attach": "<unknown>"
+    },
+    {
+      "name": "samba-rpcd-spoolss",
+      "attach": "<unknown>"
+    },
+    {
+      "name": "samba-rpcd-classic",
+      "attach": "<unknown>"
+    },
+    {
+      "name": "samba-rpcd",
+      "attach": "<unknown>"
+    },
+    {
+      "name": "samba-dcerpcd",
+      "attach": "<unknown>"
+    }
+  ],
+  "limitation": "Only16 retained examples, not all119. Logical fixture is not runtime or label proof."
+}

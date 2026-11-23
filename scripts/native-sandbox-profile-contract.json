@@ -139,7 +139,7 @@
     "/etc/apparmor.d",
     "-I",
     "/etc/apparmor.d",
-    "-r",
+    "-a",
     "/etc/apparmor.d/bwrap-userns-restrict"
   ],
   "parserSourceReferences": [

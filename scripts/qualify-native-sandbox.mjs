@@ -2,7 +2,7 @@
 /** Disposable Ubuntu source-job prerequisite; never a production permission grant. */
 import assert from 'node:assert/strict';
 import {spawnSync} from 'node:child_process';
-import {createHash} from 'node:crypto';
+import {createHash,randomUUID} from 'node:crypto';
 import {readFileSync,lstatSync,realpathSync,existsSync,writeFileSync,mkdirSync,mkdtempSync,openSync,readSync,closeSync,fstatSync,readdirSync,constants} from 'node:fs';
 import {join,dirname,resolve} from 'node:path';
 import {fileURLToPath,pathToFileURL} from 'node:url';
@@ -77,9 +77,52 @@ export function enforcePolicyContext(context,persist,emergency){
  try{refusePolicyConflict(context);}catch(error){preserveSandboxFailure(error,persist,emergency);}
  persist();return context;
 }
+export function addOnlyPolicyContext(loaded,destination){
+ const diagnostic=policyDecisionContext(loaded,destination),rows=new Map();
+ for(const line of loaded.tree.split('\n').filter(Boolean)){const m=line.match(/^\/sys\/kernel\/security\/apparmor\/policy\/profiles\/(.+)\/(name|attach):(.*)$/);const row=rows.get(m[1])??{};row[m[2]]=m[3];rows.set(m[1],row);}
+ const named=diagnostic.profiles.some(p=>p.targetNameEntries.length>0)||[...rows.values()].some(r=>PROFILE_CONTRACT.profileNames.includes(r.name));
+ const unresolved=[...rows.values()].filter(r=>r.attach==='<unknown>'),known=[...rows.values()].filter(r=>r.attach!=='<unknown>'&&attachmentMayMatch(r.attach));
+ const refusalBranch=named?'target-name-already-loaded':known.length?'known-attachment-overlap':destination.state==='trust-refused'?'destination-trust':!['absent','same-package-bytes'].includes(destination.state)?'destination-bytes':null;
+ return {...diagnostic,authority:'DISPOSABLE_ADD_ONLY_EXPERIMENT_REQUIRES_ACTUAL_LABEL_AND_ALL12_CONTROLS',refusalBranch,refused:refusalBranch!==null,unresolvedAttachmentCount:unresolved.length,unknownAttachmentsProvedDisjoint:false,knownOverlapCount:known.length,knownOverlaps:known.slice(0,16).map(r=>({name:policyText(r.name),attachment:policyText(r.attach)})),requiresActualExecutionLabel:true};
+}
+export function enforceAddOnlyContext(context,persist,emergency){
+ if(context.refused){const code=context.refusalBranch==='destination-trust'?context.destination.failureCode:'sandbox_profile_policy_conflict',error=Object.assign(new Error(code),{sandboxCode:code,sandboxDiagnostic:context});preserveSandboxFailure(error,persist,emergency);}
+ persist();return context;
+}
+export function validateAddOnlyParserArgs(args){
+ if(JSON.stringify(args)!==JSON.stringify(['--config-file','/etc/apparmor/parser.conf','-K','-b','/etc/apparmor.d','-I','/etc/apparmor.d','-a','/etc/apparmor.d/bwrap-userns-restrict']))fail('sandbox_add_only_parser_required');return args;
+}
+export const KERNEL_LABEL_PATH='/proc/self/attr/apparmor/current';
+export const EXPECTED_KERNEL_LABEL='bwrap//&unpriv_bwrap (enforce)';
+export function validateExecutionLabel(raw){
+ if(typeof raw!=='string'||Buffer.byteLength(raw)>1024||![EXPECTED_KERNEL_LABEL,EXPECTED_KERNEL_LABEL+'\n'].includes(raw))fail('sandbox_execution_label_refused');return EXPECTED_KERNEL_LABEL;
+}
+export function readExecutionLabel(io){
+ const failure=(operation,error)=>Object.assign(Error('sandbox_execution_label_io_refused'),{sandboxCode:'sandbox_execution_label_io_refused',labelIo:{path:KERNEL_LABEL_PATH,operation,errno:['EACCES','EPERM','ENOENT','EINVAL','EIO','EBADF','ELOOP','ENOTDIR'].includes(error?.code)?error.code:'OTHER'}});
+ let fd;try{fd=io.openSync(KERNEL_LABEL_PATH,io.constants.O_RDONLY);}catch(error){throw failure('open',error);}const buffer=Buffer.alloc(1025);let used=0,primary=null;
+ try{for(;;){const n=io.readSync(fd,buffer,used,buffer.length-used,null);used+=n;if(used>1024)fail('sandbox_execution_label_bound');if(n===0)break;}}catch(error){primary=error.sandboxCode?error:failure('read',error);}
+ finally{try{io.closeSync(fd);}catch(error){if(!primary)primary=failure('close',error);}}
+ if(primary)throw primary;return buffer.subarray(0,used).toString('utf8');
+}
+export function validateChildLabelProof(raw,challenge,uid){
+ if(typeof raw!=='string'||Buffer.byteLength(raw)>4096)fail('sandbox_child_label_protocol_refused');let r;try{r=JSON.parse(raw);}catch{fail('sandbox_child_label_protocol_refused');}
+ if(r?.schema!=='paperclip.native-sandbox-child-label.v1'||r.challenge!==challenge||r.uid!==uid||!Number.isSafeInteger(uid)||uid<=0||r.path!==KERNEL_LABEL_PATH)fail('sandbox_child_label_identity_refused');
+ const entry=validateExecutionLabel(r.entry),exit=validateExecutionLabel(r.exit);if(r.entry!==r.exit)fail('sandbox_child_label_changed');
+ return {schema:'paperclip.native-sandbox-execution-label.v1',uid,path:KERNEL_LABEL_PATH,entry,exit,mode:'enforce',profiles:['bwrap','unpriv_bwrap'],identityBookends:true,challengeSha256:hash(challenge)};
+}
+export function inspectChildLabelProof(raw,challenge,uid){
+ try{return {ok:true,proof:validateChildLabelProof(raw,challenge,uid)};}catch(error){return {ok:false,failure:{schema:'paperclip.native-sandbox-probe-failure.v1',code:error.sandboxCode??'sandbox_child_label_protocol_refused'}};}
+}
+export function parseSandboxProbeResult(r){
+ if(!r.ok)return {status:r.exit===1&&!r.signal&&r.namespaceDenied&&!r.stdout.trim()?'namespace_denied':'native_probe_refused',exit:r.exit,signal:r.signal,outputSha256:r.outputSha256,...(r.stdout.trim()?{safeFailure:projectProbeFailure(r.stdout)}:{})};
+ try{return {status:'passed',proof:validateProbeReceipt(JSON.parse(r.stdout))};}catch(error){return {status:'native_probe_refused',failureCode:error.sandboxCode??'sandbox_native_probe_receipt_invalid',outputSha256:r.outputSha256};}
+}
+function projectProbeFailure(raw){
+ try{const r=JSON.parse(raw);if(r.schema==='paperclip.native-sandbox-probe-failure.v1')return {schema:r.schema,code:['sandbox_execution_label_refused','sandbox_execution_label_bound','sandbox_execution_label_io_refused','sandbox_child_label_identity_refused','sandbox_child_label_protocol_refused','sandbox_child_label_changed','sandbox_child_boundary_refused'].includes(r.code)?r.code:'sandbox_child_boundary_refused',...(typeof r.observedLabel==='string'?{observedLabel:policyText(r.observedLabel)}:typeof r.observedLabel?.text==='string'?{observedLabel:policyText(r.observedLabel.text)}:/^[a-f0-9]{64}$/.test(r.observedLabel?.sha256??'')?{observedLabel:{sha256:r.observedLabel.sha256}}:{}),...(r.labelIo?.path===KERNEL_LABEL_PATH&&['open','read','close'].includes(r.labelIo.operation)&&['EACCES','EPERM','ENOENT','EINVAL','EIO','EBADF','ELOOP','ENOTDIR','OTHER'].includes(r.labelIo.errno)?{labelIo:{path:KERNEL_LABEL_PATH,operation:r.labelIo.operation,errno:r.labelIo.errno}}:{})};}catch{}return {code:'sandbox_child_boundary_refused'};
+}
 export function validateProbeReceipt(r){
  if(r?.schema!=='paperclip.native-sandbox-probe.v1'||!Number.isSafeInteger(r.uid)||r.uid<=0||r.codexVersion!=='0.160.0'||r.bwrapPath!=='/usr/bin/bwrap'||!['wrapperSha256','nativeElfSha256','bwrapSha256'].every(k=>/^[a-f0-9]{64}$/.test(r[k]??''))||!['nativeSandbox','allowedRead','scratchWrite','candidateDenied','referenceDenied','protectedDenied','protectedReadDenied','metadataDenied','outsideDenied','networkDenied','outsideNetworkControl','originalBytesPreserved'].every(k=>r[k]===true))fail('sandbox_native_probe_incomplete');
- return r;
+ const l=r.executionLabel;if(l?.schema!=='paperclip.native-sandbox-execution-label.v1'||l.uid!==r.uid||l.path!==KERNEL_LABEL_PATH||l.entry!==EXPECTED_KERNEL_LABEL||l.exit!==EXPECTED_KERNEL_LABEL||l.mode!=='enforce'||JSON.stringify(l.profiles)!==JSON.stringify(['bwrap','unpriv_bwrap'])||l.identityBookends!==true||!/^[a-f0-9]{64}$/.test(l.challengeSha256??''))fail('sandbox_execution_label_unproven');return r;
 }
 function safeEnv(home){return {PATH:'/usr/bin:/bin:/usr/sbin',HOME:home,LANG:'C',LC_ALL:'C',DEBIAN_FRONTEND:'noninteractive'};}
 function runner(deadline,home){return (binary,args,ms=15000,input)=>{
@@ -92,7 +135,7 @@ function runner(deadline,home){return (binary,args,ms=15000,input)=>{
  const command=privileged?binary:'/usr/bin/timeout',argv=privileged?['-n','/usr/bin/timeout','--signal=KILL',seconds,...args.slice(1)]:['--signal=KILL',seconds,binary,...args];
  const r=spawnSync(command,argv,{...(input===undefined?{}:{input}),env:safeEnv(home),encoding:'utf8',timeout:effective,killSignal:'SIGKILL',maxBuffer:MAX/2,shell:false});
  const out=String(r.stdout??'')+'\n'+String(r.stderr??'');if(Buffer.byteLength(out)>MAX)fail('sandbox_command_output_bound');
- return {ok:!r.error&&!r.signal&&r.status===0,stdout:String(r.stdout??''),namespaceDenied:namespaceRefusal(out),exit:Number.isInteger(r.status)?r.status:null,signal:r.signal??null,outputSha256:hash(out)};
+ return {ok:!r.error&&!r.signal&&r.status===0,stdout:String(r.stdout??''),namespaceDenied:namespaceRefusal(out),exit:Number.isInteger(r.status)?r.status:null,signal:r.signal??null,outputSha256:hash(out),policyAlreadyExists:/Profile already exists/.test(out)};
  };}
 const SYSTEM_FILES=Object.freeze({distroBwrap:'/usr/bin/bwrap',systemTimeout:'/usr/bin/timeout',packagedProfile:'/usr/share/apparmor/extra-profiles/bwrap-userns-restrict',destinationProfile:'/etc/apparmor.d/bwrap-userns-restrict'});
 const SYSTEM_ANCESTORS=new Set(['/',...Object.values(SYSTEM_FILES).flatMap(file=>{const a=[];for(let p=dirname(file);;p=dirname(p)){a.push(p);if(p==='/')break;}return a;})]);
@@ -203,7 +246,7 @@ export function collectHostFacts(run){
  const bwrapPresent=existsSync('/usr/bin/bwrap');let bwrapTrusted=false,bwrapPackageOwned=false,bwrapSha256=null,bwrapVersion=null,bwrapPackageVersion=null,bwrapMode=null;
  if(bwrapPresent){const raw=trustedFile('/usr/bin/bwrap',16*1024**2);bwrapTrusted=true;bwrapSha256=hash(raw);const p=run('/usr/bin/dpkg-query',['-S','/usr/bin/bwrap']),v=run('/usr/bin/dpkg-query',['-W','-f=${Version}','bubblewrap']),integrity=run('/usr/bin/dpkg',['--verify','bubblewrap']),version=run('/usr/bin/bwrap',['--version']);bwrapPackageOwned=p.ok&&p.stdout.trim()==='bubblewrap: /usr/bin/bwrap'&&v.ok&&integrity.ok&&!integrity.stdout.trim()&&version.ok;bwrapVersion=version.stdout.trim().match(/^bubblewrap ([0-9][0-9A-Za-z.+~-]*)$/)?.[1]??null;bwrapPackageVersion=v.stdout.trim();bwrapMode=lstatSync('/usr/bin/bwrap').mode&0o7777;if(!bwrapVersion||!/^\d[0-9A-Za-z.+:~\-]*$/.test(bwrapPackageVersion))fail('sandbox_bwrap_version_invalid');}
  const status=readFileSync('/proc/self/status','utf8');
- return validateSandboxHost({os:value('ID'),release:value('VERSION_ID'),uid:process.getuid(),bwrapPresent,bwrapTrusted,bwrapPackageOwned,bwrapSha256,bwrapVersion,bwrapPackageVersion,bwrapMode,apparmor:optional('/sys/module/apparmor/parameters/enabled')==='Y',restrictedUserns:number('/proc/sys/kernel/apparmor_restrict_unprivileged_userns'),maxUserNamespaces:number('/proc/sys/user/max_user_namespaces'),usernsClone:number('/proc/sys/kernel/unprivileged_userns_clone'),seccomp:Number(status.match(/^Seccomp:\s+(\d+)$/m)?.[1]??-1)});
+ return validateSandboxHost({os:value('ID'),release:value('VERSION_ID'),kernelRelease:/^[A-Za-z0-9_.+\-]{1,128}$/.test(kernelRelease())?kernelRelease():null,uid:process.getuid(),bwrapPresent,bwrapTrusted,bwrapPackageOwned,bwrapSha256,bwrapVersion,bwrapPackageVersion,bwrapMode,apparmor:optional('/sys/module/apparmor/parameters/enabled')==='Y',restrictedUserns:number('/proc/sys/kernel/apparmor_restrict_unprivileged_userns'),maxUserNamespaces:number('/proc/sys/user/max_user_namespaces'),usernsClone:number('/proc/sys/kernel/unprivileged_userns_clone'),seccomp:Number(status.match(/^Seccomp:\s+(\d+)$/m)?.[1]??-1)});
 }
 function hosted(e){if(process.platform!=='linux'||process.arch!=='x64'||e.GITHUB_REPOSITORY!=='mmdaaboul/paperclip'||e.GITHUB_JOB!=='selected_native_source'||e.GITHUB_ACTIONS!=='true'||e.RUNNER_ENVIRONMENT!=='github-hosted')fail('sandbox_disposable_job_only');}
 export async function qualifyNativeSandbox({workspace,root,ambient=process.env,onReceipt=()=>{}}){
@@ -212,19 +255,20 @@ export async function qualifyNativeSandbox({workspace,root,ambient=process.env,o
  const save=()=>{assert(Buffer.byteLength(JSON.stringify(receipt))<=MAX);onReceipt(receipt);};
  try{
   receipt.before=collectHostFacts(run);save();
-  const probe=()=>{const r=run(process.execPath,['--import',join(workspace,'packages/paperclip-runner/node_modules/tsx/dist/loader.mjs'),SELF,'--probe',root],SANDBOX_LIMITS.probeMs);if(!r.ok)return {status:r.namespaceDenied?'namespace_denied':'native_probe_refused',exit:r.exit,signal:r.signal,outputSha256:r.outputSha256};try{return {status:'passed',proof:validateProbeReceipt(JSON.parse(r.stdout))};}catch{fail('sandbox_native_probe_receipt_invalid');}};
+  const probe=()=>parseSandboxProbeResult(run(process.execPath,['--import',join(workspace,'packages/paperclip-runner/node_modules/tsx/dist/loader.mjs'),SELF,'--probe',root],SANDBOX_LIMITS.probeMs));
   receipt.initialProbe=receipt.before.bwrapPresent?await probe():{status:'not-run-missing-distro-bwrap'};save();
   const decision=sandboxRepairDecision(receipt.before,receipt.initialProbe.status);receipt.decision=decision;save();
   if(decision!=='none'){
    const aptDeadline=Math.min(deadline,Date.now()+SANDBOX_LIMITS.aptMs);
    for(const args of [['update','-qq'],['install','-y','-qq','--no-install-recommends','bubblewrap','apparmor-profiles','apparmor-utils']]){const r=run('/usr/bin/sudo',['-n','/usr/bin/apt-get',...args],Math.max(1,aptDeadline-Date.now()));if(!r.ok)fail('sandbox_distro_acquisition_failed');receipt.operations.push(args[0]==='update'?'signed-distro-index':'named-distro-prerequisites');save();}
    const after=collectHostFacts(run);if(!after.bwrapPresent)fail('sandbox_distro_bwrap_missing');receipt.afterAcquisition=after;save();
-   if(after.apparmor&&after.restrictedUserns===1){
-    sandboxRepairDecision(after,'namespace_denied');
+   receipt.afterAcquisitionProbe=await probe();save();
+   const afterDecision=sandboxRepairDecision(after,receipt.afterAcquisitionProbe.status);receipt.afterAcquisitionDecision=afterDecision;save();
+   if(afterDecision!=='none'){
     const profileDeadline=Math.min(deadline,Date.now()+SANDBOX_LIMITS.profileMs),profileRun=(binary,args)=>run(binary,args,Math.max(1,profileDeadline-Date.now()));
     const packaged='/usr/share/apparmor/extra-profiles/bwrap-userns-restrict',destination='/etc/apparmor.d/bwrap-userns-restrict';
     const bytes=readAuthenticatedProfile(packaged),closure=verifyProfileIncludeClosure(bytes);
-    const loaded=readLoadedPolicy(profileRun);receipt.policyInspection=policyDecisionContext(loaded,destinationPolicyState(bytes));enforcePolicyContext(receipt.policyInspection,save,summary=>console.error(JSON.stringify(summary)));
+    const loaded=readLoadedPolicy(profileRun);receipt.policyInspection=addOnlyPolicyContext(loaded,destinationPolicyState(bytes));enforceAddOnlyContext(receipt.policyInspection,save,summary=>console.error(JSON.stringify(summary)));
     const dest=receipt.policyInspection.destination.state;
     const action=profileLoadDecision({packagedVerified:true,destination:dest,loaded:'absent',localOverride:false});
     receipt.profile={package:'apparmor-profiles',sha256:hash(bytes),destination:dest,loadedBefore:false,provenance:profileProvenance(),includeClosure:closure};save();
@@ -233,13 +277,17 @@ export async function qualifyNativeSandbox({workspace,root,ambient=process.env,o
     if(!readAuthenticatedProfile(packaged).equals(bytes)||!trustedFile(destination).equals(bytes)||JSON.stringify(verifyProfileIncludeClosure(bytes))!==JSON.stringify(closure))fail('sandbox_profile_changed');
     verifyRootStage(stage,(binary,args,input)=>run(binary,args,Math.max(1,profileDeadline-Date.now()),input));
     const again=readLoadedPolicy(profileRun);if(again.names!==loaded.names||again.tree!==loaded.tree)fail('sandbox_loaded_policy_changed');
-    const load=profileRun('/usr/bin/sudo',['-n','/usr/sbin/apparmor_parser',...PROFILE_CONTRACT.parserArgs]);if(!load.ok)fail('sandbox_profile_load_failed');receipt.operations.push('packaged-bwrap-profile-loaded');
-    const finalLoaded=readLoadedPolicy(profileRun);validateLoadedProfileDelta(loaded,finalLoaded);receipt.profile.loadedAfter=true;receipt.profile.loadedNames=[...PROFILE_CONTRACT.profileNames];receipt.profile.cacheDisabled=true;save();
+    const load=profileRun('/usr/bin/sudo',['-n','/usr/sbin/apparmor_parser',...validateAddOnlyParserArgs(PROFILE_CONTRACT.parserArgs)]);receipt.profile.addOnlyLoad={ok:load.ok,exit:load.exit,signal:load.signal,outputSha256:load.outputSha256,policyAlreadyExists:load.policyAlreadyExists,mode:'add-only-no-fallback'};
+    if(!load.ok){const error=Object.assign(Error('sandbox_profile_add_failed'),{sandboxCode:'sandbox_profile_add_failed',sandboxDiagnostic:receipt.profile.addOnlyLoad});preserveSandboxFailure(error,save,summary=>console.error(JSON.stringify(summary)));}receipt.operations.push('packaged-bwrap-profile-loaded');
+    const finalLoaded=readLoadedPolicy(profileRun);receipt.profile.afterAdd={namesSha256:hash(finalLoaded.names),attachmentsSha256:hash(finalLoaded.tree),targetNames:PROFILE_CONTRACT.profileNames.map(n=>({name:n,entries:finalLoaded.names.split('\n').filter(x=>x.startsWith(n+' ')).map(policyText)}))};try{validateLoadedProfileDelta(loaded,finalLoaded);}catch(error){error.sandboxDiagnostic=receipt.profile.afterAdd;preserveSandboxFailure(error,save,summary=>console.error(JSON.stringify(summary)));}receipt.profile.previousPolicyRowsPreserved=true;receipt.profile.addedProfileCount=2;receipt.profile.loadedAfter=true;receipt.profile.loadedNames=[...PROFILE_CONTRACT.profileNames];receipt.profile.cacheDisabled=true;save();
    }
-   receipt.postProbe=await probe();save();if(receipt.postProbe.status!=='passed')fail('sandbox_post_prerequisite_refused');
+   receipt.postProbe=afterDecision==='none'?receipt.afterAcquisitionProbe:await probe();save();if(receipt.postProbe.status!=='passed')fail('sandbox_post_prerequisite_refused');
   }
   receipt.after=collectHostFacts(run);receipt.globalRestrictionChanged=['apparmor','restrictedUserns','maxUserNamespaces','usernsClone','seccomp'].some(k=>receipt.before[k]!==receipt.after[k]);if(receipt.globalRestrictionChanged)fail('sandbox_global_host_policy_changed');receipt.proof=validateProbeReceipt((receipt.postProbe??receipt.initialProbe).proof);if(receipt.after.bwrapSha256!==receipt.proof.bwrapSha256)fail('sandbox_bwrap_changed');receipt.status='passed';save();return receipt;
  }catch(error){receipt.status='failed';receipt.failureCode=error.sandboxCode??'sandbox_prerequisite_refused';if(error.sandboxDiagnostic)receipt.trustRefusal=error.sandboxDiagnostic;preserveSandboxFailure(error,save,summary=>console.error(JSON.stringify(summary)));}
+}
+export function nativeBoundaryProbeProgram(){
+ return `const fs=require('node:fs'),net=require('node:net');const [c,r,p,s,o,port,challenge]=process.argv.slice(1);const KERNEL_LABEL_PATH=${JSON.stringify(KERNEL_LABEL_PATH)},EXPECTED_KERNEL_LABEL=${JSON.stringify(EXPECTED_KERNEL_LABEL)};const fail=code=>{throw Object.assign(Error(code),{sandboxCode:code});};const validateExecutionLabel=${validateExecutionLabel.toString()},readExecutionLabel=${readExecutionLabel.toString()};let entry=null,lastLabel=null;const reportError=e=>{process.stdout.write(JSON.stringify({schema:'paperclip.native-sandbox-probe-failure.v1',code:e.sandboxCode??'sandbox_child_boundary_refused',...(typeof lastLabel==='string'?{observedLabel:lastLabel}:{}),...(e.labelIo?{labelIo:e.labelIo}:{})}));process.exit(25);};try{if(process.getuid()===0)fail('sandbox_child_boundary_refused');entry=readExecutionLabel(fs);lastLabel=entry;validateExecutionLabel(entry);if(fs.readFileSync(c+'/canary','utf8')!=='retained-candidate'||fs.readFileSync(r+'/canary','utf8')!=='retained-reference')fail('sandbox_child_boundary_refused');for(const f of [c+'/canary',r+'/canary',p+'/canary',c+'/.git/canary',o+'/outside']){let denied=false;try{fs.writeFileSync(f,'forbidden');}catch{denied=true;}if(!denied)fail('sandbox_child_boundary_refused');}let protectedReadDenied=false;try{fs.readFileSync(p+'/canary');}catch{protectedReadDenied=true;}if(!protectedReadDenied)fail('sandbox_child_boundary_refused');fs.writeFileSync(s+'/allowed','allowed');let finished=false;const finish=()=>{if(finished)return;finished=true;try{const exit=readExecutionLabel(fs);lastLabel=exit;validateExecutionLabel(exit);if(entry!==exit)fail('sandbox_child_label_changed');process.stdout.write(JSON.stringify({schema:'paperclip.native-sandbox-child-label.v1',challenge,uid:process.getuid(),path:KERNEL_LABEL_PATH,entry,exit}));process.exit(0);}catch(e){reportError(e);}};const socket=net.connect(Number(port),'127.0.0.1',()=>process.exit(23));socket.on('error',finish);socket.setTimeout(500,()=>{socket.destroy();finish();});}catch(e){reportError(e);}`;
 }
 async function nativeProbe(root){
  if(process.platform!=='linux'||process.arch!=='x64'||process.getuid()===0)fail('sandbox_probe_platform');
@@ -250,14 +298,15 @@ async function nativeProbe(root){
  const platformManifest=createRequire(manifest).resolve('@openai/codex-linux-x64/package.json'),native=join(dirname(platformManifest),'vendor/x86_64-unknown-linux-musl/bin/codex'),nativeElfSha256=nativeElfDigest(native);
  const bwrap=trustedFile('/usr/bin/bwrap',16*1024**2),env={PATH:'/usr/bin:/bin',HOME:p.home,CODEX_HOME:p.home,TMPDIR:p.scratch,LANG:'C'};
  const args=createIsolatedCodexAppServerArgs(env,[...codexExecutableReadOnlyRoots(env,codex),process.execPath],undefined,[p.protected],false,{workspaceDirectory:p.candidate,referenceDirectories:[p.reference],readOnlyWorkspace:true,scratchDirectory:p.scratch});const config=[];for(let i=0;i<args.length-1;i++)if(args[i]==='-c'&&args[i+1].startsWith('permissions.'))config.push('-c',args[++i]);
- const server=net.createServer(s=>s.end('local-positive-control'));await new Promise((yes,no)=>{server.once('error',no);server.listen(0,'127.0.0.1',yes);});const port=server.address().port;let outsideControl=false;
+ const challenge=randomUUID(),server=net.createServer(s=>s.end('local-positive-control'));await new Promise((yes,no)=>{server.once('error',no);server.listen(0,'127.0.0.1',yes);});const port=server.address().port;let outsideControl=false;
  try{
   await new Promise((yes,no)=>{const socket=net.connect(port,'127.0.0.1',()=>{outsideControl=true;socket.end();yes();});socket.once('error',no);socket.setTimeout(1000,()=>socket.destroy(new Error('control_timeout')));});
-  const program=`const fs=require('node:fs'),net=require('node:net');const [c,r,p,s,o,port]=process.argv.slice(1);if(process.getuid()===0)process.exit(20);if(fs.readFileSync(c+'/canary','utf8')!=='retained-candidate'||fs.readFileSync(r+'/canary','utf8')!=='retained-reference')process.exit(21);for(const f of [c+'/canary',r+'/canary',p+'/canary',c+'/.git/canary',o+'/outside']){let denied=false;try{fs.writeFileSync(f,'forbidden');}catch{denied=true;}if(!denied)process.exit(22);}let protectedReadDenied=false;try{fs.readFileSync(p+'/canary');}catch{protectedReadDenied=true;}if(!protectedReadDenied)process.exit(24);fs.writeFileSync(s+'/allowed','allowed');const socket=net.connect(Number(port),'127.0.0.1',()=>process.exit(23));socket.on('error',()=>process.exit(0));socket.setTimeout(500,()=>{socket.destroy();process.exit(0)});`;
-  const r=spawnSync(codex.endsWith('.js')?process.execPath:codex,[...(codex.endsWith('.js')?[codex]:[]),'sandbox',...config,'-P',CODEX_SKILLLESS_PERMISSION_PROFILE,'-C',p.candidate,'--',process.execPath,'-e',program,p.candidate,p.reference,p.protected,p.scratch,base,String(port)],{cwd:p.candidate,env,encoding:'utf8',timeout:10000,killSignal:'SIGKILL',maxBuffer:MAX/2});
-  if(r.error||r.signal||r.status!==0){const text=String(r.stdout??'')+'\n'+String(r.stderr??'');process.stderr.write(namespaceRefusal(text)?'bwrap: No permissions to create new namespace\n':'native sandbox boundary probe refused\n');process.exitCode=1;return;}
+  const program=nativeBoundaryProbeProgram();
+  const r=spawnSync(codex.endsWith('.js')?process.execPath:codex,[...(codex.endsWith('.js')?[codex]:[]),'sandbox',...config,'-P',CODEX_SKILLLESS_PERMISSION_PROFILE,'-C',p.candidate,'--',process.execPath,'-e',program,p.candidate,p.reference,p.protected,p.scratch,base,String(port),challenge],{cwd:p.candidate,env,encoding:'utf8',timeout:10000,killSignal:'SIGKILL',maxBuffer:MAX/2});
+  if(r.error||r.signal||r.status!==0){const text=String(r.stdout??'')+'\n'+String(r.stderr??'');if(r.stdout.trim())console.log(JSON.stringify({schema:'paperclip.native-sandbox-probe-failure.v1',...projectProbeFailure(r.stdout)}));process.stderr.write(!r.error&&!r.signal&&r.status===1&&!r.stdout.trim()&&namespaceRefusal(text)?'bwrap: No permissions to create new namespace\n':'native sandbox boundary probe refused\n');process.exitCode=1;return;}
+  const childProof=inspectChildLabelProof(r.stdout,challenge,process.getuid());if(!childProof.ok){console.log(JSON.stringify(childProof.failure));process.stderr.write('native sandbox label proof refused\n');process.exitCode=1;return;}const executionLabel=childProof.proof;
   for(const n of ['candidate','reference','protected'])if(readFileSync(join(p[n],'canary'),'utf8')!=='retained-'+n)fail('sandbox_probe_mutated_canary');if(readFileSync(join(p.candidate,'.git/canary'),'utf8')!=='retained-metadata'||readFileSync(join(p.scratch,'allowed'),'utf8')!=='allowed'||existsSync(join(base,'outside')))fail('sandbox_probe_mutated_canary');
-  console.log(JSON.stringify({schema:'paperclip.native-sandbox-probe.v1',uid:process.getuid(),codexVersion:pkg.version,wrapperSha256:hash(readFileSync(codex)),nativeElfSha256,bwrapPath:'/usr/bin/bwrap',bwrapSha256:hash(bwrap),nativeSandbox:true,allowedRead:true,scratchWrite:true,candidateDenied:true,referenceDenied:true,protectedDenied:true,protectedReadDenied:true,metadataDenied:true,outsideDenied:true,networkDenied:true,outsideNetworkControl:outsideControl,originalBytesPreserved:true}));
+  console.log(JSON.stringify({schema:'paperclip.native-sandbox-probe.v1',uid:process.getuid(),codexVersion:pkg.version,wrapperSha256:hash(readFileSync(codex)),nativeElfSha256,bwrapPath:'/usr/bin/bwrap',bwrapSha256:hash(bwrap),nativeSandbox:true,allowedRead:true,scratchWrite:true,candidateDenied:true,referenceDenied:true,protectedDenied:true,protectedReadDenied:true,metadataDenied:true,outsideDenied:true,networkDenied:true,outsideNetworkControl:outsideControl,originalBytesPreserved:true,executionLabel}));
  }finally{await new Promise(yes=>server.close(yes));}
 }
 if(process.argv[1]&&resolve(process.argv[1])===SELF){
