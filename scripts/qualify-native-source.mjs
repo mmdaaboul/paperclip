@@ -9,6 +9,7 @@ import {join,resolve,sep,dirname} from 'node:path';
 import {readClaudeDependencyFacts} from './qualify-native-maintenance.mjs';
 import {fileURLToPath} from 'node:url';
 import {validateTarget,diagnosticCodes} from './qualify-native-install.mjs';
+import {projectSelectedGroupFailure,classifySelectedFailureText} from './native-source-failure-evidence.mjs';
 const hash=b=>createHash('sha256').update(b).digest('hex');
 export function validateSourceContract(contract){
  assert.equal(contract?.schema,'paperclip.native-selected-source-contract.v2');assert.equal(contract.retries,0);assert.equal(contract.maximumWorkers,1);assert.equal(contract.unselectedCasesArePasses,false);assert(/^\d+\.\d+\.\d+$/.test(contract.expectedClaudeVersion));assert(/^\d+\.\d+\.\d+$/.test(contract.expectedClaudeSdkVersion));assert(Number.isSafeInteger(contract.expectedWorkspacePackages)&&contract.expectedWorkspacePackages>0);for(const n of ['publicTables','migrations'])assert(Number.isSafeInteger(contract.expectedSchema?.[n])&&contract.expectedSchema[n]>0);
@@ -53,13 +54,24 @@ export function sourceTestCommand(group,workspace,report){
  const file=group.project==='runner'?group.path.slice('packages/paperclip-runner/'.length):group.path;
  return {cwd,binary:process.execPath,args:[join(workspace,'scripts/ci/run-selected-vitest.mjs'),file,'--retry=0','--maxWorkers=1','--no-file-parallelism','--reporter=json','--outputFile='+report,...(group.selection==='exact-full-names'?['--testNamePattern','^(?:'+group.fullNames.map(escapeRegex).join('|')+')$']:[])]};
 }
+export function runSelectedSourceGroup({execute,group,workspace,report,commandFailure=()=>null,onDiagnostic=()=>{}}){
+ try{
+ const output=execute();let counts,reportSha256;
+ if(group.project==='node-tap'){counts=inspectNodeTap(output,group.expectedPassed);reportSha256=hash(output);}
+ else{const raw=readFileSync(report);assert(raw.length<=16*1024**2);counts=inspectVitestReport(JSON.parse(raw),group,workspace);reportSha256=hash(raw);}
+ return {counts,reportSha256};
+ }catch(original){
+  try{onDiagnostic(projectSelectedGroupFailure({group,workspace,report,commandFailure:commandFailure()}));}catch{}
+  throw original;
+ }
+}
 async function qualify(){
  validateTarget(process.env);assert(process.platform==='linux'&&process.arch==='x64'&&process.getuid()>0);const e=process.env,workspace=realpathSync(process.cwd()),root=join(realpathSync(e.RUNNER_TEMP),'f10-native-source');assert(!existsSync(root),'fresh_source_root_required');mkdirSync(root,{mode:0o700});const home=join(root,'home'),tmp=join(root,'tmp');mkdirSync(home,{mode:0o700});mkdirSync(tmp,{mode:0o700});mkdirSync(join(tmp,'bin'),{mode:0o700});
  const contractBytes=readFileSync(join(workspace,'scripts/native-selected-source-contract.json')),contract=validateSourceContract(JSON.parse(contractBytes));
  const evidence={schema:'paperclip.native-selected-qualification.v2',sourceRevision:e.SOURCE_SHA,status:'running',phase:'frozen-native-build',retry:false,contractSha256:hash(contractBytes),lockSha256:hash(readFileSync(join(workspace,'pnpm-lock.yaml'))),claudePatchSha256:hash(readFileSync(join(workspace,'patches/@agentclientprotocol__claude-agent-acp@0.73.0.patch'))),groups:[],liveProviderAcceptance:false,optionalSdkKernelCampaign:false};
  const save=()=>writeFileSync(join(root,'evidence.json'),JSON.stringify(evidence,null,2)+'\n',{mode:0o600});let env=sourceEnvironment(e,home,tmp);
  function command(binary,args,cwd=workspace,timeout=120000,extra={}){
-  const r=spawnSync(binary,args,{cwd,env:{...env,...extra},encoding:'utf8',timeout,maxBuffer:32*1024**2,shell:false});const text=(String(r.stdout??'')+'\n'+String(r.stderr??'')).split(e.NATIVE_INSTALL_GITHUB_TOKEN).join('[redacted]');writeFileSync(join(root,evidence.phase+'.private.log'),text.slice(-256*1024),{mode:0o600});if(r.error||r.signal||r.status!==0){evidence.commandFailure={exit:r.status,signal:r.signal,reason:r.error?.code??'nonzero_exit',diagnostics:diagnosticCodes(text,e.NATIVE_INSTALL_GITHUB_TOKEN)};save();assert.fail('native_source_command_failed');}return text;
+  const r=spawnSync(binary,args,{cwd,env:{...env,...extra},encoding:'utf8',timeout,maxBuffer:32*1024**2,shell:false});const text=(String(r.stdout??'')+'\n'+String(r.stderr??'')).split(e.NATIVE_INSTALL_GITHUB_TOKEN).join('[redacted]');writeFileSync(join(root,evidence.phase+'.private.log'),text.slice(-256*1024),{mode:0o600});if(r.error||r.signal||r.status!==0){evidence.commandFailure={exit:r.status,signal:r.signal,reason:r.error?.code??'nonzero_exit',diagnostics:diagnosticCodes(text,e.NATIVE_INSTALL_GITHUB_TOKEN),selectedOutputDiagnostics:classifySelectedFailureText(text).filter(x=>x.kind!=='inspector_command')};save();assert.fail('native_source_command_failed');}return text;
  }
  try{
   evidence.capacity=[nativeCapacity(root,contract.resources.sourceBuild,'before-native-source-build')];save();assert.equal(command('git',['rev-parse','HEAD']).trim(),e.SOURCE_SHA);command('git',['diff','--exit-code','HEAD','--']);
@@ -69,8 +81,7 @@ async function qualify(){
   command('git',['diff','--exit-code','HEAD','--']);const dependency=readClaudeDependencyFacts(join(workspace,'packages/paperclip-runner/package.json'),workspace);evidence.claudeRuntime={...dependency,frozenPatchedDependency:true};evidence.nativeWorkspaceBuild=true;evidence.capacity.push(nativeCapacity(root,contract.resources.sourceTests,'before-selected-source-tests'));save();const deadline=Date.now()+20*60*1000;
   for(const [index,group]of contract.groups.entries()){
    evidence.phase='selected-'+String(index).padStart(2,'0');save();const report=join(root,'report-'+index+'.private.json'),selected=sourceTestCommand(group,workspace,report);assert(Date.now()<deadline,'native_source_total_deadline');
-   const output=command(selected.binary,selected.args,selected.cwd,Math.min(180000,deadline-Date.now()));let counts,reportSha256;
-   if(group.project==='node-tap'){counts=inspectNodeTap(output,group.expectedPassed);reportSha256=hash(output);}else{const raw=readFileSync(report);assert(raw.length<=16*1024**2);counts=inspectVitestReport(JSON.parse(raw),group,workspace);reportSha256=hash(raw);}
+   const {counts,reportSha256}=runSelectedSourceGroup({execute:()=>command(selected.binary,selected.args,selected.cwd,Math.min(180000,deadline-Date.now())),group,workspace,report,commandFailure:()=>evidence.commandFailure,onDiagnostic:diagnostic=>{evidence.failedGroup=diagnostic;save();}});
    evidence.groups.push({path:group.path,project:group.project,selection:group.selection,...(group.fullNames?{fullNames:group.fullNames}:{}),sourceSha256:hash(readFileSync(join(workspace,group.path))),reportSha256,...counts});save();
   }
   command('git',['diff','--exit-code','HEAD','--']);evidence.phase='source-qualified';evidence.status='passed';evidence.passed=evidence.groups.reduce((n,g)=>n+g.passed,0);evidence.failed=0;evidence.skipped=0;
