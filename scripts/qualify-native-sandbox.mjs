@@ -48,6 +48,35 @@ export function inspectLoadedAttachments(loaded,tree,targetName){
  for(const row of rows.values()){if(!Object.hasOwn(row,'name')||!Object.hasOwn(row,'attach'))fail('sandbox_loaded_attachments_incomplete');if(row.name===targetName||attachmentMayMatch(row.attach))conflict=true;}
  return {conflict,profiles:rows.size};
 }
+// Diagnostic projection only. The existing conservative matcher remains the
+// sole decision rule; truncation or projection must never grant permission.
+function policyText(value){return /secret|token|password|credential|private.?key/i.test(value)||value.length>160?{sha256:hash(value),bytes:Buffer.byteLength(value)}:{text:value};}
+export function inspectPolicyConflict(loaded,targetName){
+ const decision=inspectLoadedAttachments(loaded.names,loaded.tree,targetName),rows=new Map();
+ for(const line of loaded.tree.split('\n').filter(Boolean)){const m=line.match(/^\/sys\/kernel\/security\/apparmor\/policy\/profiles\/(.+)\/(name|attach):(.*)$/);const row=rows.get(m[1])??{};row[m[2]]=m[3];rows.set(m[1],row);}
+ const conflicts=[];for(const row of rows.values())if(row.name===targetName||attachmentMayMatch(row.attach))conflicts.push({name:policyText(row.name),attachment:policyText(row.attach),predicate:row.name===targetName?'target-name-already-loaded':'attachment-may-match-bwrap'});
+ const named=loaded.names.split('\n').filter(x=>x.startsWith(targetName+' '));
+ return {...decision,targetProfile:targetName,namesSha256:hash(loaded.names),attachmentsSha256:hash(loaded.tree),targetNameEntries:named.map(policyText),conflicts:conflicts.slice(0,16),conflictCount:conflicts.length,truncated:conflicts.length>16};
+}
+export function policyDecisionContext(loaded,destination){
+ const profiles=PROFILE_CONTRACT.profileNames.map(name=>inspectPolicyConflict(loaded,name));
+ return {schema:'paperclip.profile-policy-inspection.v1',profiles,destination,refusalBranch:profiles.some(p=>p.conflict)?'loaded-policy':destination.state==='divergent'?'destination-bytes':destination.state==='trust-refused'?'destination-trust':null,refused:profiles.some(p=>p.conflict)||['divergent','trust-refused'].includes(destination.state)};
+}
+function destinationPolicyState(bytes){
+ const path='/etc/apparmor.d/bwrap-userns-restrict';
+ if(!existsSync(path))return {path,state:'absent'};
+ try{const raw=trustedFile(path),st=lstatSync(path);return {path,state:raw.equals(bytes)?'same-package-bytes':'divergent',bytes:raw.length,sha256:hash(raw),expectedSha256:hash(bytes),uid:st.uid,gid:st.gid,mode:st.mode&0o7777,dev:st.dev,ino:st.ino};}
+ catch(error){return {path,state:'trust-refused',failureCode:error.sandboxCode??'sandbox_destination_unreadable',...(error.sandboxDiagnostic?{trustRefusal:error.sandboxDiagnostic}:{})};}
+}
+export function refusePolicyConflict(context){
+ if(context.profiles.some(p=>p.conflict)||context.destination.state==='divergent')throw Object.assign(new Error('sandbox_profile_policy_conflict'),{sandboxCode:'sandbox_profile_policy_conflict',sandboxDiagnostic:context});
+ if(context.destination.state==='trust-refused')throw Object.assign(new Error(context.destination.failureCode),{sandboxCode:context.destination.failureCode,sandboxDiagnostic:context});
+ return context;
+}
+export function enforcePolicyContext(context,persist,emergency){
+ try{refusePolicyConflict(context);}catch(error){preserveSandboxFailure(error,persist,emergency);}
+ persist();return context;
+}
 export function validateProbeReceipt(r){
  if(r?.schema!=='paperclip.native-sandbox-probe.v1'||!Number.isSafeInteger(r.uid)||r.uid<=0||r.codexVersion!=='0.160.0'||r.bwrapPath!=='/usr/bin/bwrap'||!['wrapperSha256','nativeElfSha256','bwrapSha256'].every(k=>/^[a-f0-9]{64}$/.test(r[k]??''))||!['nativeSandbox','allowedRead','scratchWrite','candidateDenied','referenceDenied','protectedDenied','protectedReadDenied','metadataDenied','outsideDenied','networkDenied','outsideNetworkControl','originalBytesPreserved'].every(k=>r[k]===true))fail('sandbox_native_probe_incomplete');
  return r;
@@ -141,6 +170,23 @@ export function stageAuthenticatedProfile(bytes,source,run){
  r=run('/usr/bin/sudo',['-n','/usr/bin/tee','--',path],bytes);if(!r.ok||!Buffer.from(r.stdout).equals(bytes))fail('sandbox_root_stage_write');const file=rootMetadata(path,run);validateRootStageMetadata(dir,file,PROFILE_CONTRACT.profile);const stage={directory,path,dir,file};verifyRootStage(stage,run);stage.proof={schema:'paperclip.authenticated-root-profile-stage.v1',directory,path,dir,file,sha256:hash(bytes),exclusiveDirectory:true,inputAuthenticated:true,rootDigestVerified:true,identityBookends:true};return stage;
 }
 function readLoadedPolicy(run){const a=run('/usr/bin/sudo',['-n','/usr/bin/cat','/sys/kernel/security/apparmor/profiles']),tree=run('/usr/bin/sudo',['-n','/usr/bin/find','/sys/kernel/security/apparmor/policy/profiles','-type','f','(','-name','name','-o','-name','attach',')','-exec','/usr/bin/grep','-H','^','{}','+']),b=run('/usr/bin/sudo',['-n','/usr/bin/cat','/sys/kernel/security/apparmor/profiles']);if(!a.ok||!tree.ok||!b.ok||a.stdout!==b.stdout)fail('sandbox_loaded_policy_unknown');return {names:a.stdout,tree:tree.stdout};}
+async function diagnosePolicyConflict(){
+ hosted(process.env);diagnosticHostIdentity(process.getuid(),readFileSync('/etc/os-release','utf8'));
+ const root=realpathSync(process.env.RUNNER_TEMP),out=join(root,'native-policy-conflict-diagnostic.json');if(existsSync(out))fail('diagnostic_destination_exists');
+ const evidence={schema:'paperclip.policy-conflict-diagnostic.v1',authority:'DIAGNOSTIC_ONLY_NOT_QUALIFICATION',source:process.env.SOURCE_SHA,status:'running',retry:false,operations:[],explicitProfileMutation:false,nativeProbeRun:false,sourceBuilt:false,appInstalled:false,ordinaryPackageMaintainerEffectsPossible:true};
+ const save=()=>{const raw=JSON.stringify(evidence,null,2)+'\n';if(Buffer.byteLength(raw)>MAX)fail('diagnostic_evidence_bound');writeFileSync(out,raw,{mode:0o600});};
+ const run=runner(Date.now()+480000,root),snapshot=()=>{const state={systemTrust:snapshotSystemTrust()};try{const loaded=readLoadedPolicy(run);state.loaded=PROFILE_CONTRACT.profileNames.map(n=>inspectPolicyConflict(loaded,n));}catch(error){state.loadedRefusal={failureCode:error.sandboxCode??'sandbox_policy_inventory_failed',...(error.sandboxDiagnostic?{context:error.sandboxDiagnostic}:{})};}return state;};
+ try{
+  evidence.before=snapshot();save();
+  const aptDeadline=Date.now()+300000;
+  for(const args of [['update','-qq'],['install','-y','-qq','--no-install-recommends','bubblewrap','apparmor-profiles','apparmor-utils']]){const r=run('/usr/bin/sudo',['-n','/usr/bin/apt-get',...args],Math.max(1,aptDeadline-Date.now()));if(!r.ok)fail('diagnostic_distro_acquisition_failed');evidence.operations.push(args[0]==='update'?'signed-distro-index':'named-distro-prerequisites');save();}
+  evidence.after=snapshot();save();evidence.phase='authenticated-profile-and-includes';save();
+  const bytes=readAuthenticatedProfile('/usr/share/apparmor/extra-profiles/bwrap-userns-restrict');evidence.profile={sha256:hash(bytes),provenance:profileProvenance(),includeClosure:verifyProfileIncludeClosure(bytes)};save();
+  evidence.phase='loaded-policy-and-destination';save();const loaded=readLoadedPolicy(run);evidence.policyInspection=policyDecisionContext(loaded,destinationPolicyState(bytes));save();
+  evidence.status='diagnostic-completed';evidence.observedConflict=evidence.policyInspection.refused;
+  evidence.finishedAt=new Date().toISOString();save();console.log(JSON.stringify({status:evidence.status,authority:evidence.authority,observedConflict:evidence.observedConflict}));
+ }catch(error){evidence.status='diagnostic-stopped';evidence.failureCode=error.sandboxCode??'diagnostic_refused';if(error.sandboxDiagnostic)evidence.refusal=error.sandboxDiagnostic;process.exitCode=1;preserveSandboxFailure(error,()=>{evidence.finishedAt=new Date().toISOString();save();},summary=>console.error(JSON.stringify(summary)));}
+}
 export function validateLoadedProfileDelta(before,after){
  const lines=x=>x.trim().split('\n').filter(Boolean),old=lines(before.names).sort(),now=lines(after.names),added=now.filter(x=>!old.includes(x));if(added.length!==2||!PROFILE_CONTRACT.profileNames.every(n=>added.includes(n+' (enforce)'))||old.some(x=>!now.includes(x)))fail('sandbox_profile_load_unproven');
  const parse=text=>{const rows=new Map();for(const line of text.trim().split('\n').filter(Boolean)){const m=line.match(/^\/sys\/kernel\/security\/apparmor\/policy\/profiles\/(.+)\/(name|attach):(.*)$/);if(!m)fail('sandbox_loaded_attachments_unknown');const row=rows.get(m[1])??{};if(Object.hasOwn(row,m[2]))fail('sandbox_loaded_attachments_duplicate');row[m[2]]=m[3];rows.set(m[1],row);}return rows;};
@@ -178,8 +224,8 @@ export async function qualifyNativeSandbox({workspace,root,ambient=process.env,o
     const profileDeadline=Math.min(deadline,Date.now()+SANDBOX_LIMITS.profileMs),profileRun=(binary,args)=>run(binary,args,Math.max(1,profileDeadline-Date.now()));
     const packaged='/usr/share/apparmor/extra-profiles/bwrap-userns-restrict',destination='/etc/apparmor.d/bwrap-userns-restrict';
     const bytes=readAuthenticatedProfile(packaged),closure=verifyProfileIncludeClosure(bytes);
-    const loaded=readLoadedPolicy(profileRun);for(const name of PROFILE_CONTRACT.profileNames)if(inspectLoadedAttachments(loaded.names,loaded.tree,name).conflict)fail('sandbox_profile_policy_conflict');
-    const dest=existsSync(destination)?(trustedFile(destination).equals(bytes)?'same-package-bytes':'divergent'):'absent';
+    const loaded=readLoadedPolicy(profileRun);receipt.policyInspection=policyDecisionContext(loaded,destinationPolicyState(bytes));enforcePolicyContext(receipt.policyInspection,save,summary=>console.error(JSON.stringify(summary)));
+    const dest=receipt.policyInspection.destination.state;
     const action=profileLoadDecision({packagedVerified:true,destination:dest,loaded:'absent',localOverride:false});
     receipt.profile={package:'apparmor-profiles',sha256:hash(bytes),destination:dest,loadedBefore:false,provenance:profileProvenance(),includeClosure:closure};save();
     const stage=stageAuthenticatedProfile(bytes,process.env.SOURCE_SHA,(binary,args,input)=>run(binary,args,Math.max(1,profileDeadline-Date.now()),input));receipt.profile.rootStage=stage.proof;receipt.operations.push('authenticated-bwrap-profile-staged');save();
@@ -215,7 +261,8 @@ async function nativeProbe(root){
  }finally{await new Promise(yes=>server.close(yes));}
 }
 if(process.argv[1]&&resolve(process.argv[1])===SELF){
- if(process.argv[2]==='--diagnose-system-trust')await diagnoseSystemTrust();
+ if(process.argv[2]==='--diagnose-policy-conflict')await diagnosePolicyConflict();
+ else if(process.argv[2]==='--diagnose-system-trust')await diagnoseSystemTrust();
  else if(process.argv[2]==='--probe')await nativeProbe(resolve(process.argv[3]));
  else if(process.argv[2]==='--facts'){hosted(process.env);const run=runner(Date.now()+60000,process.env.RUNNER_TEMP);console.log(JSON.stringify({schema:'paperclip.native-sandbox-host-facts.v1',facts:collectHostFacts(run)}));}
  else fail('sandbox_command_closed');
