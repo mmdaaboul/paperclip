@@ -71,7 +71,7 @@ test('a real test child delivers its synchronous marker and terminal receipt thr
 });
 
 test('the hosted diagnostic routes to the pinned probe and returns before build or policy staging', () => {
- const workflow = readFileSync(new URL('../.github/workflows/native-linux-build.yml', import.meta.url),'utf8');
+ const workflow = readFileSync(new URL('./fixtures/native-probe-launch-transport-diagnostic.yml', import.meta.url),'utf8');
  const sandbox = readFileSync(new URL('./qualify-native-sandbox.mjs', import.meta.url),'utf8');
  const source = readFileSync(new URL('./qualify-native-source.mjs', import.meta.url),'utf8');
  assert(workflow.includes('timeout-minutes: 12'));

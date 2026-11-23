@@ -27,6 +27,28 @@ export function sandboxRepairDecision(f,initial){
  if(initial!=='namespace_denied'||f.apparmor!==true||f.restrictedUserns!==1||f.maxUserNamespaces<=0||f.usernsClone===0||f.seccomp!==0)fail('sandbox_host_policy_unclassified');
  return 'documented-profile-prerequisite';
 }
+export const LOOPBACK_PREREQUISITE=Object.freeze({
+ stderrBytes:61,stderrSha256:'ed3471f7900377f86150471417911309833a36d664cb5af7409e139103f67ddf',
+ bwrapPackageVersion:'0.9.0-1ubuntu0.3',bwrapSha256:'e318903862396f96de3df57264e0158682b952fd3fb53ac23d876413e7b30f71',bwrapMode:0o755,
+});
+export function postAcquisitionSandboxDecision(host,probe){
+ const transport=probe?.transport;
+ if(probe?.status==='native_probe_refused'&&probe.exit===1&&probe.signal===null&&!probe.safeFailure
+  &&transport?.schema==='paperclip.native-probe-transport.v1'&&transport.exit===1&&transport.signal===null&&transport.spawnError===null
+  &&transport.stdoutBytes===0&&transport.stdoutSha256===hash('')&&transport.stderrBytes===LOOPBACK_PREREQUISITE.stderrBytes
+  &&transport.stderrSha256===LOOPBACK_PREREQUISITE.stderrSha256&&transport.unclassifiedStderr===false
+  &&transport.childEntryObserved===false&&transport.childTerminalObserved===false
+  &&Array.isArray(transport.stderrCategories)&&transport.stderrCategories.includes('namespace_loopback_denied')
+  &&(host.usernsClone===1||host.usernsClone===null)&&Number.isSafeInteger(host.maxUserNamespaces)
+  &&host.bwrapPresent===true&&host.bwrapTrusted===true&&host.bwrapPackageOwned===true&&host.bwrapSystemLaunchSupported===true
+  &&['bwrapPackageVersion','bwrapSha256','bwrapMode'].every(key=>host[key]===LOOPBACK_PREREQUISITE[key])){
+  // This exact pre-child denial can enter the same disposable add-only path.
+  // Its host, profile, no-replace and later execution-proof gates are unchanged.
+  sandboxRepairDecision(host,'namespace_denied');
+  return 'documented-loopback-profile-prerequisite';
+ }
+ return sandboxRepairDecision(host,probe?.status);
+}
 export function profileLoadDecision({packagedVerified,destination,loaded,localOverride}){
  if(!packagedVerified||localOverride||loaded!=='absent'||!['absent','same-package-bytes'].includes(destination))fail('sandbox_profile_policy_conflict');
  return destination==='absent'?'install-and-load':'load';
@@ -297,8 +319,11 @@ export function collectHostFacts(run){
  const os=readFileSync('/etc/os-release','utf8'),value=k=>os.match(new RegExp('^'+k+'="?([^"\\n]+)"?$','m'))?.[1];
  const bwrapPresent=existsSync('/usr/bin/bwrap');let bwrapTrusted=false,bwrapPackageOwned=false,bwrapSha256=null,bwrapVersion=null,bwrapPackageVersion=null,bwrapMode=null;
  if(bwrapPresent){const raw=trustedFile('/usr/bin/bwrap',16*1024**2);bwrapTrusted=true;bwrapSha256=hash(raw);const p=run('/usr/bin/dpkg-query',['-S','/usr/bin/bwrap']),v=run('/usr/bin/dpkg-query',['-W','-f=${Version}','bubblewrap']),integrity=run('/usr/bin/dpkg',['--verify','bubblewrap']),version=run('/usr/bin/bwrap',['--version']);bwrapPackageOwned=p.ok&&p.stdout.trim()==='bubblewrap: /usr/bin/bwrap'&&v.ok&&integrity.ok&&!integrity.stdout.trim()&&version.ok;bwrapVersion=version.stdout.trim().match(/^bubblewrap ([0-9][0-9A-Za-z.+~-]*)$/)?.[1]??null;bwrapPackageVersion=v.stdout.trim();bwrapMode=lstatSync('/usr/bin/bwrap').mode&0o7777;if(!bwrapVersion||!/^\d[0-9A-Za-z.+:~\-]*$/.test(bwrapPackageVersion))fail('sandbox_bwrap_version_invalid');}
+ const help=bwrapPackageOwned?run('/usr/bin/bwrap',['--help']):null;
+ const helpText=help?`${help.stdout}\n${help.stderr}`:'';
+ const bwrapSystemLaunchSupported=help?.ok===true&&helpText.includes('--as-pid-1')&&helpText.includes('--perms');
  const status=readFileSync('/proc/self/status','utf8');
- return validateSandboxHost({os:value('ID'),release:value('VERSION_ID'),kernelRelease:/^[A-Za-z0-9_.+\-]{1,128}$/.test(kernelRelease())?kernelRelease():null,uid:process.getuid(),bwrapPresent,bwrapTrusted,bwrapPackageOwned,bwrapSha256,bwrapVersion,bwrapPackageVersion,bwrapMode,apparmor:optional('/sys/module/apparmor/parameters/enabled')==='Y',restrictedUserns:number('/proc/sys/kernel/apparmor_restrict_unprivileged_userns'),maxUserNamespaces:number('/proc/sys/user/max_user_namespaces'),usernsClone:number('/proc/sys/kernel/unprivileged_userns_clone'),seccomp:Number(status.match(/^Seccomp:\s+(\d+)$/m)?.[1]??-1)});
+ return validateSandboxHost({os:value('ID'),release:value('VERSION_ID'),kernelRelease:/^[A-Za-z0-9_.+\-]{1,128}$/.test(kernelRelease())?kernelRelease():null,uid:process.getuid(),bwrapPresent,bwrapTrusted,bwrapPackageOwned,bwrapSha256,bwrapVersion,bwrapPackageVersion,bwrapMode,bwrapSystemLaunchSupported,apparmor:optional('/sys/module/apparmor/parameters/enabled')==='Y',restrictedUserns:number('/proc/sys/kernel/apparmor_restrict_unprivileged_userns'),maxUserNamespaces:number('/proc/sys/user/max_user_namespaces'),usernsClone:number('/proc/sys/kernel/unprivileged_userns_clone'),seccomp:Number(status.match(/^Seccomp:\s+(\d+)$/m)?.[1]??-1)});
 }
 function hosted(e){if(process.platform!=='linux'||process.arch!=='x64'||e.GITHUB_REPOSITORY!=='mmdaaboul/paperclip'||e.GITHUB_JOB!=='selected_native_source'||e.GITHUB_ACTIONS!=='true'||e.RUNNER_ENVIRONMENT!=='github-hosted')fail('sandbox_disposable_job_only');}
 export async function qualifyNativeSandbox({workspace,root,ambient=process.env,onReceipt=()=>{},postAcquisitionDiagnostic=false}){
@@ -317,7 +342,7 @@ export async function qualifyNativeSandbox({workspace,root,ambient=process.env,o
    const after=collectHostFacts(run);if(!after.bwrapPresent)fail('sandbox_distro_bwrap_missing');receipt.afterAcquisition=after;save();
    receipt.afterAcquisitionProbe=await probe();save();
    if(postAcquisitionDiagnostic){receipt.status='diagnostic-observed';save();return receipt;}
-   const afterDecision=sandboxRepairDecision(after,receipt.afterAcquisitionProbe.status);receipt.afterAcquisitionDecision=afterDecision;save();
+   const afterDecision=postAcquisitionSandboxDecision(after,receipt.afterAcquisitionProbe);receipt.afterAcquisitionDecision=afterDecision;save();
    if(afterDecision!=='none'){
     const profileDeadline=Math.min(deadline,Date.now()+SANDBOX_LIMITS.profileMs),profileRun=(binary,args)=>run(binary,args,Math.max(1,profileDeadline-Date.now()));
     const packaged='/usr/share/apparmor/extra-profiles/bwrap-userns-restrict',destination='/etc/apparmor.d/bwrap-userns-restrict';
@@ -337,7 +362,7 @@ export async function qualifyNativeSandbox({workspace,root,ambient=process.env,o
    }
    receipt.postProbe=afterDecision==='none'?receipt.afterAcquisitionProbe:await probe();save();if(receipt.postProbe.status!=='passed')fail('sandbox_post_prerequisite_refused');
   }
-  receipt.after=collectHostFacts(run);receipt.globalRestrictionChanged=['apparmor','restrictedUserns','maxUserNamespaces','usernsClone','seccomp'].some(k=>receipt.before[k]!==receipt.after[k]);if(receipt.globalRestrictionChanged)fail('sandbox_global_host_policy_changed');receipt.proof=validateProbeReceipt((receipt.postProbe??receipt.initialProbe).proof);if(receipt.after.bwrapSha256!==receipt.proof.bwrapSha256)fail('sandbox_bwrap_changed');receipt.status='passed';save();return receipt;
+  receipt.after=collectHostFacts(run);receipt.globalRestrictionChanged=['apparmor','restrictedUserns','maxUserNamespaces','usernsClone','seccomp'].some(k=>receipt.before[k]!==receipt.after[k]);if(receipt.globalRestrictionChanged)fail('sandbox_global_host_policy_changed');receipt.proof=validateProbeReceipt((receipt.postProbe??receipt.initialProbe).proof);if(receipt.after.bwrapSha256!==receipt.proof.bwrapSha256||(receipt.afterAcquisitionDecision==='documented-loopback-profile-prerequisite'&&receipt.after.bwrapSha256!==receipt.afterAcquisition.bwrapSha256))fail('sandbox_bwrap_changed');receipt.status='passed';save();return receipt;
  }catch(error){receipt.status='failed';receipt.failureCode=error.sandboxCode??'sandbox_prerequisite_refused';if(error.sandboxDiagnostic)receipt.trustRefusal=error.sandboxDiagnostic;preserveSandboxFailure(error,save,summary=>console.error(JSON.stringify(summary)));}
 }
 export function nativeBoundaryProbeProgram(){
