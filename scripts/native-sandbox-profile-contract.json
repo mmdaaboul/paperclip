@@ -1,0 +1,293 @@
+{
+  "schema": "paperclip.authenticated-sandbox-profile.v1",
+  "keyFingerprint": "F6ECB3762474EDA9D21B7022871920D1991BC93C",
+  "releaseSha256": "bc225b43093cfec0db7cad8f804418cbb32c20971a998b9e3e311ad8e3731f38",
+  "releaseSignatureSha256": "ed2cbf956194e5e6ace22d7c96c753fdcef42a22013d940c8e850c5af51e342b",
+  "packagesIndexSha256": "21ade716d65262529e11582d53ed68370b97a9b66a33f2d432f5008bed3f6710",
+  "package": {
+    "Package": "apparmor-profiles",
+    "Version": "4.0.1really4.0.1-0ubuntu0.24.04.9",
+    "Architecture": "all",
+    "Filename": "pool/main/a/apparmor/apparmor-profiles_4.0.1really4.0.1-0ubuntu0.24.04.9_all.deb",
+    "Size": "39592",
+    "SHA256": "90b02aa006eea7702cd4e851343e469e41365dda42145a3cb035de1d6c773b8c"
+  },
+  "apparmorPackage": {
+    "Package": "apparmor",
+    "Version": "4.0.1really4.0.1-0ubuntu0.24.04.9",
+    "Architecture": "amd64",
+    "Filename": "pool/main/a/apparmor/apparmor_4.0.1really4.0.1-0ubuntu0.24.04.9_amd64.deb",
+    "Size": "639878",
+    "SHA256": "59af23f557d666039708ec176aa056d2fd85125dabd452accf6d86f5c608fb74"
+  },
+  "profile": {
+    "path": "usr/share/apparmor/extra-profiles/bwrap-userns-restrict",
+    "bytes": 1936,
+    "sha256": "11d39094f044f0cda0febb3ad517b830301da6b2ce929664af09ee9e4dd264f9"
+  },
+  "profileNames": [
+    "bwrap",
+    "unpriv_bwrap"
+  ],
+  "profileAttachments": {
+    "bwrap": "/usr/bin/bwrap",
+    "unpriv_bwrap": null
+  },
+  "trustedFiles": {
+    "/etc/apparmor/parser.conf": {
+      "bytes": 2270,
+      "sha256": "f8586f1c3bfd7abac6a182c1b45d22a8397c0db5a737b54bc8f9fc48da53d5bd"
+    },
+    "/etc/apparmor.d/abi/4.0": {
+      "bytes": 2205,
+      "sha256": "e510bb8f6788b45e48de2f859a6f94a7b8416cbac5a1051814cfce925fa911bd"
+    },
+    "/etc/apparmor.d/tunables/alias": {
+      "bytes": 734,
+      "sha256": "e7b8b278db3f7aca74e0176f22cbd3adc3c89212cc9e66a90a2787b3ceee8030"
+    },
+    "/etc/apparmor.d/tunables/apparmorfs": {
+      "bytes": 495,
+      "sha256": "63d35ffdb55dfeeb3cabb83e378c2c6856ef8a31ebf512b0a3e039634ab0ead8"
+    },
+    "/etc/apparmor.d/tunables/dovecot": {
+      "bytes": 917,
+      "sha256": "7a7c87c1ccf7b47071ff3866de46aadeee8029f487b740577d3e646d647b3abb"
+    },
+    "/etc/apparmor.d/tunables/etc": {
+      "bytes": 1256,
+      "sha256": "4211a2db7a81c3edea6a657f8eacdae4322235c1d766ac95a592cb6f1b43f7ee"
+    },
+    "/etc/apparmor.d/tunables/global": {
+      "bytes": 897,
+      "sha256": "2c1d72013b53bf103fb8abe2199ce5775f8493df1acd3ef497046156c09fdf7c"
+    },
+    "/etc/apparmor.d/tunables/home": {
+      "bytes": 974,
+      "sha256": "806a4e80696e3870d46d1ae99ac7fe7099680b39040c2183094a44671d83218e"
+    },
+    "/etc/apparmor.d/tunables/home.d/site.local": {
+      "bytes": 634,
+      "sha256": "f6f9d209f8015196f2e391ea02debcebecbf8022ececfee3a08e3973c3bb06d4"
+    },
+    "/etc/apparmor.d/tunables/kernelvars": {
+      "bytes": 1511,
+      "sha256": "a2fa754e93a435722ea4b8b03e2bdf52bf4c029c66397b773f5e4321d6f66ea5"
+    },
+    "/etc/apparmor.d/tunables/multiarch": {
+      "bytes": 607,
+      "sha256": "0d35e0680f4dd9085a1c64911be21e95a65d12db045bde4b4ecae22915ce53ff"
+    },
+    "/etc/apparmor.d/tunables/multiarch.d/site.local": {
+      "bytes": 645,
+      "sha256": "731ad52936633b9a0c738605a2a08aad2357df91ca8fbe3bd2c3427d7aac240b"
+    },
+    "/etc/apparmor.d/tunables/proc": {
+      "bytes": 548,
+      "sha256": "d6a8ac6910ecdde3930916dcb44d7b3d3bf1cfe5a8f54728f1f599e32a26ece7"
+    },
+    "/etc/apparmor.d/tunables/run": {
+      "bytes": 129,
+      "sha256": "cbe2d9c99a82124d6206bfdd377895fa3dec48ee255923d2c31b71be53ab9bdd"
+    },
+    "/etc/apparmor.d/tunables/securityfs": {
+      "bytes": 525,
+      "sha256": "da256009660ae672e734642bc40422df6d7166bd5c01579729a0c6fac340e47c"
+    },
+    "/etc/apparmor.d/tunables/share": {
+      "bytes": 929,
+      "sha256": "5389ddceeb78d2012f528037e5c8205535f145c906cf6266ba400d9bafea26b7"
+    },
+    "/etc/apparmor.d/tunables/sys": {
+      "bytes": 378,
+      "sha256": "386ef113b736b14319fa1aad4f0b09f367147121072dd1ad354e528a16a588c5"
+    },
+    "/etc/apparmor.d/tunables/system": {
+      "bytes": 5055,
+      "sha256": "84dfeb5a2239e9cb7626b8008275c5aa0602d671303f4b43b7db0eff4688b828"
+    },
+    "/etc/apparmor.d/tunables/xdg-user-dirs": {
+      "bytes": 844,
+      "sha256": "1d92b108e04a4067333224c4dbfd19df8ca0f0deef7a28b153995e22fe8cedb7"
+    },
+    "/usr/sbin/apparmor_parser": {
+      "bytes": 1629848,
+      "sha256": "85e67b4ebc2559cc84c7d256d14890b8a7521e0278aedd544e13a3204a387d05"
+    }
+  },
+  "trustedDirectories": [
+    "/etc/apparmor.d/tunables",
+    "/etc/apparmor.d/tunables/home.d",
+    "/etc/apparmor.d/tunables/multiarch.d",
+    "/etc/apparmor.d/tunables/xdg-user-dirs.d"
+  ],
+  "parserConfig": "/etc/apparmor/parser.conf",
+  "includeRoot": "/etc/apparmor.d",
+  "parserArgs": [
+    "--config-file",
+    "/etc/apparmor/parser.conf",
+    "-K",
+    "-b",
+    "/etc/apparmor.d",
+    "-I",
+    "/etc/apparmor.d",
+    "-r",
+    "/etc/apparmor.d/bwrap-userns-restrict"
+  ],
+  "parserSourceReferences": [
+    "https://gitlab.com/apparmor/apparmor/-/raw/v4.0.1/parser/parser_include.c",
+    "https://gitlab.com/apparmor/apparmor/-/raw/v4.0.1/parser/parser_main.c"
+  ],
+  "scope": "Disposable hosted CI only. Exact authenticated official profile bytes; native boundary probes remain decisive.",
+  "expectedIncludeClosureRows": [
+    {
+      "path": "/etc/apparmor/parser.conf",
+      "type": "file",
+      "bytes": 2270,
+      "sha256": "f8586f1c3bfd7abac6a182c1b45d22a8397c0db5a737b54bc8f9fc48da53d5bd"
+    },
+    {
+      "path": "/etc/apparmor.d/abi/4.0",
+      "type": "file",
+      "bytes": 2205,
+      "sha256": "e510bb8f6788b45e48de2f859a6f94a7b8416cbac5a1051814cfce925fa911bd"
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/global",
+      "type": "file",
+      "bytes": 897,
+      "sha256": "2c1d72013b53bf103fb8abe2199ce5775f8493df1acd3ef497046156c09fdf7c"
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/home",
+      "type": "file",
+      "bytes": 974,
+      "sha256": "806a4e80696e3870d46d1ae99ac7fe7099680b39040c2183094a44671d83218e"
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/home.d",
+      "type": "directory",
+      "names": [
+        "site.local"
+      ]
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/home.d/site.local",
+      "type": "file",
+      "bytes": 634,
+      "sha256": "f6f9d209f8015196f2e391ea02debcebecbf8022ececfee3a08e3973c3bb06d4"
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/multiarch",
+      "type": "file",
+      "bytes": 607,
+      "sha256": "0d35e0680f4dd9085a1c64911be21e95a65d12db045bde4b4ecae22915ce53ff"
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/multiarch.d",
+      "type": "directory",
+      "names": [
+        "site.local"
+      ]
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/multiarch.d/site.local",
+      "type": "file",
+      "bytes": 645,
+      "sha256": "731ad52936633b9a0c738605a2a08aad2357df91ca8fbe3bd2c3427d7aac240b"
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/proc",
+      "type": "file",
+      "bytes": 548,
+      "sha256": "d6a8ac6910ecdde3930916dcb44d7b3d3bf1cfe5a8f54728f1f599e32a26ece7"
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/proc.d",
+      "type": "absent"
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/alias",
+      "type": "file",
+      "bytes": 734,
+      "sha256": "e7b8b278db3f7aca74e0176f22cbd3adc3c89212cc9e66a90a2787b3ceee8030"
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/alias.d",
+      "type": "absent"
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/kernelvars",
+      "type": "file",
+      "bytes": 1511,
+      "sha256": "a2fa754e93a435722ea4b8b03e2bdf52bf4c029c66397b773f5e4321d6f66ea5"
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/kernelvars.d",
+      "type": "absent"
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/system",
+      "type": "file",
+      "bytes": 5055,
+      "sha256": "84dfeb5a2239e9cb7626b8008275c5aa0602d671303f4b43b7db0eff4688b828"
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/system.d",
+      "type": "absent"
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/xdg-user-dirs",
+      "type": "file",
+      "bytes": 844,
+      "sha256": "1d92b108e04a4067333224c4dbfd19df8ca0f0deef7a28b153995e22fe8cedb7"
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/xdg-user-dirs.d",
+      "type": "directory",
+      "names": []
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/share",
+      "type": "file",
+      "bytes": 929,
+      "sha256": "5389ddceeb78d2012f528037e5c8205535f145c906cf6266ba400d9bafea26b7"
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/share.d",
+      "type": "absent"
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/etc",
+      "type": "file",
+      "bytes": 1256,
+      "sha256": "4211a2db7a81c3edea6a657f8eacdae4322235c1d766ac95a592cb6f1b43f7ee"
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/etc.d",
+      "type": "absent"
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/run",
+      "type": "file",
+      "bytes": 129,
+      "sha256": "cbe2d9c99a82124d6206bfdd377895fa3dec48ee255923d2c31b71be53ab9bdd"
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/run.d",
+      "type": "absent"
+    },
+    {
+      "path": "/etc/apparmor.d/tunables/global.d",
+      "type": "absent"
+    },
+    {
+      "path": "/etc/apparmor.d/local/bwrap-userns-restrict",
+      "type": "absent"
+    },
+    {
+      "path": "/etc/apparmor.d/local/unpriv_bwrap",
+      "type": "absent"
+    }
+  ]
+}

@@ -3,13 +3,14 @@
 import assert from 'node:assert/strict';
 import {spawnSync} from 'node:child_process';
 import {createHash} from 'node:crypto';
-import {readFileSync,lstatSync,realpathSync,existsSync,writeFileSync,mkdirSync,mkdtempSync,openSync,readSync,closeSync,fstatSync} from 'node:fs';
+import {readFileSync,lstatSync,realpathSync,existsSync,writeFileSync,mkdirSync,mkdtempSync,openSync,readSync,closeSync,fstatSync,readdirSync,constants} from 'node:fs';
 import {join,dirname,resolve} from 'node:path';
 import {fileURLToPath,pathToFileURL} from 'node:url';
 import {createRequire} from 'node:module';
 import net from 'node:net';
 import {release as kernelRelease} from 'node:os';
 const SELF=fileURLToPath(import.meta.url),MAX=65536;
+export const PROFILE_CONTRACT=Object.freeze(JSON.parse(readFileSync(new URL('./native-sandbox-profile-contract.json',import.meta.url),'utf8')));
 export const SANDBOX_LIMITS=Object.freeze({aggregateMs:600000,aptMs:300000,profileMs:60000,probeMs:15000,outputBytes:MAX});
 const hash=b=>createHash('sha256').update(b).digest('hex');
 const fail=code=>{throw Object.assign(new Error(code),{sandboxCode:code});};
@@ -52,7 +53,7 @@ export function validateProbeReceipt(r){
  return r;
 }
 function safeEnv(home){return {PATH:'/usr/bin:/bin:/usr/sbin',HOME:home,LANG:'C',LC_ALL:'C',DEBIAN_FRONTEND:'noninteractive'};}
-function runner(deadline,home){return (binary,args,ms=15000)=>{
+function runner(deadline,home){return (binary,args,ms=15000,input)=>{
  const effective=Math.min(ms,deadline-Date.now());if(effective<=1000)fail('sandbox_prerequisite_deadline');trustedFile('/usr/bin/timeout',1024*1024);
  const seconds=((effective-1000)/1000).toFixed(3)+'s',privileged=binary==='/usr/bin/sudo';
  if(privileged&&args[0]!=='-n')fail('sandbox_privileged_command_refused');
@@ -60,7 +61,7 @@ function runner(deadline,home){return (binary,args,ms=15000)=>{
  // Its deadline precedes Node's final KILL backstop; sudo-owned apt children
  // are bounded by the root-owned timeout, not a normal user's signal rights.
  const command=privileged?binary:'/usr/bin/timeout',argv=privileged?['-n','/usr/bin/timeout','--signal=KILL',seconds,...args.slice(1)]:['--signal=KILL',seconds,binary,...args];
- const r=spawnSync(command,argv,{env:safeEnv(home),encoding:'utf8',timeout:effective,killSignal:'SIGKILL',maxBuffer:MAX/2,shell:false});
+ const r=spawnSync(command,argv,{...(input===undefined?{}:{input}),env:safeEnv(home),encoding:'utf8',timeout:effective,killSignal:'SIGKILL',maxBuffer:MAX/2,shell:false});
  const out=String(r.stdout??'')+'\n'+String(r.stderr??'');if(Buffer.byteLength(out)>MAX)fail('sandbox_command_output_bound');
  return {ok:!r.error&&!r.signal&&r.status===0,stdout:String(r.stdout??''),namespaceDenied:namespaceRefusal(out),exit:Number.isInteger(r.status)?r.status:null,signal:r.signal??null,outputSha256:hash(out)};
  };}
@@ -92,6 +93,39 @@ async function diagnoseSystemTrust(){
  finally{evidence.finishedAt=new Date().toISOString();save();console.log(JSON.stringify(evidence));}
 }
 
+export function profileProvenance(){const p=PROFILE_CONTRACT;return {schema:p.schema,keyFingerprint:p.keyFingerprint,releaseSha256:p.releaseSha256,releaseSignatureSha256:p.releaseSignatureSha256,packagesIndexSha256:p.packagesIndexSha256,package:p.package,apparmorPackage:p.apparmorPackage,profile:p.profile};}
+export function validateAuthenticatedProfile(bytes){if(!Buffer.isBuffer(bytes)||bytes.length!==PROFILE_CONTRACT.profile.bytes||hash(bytes)!==PROFILE_CONTRACT.profile.sha256)fail('sandbox_authenticated_profile_mismatch');return bytes;}
+export function readAuthenticatedProfile(path){
+ const fd=openSync(path,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);try{const a=fstatSync(fd),named=lstatSync(path);if(!a.isFile()||a.nlink!==1||a.size!==PROFILE_CONTRACT.profile.bytes||a.dev!==named.dev||a.ino!==named.ino||named.isSymbolicLink())fail('sandbox_untrusted_profile_identity');const bytes=Buffer.alloc(a.size+1);let n=0;for(;;){const count=readSync(fd,bytes,n,bytes.length-n,null);n+=count;if(count===0||n===bytes.length)break;}const b=fstatSync(fd),last=lstatSync(path);if(n!==a.size||['dev','ino','size','mtimeMs','ctimeMs'].some(k=>a[k]!==b[k]||b[k]!==last[k])||last.nlink!==1||!last.isFile()||last.isSymbolicLink())fail('sandbox_untrusted_profile_changed');return validateAuthenticatedProfile(bytes.subarray(0,n));}finally{closeSync(fd);}
+}
+function trustedDirectory(path){for(let p=path;;p=dirname(p)){const st=lstatSync(p);if(!st.isDirectory()||st.isSymbolicLink()||st.uid!==0||(st.mode&0o022)!==0||realpathSync(p)!==p)fail('sandbox_include_directory_unsafe');if(p==='/')break;}return lstatSync(path);}
+export function includeDirectives(raw){
+ const rows=[];for(const line of raw.toString('utf8').split('\n')){if(!/^\s*(?:#\s*)?(?:include|abi)\b/.test(line))continue;const m=line.match(/^\s*(?:#\s*)?(include(?:\s+if\s+exists)?|abi)\s+<([A-Za-z0-9_./-]+)>\s*,?\s*(?:#.*)?$/);if(!m||m[2].split('/').some(x=>x==='..'||x==='.'||!x))fail('sandbox_include_syntax_unknown');rows.push({path:m[2],optional:m[1].includes('if exists')});}return rows;
+}
+export function verifyProfileIncludeClosure(profile){
+ validateAuthenticatedProfile(profile);const root=PROFILE_CONTRACT.includeRoot,rows=[],seen=new Set(),active=new Set();let total=0;
+ const file=path=>{const pin=PROFILE_CONTRACT.trustedFiles[path];if(!pin)fail('sandbox_include_unpinned');const bytes=trustedFile(path,2*1024**2);if(bytes.length!==pin.bytes||hash(bytes)!==pin.sha256)fail('sandbox_include_changed');total+=bytes.length;if(total>262144)fail('sandbox_include_total_bound');rows.push({path,type:'file',bytes:bytes.length,sha256:hash(bytes)});return bytes;};
+ const config=file(PROFILE_CONTRACT.parserConfig);if(config.toString().split('\n').some(x=>x.trim()&&!x.trimStart().startsWith('#')))fail('sandbox_parser_config_active');
+ const parserPin=PROFILE_CONTRACT.trustedFiles['/usr/sbin/apparmor_parser'],parser=trustedFile('/usr/sbin/apparmor_parser',2*1024**2);if(parser.length!==parserPin.bytes||hash(parser)!==parserPin.sha256)fail('sandbox_parser_unpinned');
+ const walk=(path,optional,depth)=>{if(depth>16||rows.length>64||active.has(path))fail('sandbox_include_cycle_or_bound');if(seen.has(path))return;seen.add(path);let st;try{st=lstatSync(path);}catch(e){if(e.code!=='ENOENT'||!optional)throw e;let parent=dirname(path);for(;;){try{lstatSync(parent);break;}catch(error){if(error.code!=='ENOENT')throw error;parent=dirname(parent);}}trustedDirectory(parent);rows.push({path,type:'absent'});return;}active.add(path);if(st.isDirectory()){trustedDirectory(path);if(!PROFILE_CONTRACT.trustedDirectories.includes(path))fail('sandbox_include_directory_unpinned');const names=readdirSync(path).sort();if(names.length>32)fail('sandbox_include_directory_bound');rows.push({path,type:'directory',names});for(const n of names){if(!/^[A-Za-z0-9_.-]+$/.test(n)||n.startsWith('.'))fail('sandbox_include_name_unknown');walk(join(path,n),false,depth+1);}}else{const raw=file(path);for(const row of includeDirectives(raw))walk(join(root,row.path),row.optional,depth+1);}active.delete(path);};
+ trustedDirectory(root);for(const row of includeDirectives(profile))walk(join(root,row.path),row.optional,0);if(JSON.stringify(rows)!==JSON.stringify(PROFILE_CONTRACT.expectedIncludeClosureRows))fail('sandbox_include_closure_changed');return {schema:'paperclip.profile-include-closure.v1',includeRoot:root,parserSha256:hash(parser),parserConfigSha256:hash(config),cacheDisabled:true,rows};
+}
+function rootMetadata(path,run){const r=run('/usr/bin/sudo',['-n','/usr/bin/stat','--printf=%u:%g:%a:%h:%s:%d:%i:%F','--',path]);if(!r.ok)fail('sandbox_root_stage_metadata');const v=r.stdout.split(':');if(v.length!==8||!v.slice(0,7).every(x=>/^[0-9]+$/.test(x)))fail('sandbox_root_stage_metadata');return {uid:Number(v[0]),gid:Number(v[1]),mode:parseInt(v[2],8),nlink:Number(v[3]),bytes:Number(v[4]),dev:Number(v[5]),ino:Number(v[6]),type:v[7]};}
+export function validateRootStageMetadata(dir,file,expected){if(dir.uid!==0||dir.gid!==0||dir.mode!==0o700||dir.type!=='directory'||file.uid!==0||file.gid!==0||(file.mode&0o6022)!==0||file.type!=='regular file'||file.nlink!==1||file.bytes!==expected.bytes||!Number.isSafeInteger(dir.ino)||!Number.isSafeInteger(file.ino)||dir.ino<=0||file.ino<=0)fail('sandbox_root_stage_unsafe');return true;}
+export function verifyRootStage(stage,run){const dir=rootMetadata(stage.directory,run),file=rootMetadata(stage.path,run),r=run('/usr/bin/sudo',['-n','/usr/bin/sha256sum','--',stage.path]);validateRootStageMetadata(dir,file,PROFILE_CONTRACT.profile);if(!r.ok||r.stdout!==PROFILE_CONTRACT.profile.sha256+'  '+stage.path+'\n'||['dev','ino','mode','uid','gid'].some(k=>dir[k]!==stage.dir[k]||file[k]!==stage.file[k]))fail('sandbox_root_stage_changed');return true;}
+export function stageAuthenticatedProfile(bytes,source,run){
+ validateAuthenticatedProfile(bytes);if(!/^[a-f0-9]{40}$/.test(source??''))fail('sandbox_stage_source_invalid');trustedDirectory('/etc/apparmor.d');const directory='/etc/apparmor.d/.paperclip-native-'+source.slice(0,12),path=directory+'/profile';try{lstatSync(directory);fail('sandbox_root_stage_exists');}catch(e){if(e.code!=='ENOENT')throw e;}
+ for(const binary of ['/usr/bin/sudo','/usr/bin/mkdir','/usr/bin/tee','/usr/bin/stat','/usr/bin/sha256sum','/usr/bin/install'])trustedFile(binary,16*1024**2);
+ let r=run('/usr/bin/sudo',['-n','/usr/bin/mkdir','--mode=0700','--',directory]);if(!r.ok)fail('sandbox_root_stage_create');const dir=rootMetadata(directory,run);if(dir.uid!==0||dir.gid!==0||dir.mode!==0o700||dir.type!=='directory')fail('sandbox_root_stage_unsafe');
+ r=run('/usr/bin/sudo',['-n','/usr/bin/tee','--',path],bytes);if(!r.ok||!Buffer.from(r.stdout).equals(bytes))fail('sandbox_root_stage_write');const file=rootMetadata(path,run);validateRootStageMetadata(dir,file,PROFILE_CONTRACT.profile);const stage={directory,path,dir,file};verifyRootStage(stage,run);stage.proof={schema:'paperclip.authenticated-root-profile-stage.v1',directory,path,dir,file,sha256:hash(bytes),exclusiveDirectory:true,inputAuthenticated:true,rootDigestVerified:true,identityBookends:true};return stage;
+}
+function readLoadedPolicy(run){const a=run('/usr/bin/sudo',['-n','/usr/bin/cat','/sys/kernel/security/apparmor/profiles']),tree=run('/usr/bin/sudo',['-n','/usr/bin/find','/sys/kernel/security/apparmor/policy/profiles','-type','f','(','-name','name','-o','-name','attach',')','-exec','/usr/bin/grep','-H','^','{}','+']),b=run('/usr/bin/sudo',['-n','/usr/bin/cat','/sys/kernel/security/apparmor/profiles']);if(!a.ok||!tree.ok||!b.ok||a.stdout!==b.stdout)fail('sandbox_loaded_policy_unknown');return {names:a.stdout,tree:tree.stdout};}
+export function validateLoadedProfileDelta(before,after){
+ const lines=x=>x.trim().split('\n').filter(Boolean),old=lines(before.names).sort(),now=lines(after.names),added=now.filter(x=>!old.includes(x));if(added.length!==2||!PROFILE_CONTRACT.profileNames.every(n=>added.includes(n+' (enforce)'))||old.some(x=>!now.includes(x)))fail('sandbox_profile_load_unproven');
+ const parse=text=>{const rows=new Map();for(const line of text.trim().split('\n').filter(Boolean)){const m=line.match(/^\/sys\/kernel\/security\/apparmor\/policy\/profiles\/(.+)\/(name|attach):(.*)$/);if(!m)fail('sandbox_loaded_attachments_unknown');const row=rows.get(m[1])??{};if(Object.hasOwn(row,m[2]))fail('sandbox_loaded_attachments_duplicate');row[m[2]]=m[3];rows.set(m[1],row);}return rows;};
+ const a=parse(before.tree),b=parse(after.tree);if(b.size!==a.size+2||b.size!==now.length)fail('sandbox_profile_load_unproven');for(const [id,row]of a)if(JSON.stringify(b.get(id))!==JSON.stringify(row))fail('sandbox_loaded_policy_changed');const extra=[...b].filter(([id])=>!a.has(id)).map(([,row])=>row);if(!extra.some(x=>x.name==='bwrap'&&x.attach==='/usr/bin/bwrap')||!extra.some(x=>x.name==='unpriv_bwrap'&&['','<unknown>','unpriv_bwrap'].includes(x.attach)))fail('sandbox_profile_load_unproven');return true;
+}
+
 function nativeElfDigest(path){
  const fd=openSync(path,'r');try{const before=fstatSync(fd),digest=createHash('sha256'),chunk=Buffer.alloc(1024*1024);if(!before.isFile()||before.size<4||before.size>512*1024**2)fail('sandbox_codex_elf_bound');let offset=0;for(;;){const n=readSync(fd,chunk,0,chunk.length,null);if(!n)break;if(offset===0&&!chunk.subarray(0,4).equals(Buffer.from([127,69,76,70])))fail('sandbox_codex_elf_required');offset+=n;digest.update(chunk.subarray(0,n));}const after=fstatSync(fd);if(offset!==before.size||after.dev!==before.dev||after.ino!==before.ino||after.size!==before.size||after.mtimeMs!==before.mtimeMs)fail('sandbox_codex_elf_changed');return digest.digest('hex');}finally{closeSync(fd);}
 }
@@ -121,22 +155,19 @@ export async function qualifyNativeSandbox({workspace,root,ambient=process.env,o
    if(after.apparmor&&after.restrictedUserns===1){
     sandboxRepairDecision(after,'namespace_denied');
     const profileDeadline=Math.min(deadline,Date.now()+SANDBOX_LIMITS.profileMs),profileRun=(binary,args)=>run(binary,args,Math.max(1,profileDeadline-Date.now()));
-    const packaged='/usr/share/apparmor/extra-profiles/bwrap-userns-restrict',destination='/etc/apparmor.d/bwrap-userns-restrict',bytes=trustedFile(packaged);
-    const verified=profileRun('/usr/bin/dpkg',['--verify','apparmor-profiles']);if(!verified.ok||verified.stdout.trim())fail('sandbox_packaged_profile_unverified');
-    const text=bytes.toString('utf8'),m=text.match(/^profile\s+([A-Za-z0-9_.-]+)\s+\/usr\/bin\/bwrap\s+flags=\(unconfined\)\s*\{/m);if(!m||!/^\s*userns,\s*$/m.test(text))fail('sandbox_packaged_profile_unsupported');
-    const loaded=profileRun('/usr/bin/sudo',['-n','/usr/bin/cat','/sys/kernel/security/apparmor/profiles']);if(!loaded.ok)fail('sandbox_loaded_policy_unknown');
-    const tree=profileRun('/usr/bin/sudo',['-n','/usr/bin/find','/sys/kernel/security/apparmor/policy/profiles','-type','f','(','-name','name','-o','-name','attach',')','-exec','/usr/bin/grep','-H','^','{}','+']);
-    if(!tree.ok)fail('sandbox_loaded_attachments_unknown');
-    const inventory=inspectLoadedAttachments(loaded.stdout,tree.stdout,m[1]);
-    const bookend=profileRun('/usr/bin/sudo',['-n','/usr/bin/cat','/sys/kernel/security/apparmor/profiles']);if(!bookend.ok||bookend.stdout!==loaded.stdout)fail('sandbox_loaded_policy_changed');
-    const targetLoaded=inventory.conflict;
+    const packaged='/usr/share/apparmor/extra-profiles/bwrap-userns-restrict',destination='/etc/apparmor.d/bwrap-userns-restrict';
+    const bytes=readAuthenticatedProfile(packaged),closure=verifyProfileIncludeClosure(bytes);
+    const loaded=readLoadedPolicy(profileRun);for(const name of PROFILE_CONTRACT.profileNames)if(inspectLoadedAttachments(loaded.names,loaded.tree,name).conflict)fail('sandbox_profile_policy_conflict');
     const dest=existsSync(destination)?(trustedFile(destination).equals(bytes)?'same-package-bytes':'divergent'):'absent';
-    const action=profileLoadDecision({packagedVerified:true,destination:dest,loaded:targetLoaded?'unknown-preexisting':'absent',localOverride:existsSync('/etc/apparmor.d/local/bwrap')||existsSync('/etc/apparmor.d/local/'+m[1])||[...text.matchAll(/<local\/([A-Za-z0-9_.-]+)>/g)].some(row=>existsSync('/etc/apparmor.d/local/'+row[1]))});
-    receipt.profile={package:'apparmor-profiles',sha256:hash(bytes),destination:dest,loadedBefore:false};save();
-    if(action==='install-and-load'){const r=profileRun('/usr/bin/sudo',['-n','/usr/bin/install','-m','0644',packaged,destination]);if(!r.ok)fail('sandbox_profile_install_failed');receipt.operations.push('packaged-bwrap-profile-installed');}
-    if(!trustedFile(packaged).equals(bytes)||!trustedFile(destination).equals(bytes))fail('sandbox_profile_changed');
-    const load=profileRun('/usr/bin/sudo',['-n','/usr/sbin/apparmor_parser','-r',destination]);if(!load.ok)fail('sandbox_profile_load_failed');receipt.operations.push('packaged-bwrap-profile-loaded');
-    const finalLoaded=profileRun('/usr/bin/sudo',['-n','/usr/bin/cat','/sys/kernel/security/apparmor/profiles']);if(!finalLoaded.ok||!finalLoaded.stdout.split('\n').some(line=>line.startsWith(m[1]+' ')))fail('sandbox_profile_load_unproven');receipt.profile.loadedAfter=true;save();
+    const action=profileLoadDecision({packagedVerified:true,destination:dest,loaded:'absent',localOverride:false});
+    receipt.profile={package:'apparmor-profiles',sha256:hash(bytes),destination:dest,loadedBefore:false,provenance:profileProvenance(),includeClosure:closure};save();
+    const stage=stageAuthenticatedProfile(bytes,process.env.SOURCE_SHA,(binary,args,input)=>run(binary,args,Math.max(1,profileDeadline-Date.now()),input));receipt.profile.rootStage=stage.proof;receipt.operations.push('authenticated-bwrap-profile-staged');save();
+    if(action==='install-and-load'){const r=profileRun('/usr/bin/sudo',['-n','/usr/bin/install','-m','0644','--',stage.path,destination]);if(!r.ok)fail('sandbox_profile_install_failed');receipt.operations.push('packaged-bwrap-profile-installed');}
+    if(!readAuthenticatedProfile(packaged).equals(bytes)||!trustedFile(destination).equals(bytes)||JSON.stringify(verifyProfileIncludeClosure(bytes))!==JSON.stringify(closure))fail('sandbox_profile_changed');
+    verifyRootStage(stage,(binary,args,input)=>run(binary,args,Math.max(1,profileDeadline-Date.now()),input));
+    const again=readLoadedPolicy(profileRun);if(again.names!==loaded.names||again.tree!==loaded.tree)fail('sandbox_loaded_policy_changed');
+    const load=profileRun('/usr/bin/sudo',['-n','/usr/sbin/apparmor_parser',...PROFILE_CONTRACT.parserArgs]);if(!load.ok)fail('sandbox_profile_load_failed');receipt.operations.push('packaged-bwrap-profile-loaded');
+    const finalLoaded=readLoadedPolicy(profileRun);validateLoadedProfileDelta(loaded,finalLoaded);receipt.profile.loadedAfter=true;receipt.profile.loadedNames=[...PROFILE_CONTRACT.profileNames];receipt.profile.cacheDisabled=true;save();
    }
    receipt.postProbe=await probe();save();if(receipt.postProbe.status!=='passed')fail('sandbox_post_prerequisite_refused');
   }
