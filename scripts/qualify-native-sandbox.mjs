@@ -398,6 +398,31 @@ export function validateLoadedProfileDelta(before,after){
  if(!observation.accepted)throw Object.assign(Error(observation.code),{sandboxCode:observation.code,sandboxDiagnostic:observation});
  return true;
 }
+export function canProbeOpaqueBwrapAttachment(delta){
+ if(delta?.schema!=='paperclip.native-policy-delta-observation.v1'||delta.branch!=='target-attachment'
+  ||delta.code!=='sandbox_profile_load_unproven'||delta.accepted!==false)return false;
+ const {names:n,attachments:a,targets}=delta;
+ if(!n||!a||!Number.isSafeInteger(n.before)||n.before<1||n.after!==n.before+2
+  ||n.added!==2||n.removed!==0||n.beforeUnique!==n.before||n.afterUnique!==n.after||n.targetModesPresent!==true
+  ||a.before!==n.before||a.after!==n.after||a.added!==2||a.removed!==0||a.changed!==0
+  ||a.beforeParseError!==null||a.afterParseError!==null||a.parseComplete!==true
+  ||a.rowCountMatchesNames!==true||a.rowCountGrewByTwo!==true||a.beforeIncomplete!==0||a.afterIncomplete!==0
+  ||a.bwrapAttachment!==false||a.unprivilegedAttachment!==true||!Array.isArray(targets)||targets.length!==2)return false;
+ return [['bwrap','<unknown>'],['unpriv_bwrap','unpriv_bwrap']].every(([name,attachment],index)=>{
+  const target=targets[index],row=target?.rows?.[0];
+  return target?.name===name&&target.oldNames===0&&target.currentEnforcingNames===1
+   &&target.attachmentRows===1&&Array.isArray(target.rows)&&target.rows.length===1&&row?.newRow===true&&row.attachment?.text===attachment;
+ });
+}
+export function bindOpaqueBwrapProbe({loaded,readback,probe,expectedBwrapSha256}){
+ if(probe?.status!=='passed')fail('sandbox_post_prerequisite_refused');
+ const proof=validateProbeReceipt(probe.proof);
+ if(proof.bwrapSha256!==expectedBwrapSha256)fail('sandbox_bwrap_changed');
+ if(loaded.names!==readback.names||loaded.tree!==readback.tree)fail('sandbox_policy_changed_during_probe');
+ return {schema:'paperclip.opaque-native-bwrap-attachment-proof.v1',bwrapPath:proof.bwrapPath,
+  bwrapSha256:proof.bwrapSha256,executionLabelChallengeSha256:proof.executionLabel.challengeSha256,
+  namesSha256:hash(readback.names),attachmentsSha256:hash(readback.tree),policyUnchangedAcrossProbe:true};
+}
 
 function nativeElfDigest(path){
  const fd=openSync(path,'r');try{const before=fstatSync(fd),digest=createHash('sha256'),chunk=Buffer.alloc(1024*1024);if(!before.isFile()||before.size<4||before.size>512*1024**2)fail('sandbox_codex_elf_bound');let offset=0;for(;;){const n=readSync(fd,chunk,0,chunk.length,null);if(!n)break;if(offset===0&&!chunk.subarray(0,4).equals(Buffer.from([127,69,76,70])))fail('sandbox_codex_elf_required');offset+=n;digest.update(chunk.subarray(0,n));}const after=fstatSync(fd);if(offset!==before.size||after.dev!==before.dev||after.ino!==before.ino||after.size!==before.size||after.mtimeMs!==before.mtimeMs)fail('sandbox_codex_elf_changed');return digest.digest('hex');}finally{closeSync(fd);}
@@ -427,6 +452,7 @@ export async function qualifyNativeSandbox({workspace,root,ambient=process.env,o
   if(postAcquisitionDiagnostic&&decision==='none'){receipt.status='diagnostic-observed';save();return receipt;}
   if(policyDeltaDiagnostic&&decision==='none'){receipt.status='diagnostic-inconclusive';save();return receipt;}
   if(decision!=='none'){
+   let opaqueBwrapReadback=null;
    const aptDeadline=Math.min(deadline,Date.now()+SANDBOX_LIMITS.aptMs);
    for(const args of [['update','-qq'],['install','-y','-qq','--no-install-recommends','bubblewrap','apparmor-profiles','apparmor-utils']]){const r=run('/usr/bin/sudo',['-n','/usr/bin/apt-get',...args],Math.max(1,aptDeadline-Date.now()));if(!r.ok)fail('sandbox_distro_acquisition_failed');receipt.operations.push(args[0]==='update'?'signed-distro-index':'named-distro-prerequisites');save();}
    const after=collectHostFacts(run);if(!after.bwrapPresent)fail('sandbox_distro_bwrap_missing');receipt.afterAcquisition=after;save();
@@ -452,11 +478,20 @@ export async function qualifyNativeSandbox({workspace,root,ambient=process.env,o
     const delta=inspectLoadedProfileDelta(loaded,finalLoaded);
     receipt.profile.afterAdd={namesSha256:hash(finalLoaded.names),attachmentsSha256:hash(finalLoaded.tree),targetNames:projectLoadedTargetNames(finalLoaded.names),delta};
     if(policyDeltaDiagnostic){receipt.status='diagnostic-observed';save();return receipt;}
-    if(!delta.accepted)throw Object.assign(Error(delta.code),{sandboxCode:delta.code,sandboxDiagnostic:delta});
+    if(!delta.accepted){
+     // "Unknown" is display metadata. It can lead only to the existing canary
+     // after the exact authenticated install and the complete add-only delta.
+     if(!canProbeOpaqueBwrapAttachment(delta))throw Object.assign(Error(delta.code),{sandboxCode:delta.code,sandboxDiagnostic:delta});
+     opaqueBwrapReadback=finalLoaded;
+    }
     receipt.profile.previousPolicyRowsPreserved=true;receipt.profile.addedProfileCount=2;receipt.profile.loadedAfter=true;receipt.profile.loadedNames=[...PROFILE_CONTRACT.profileNames];receipt.profile.cacheDisabled=true;save();
    }
    if(policyDeltaDiagnostic){receipt.status='diagnostic-inconclusive';save();return receipt;}
    receipt.postProbe=afterDecision==='none'?receipt.afterAcquisitionProbe:await probe();save();if(receipt.postProbe.status!=='passed')fail('sandbox_post_prerequisite_refused');
+   if(opaqueBwrapReadback){
+    receipt.profile.opaqueAttachmentProof=bindOpaqueBwrapProbe({loaded:opaqueBwrapReadback,readback:readLoadedPolicy(run),probe:receipt.postProbe,expectedBwrapSha256:after.bwrapSha256});
+    save();
+   }
   }
   receipt.after=collectHostFacts(run);receipt.globalRestrictionChanged=['apparmor','restrictedUserns','maxUserNamespaces','usernsClone','seccomp'].some(k=>receipt.before[k]!==receipt.after[k]);if(receipt.globalRestrictionChanged)fail('sandbox_global_host_policy_changed');receipt.proof=validateProbeReceipt((receipt.postProbe??receipt.initialProbe).proof);if(receipt.after.bwrapSha256!==receipt.proof.bwrapSha256||(receipt.afterAcquisitionDecision==='documented-loopback-profile-prerequisite'&&receipt.after.bwrapSha256!==receipt.afterAcquisition.bwrapSha256))fail('sandbox_bwrap_changed');receipt.status='passed';save();return receipt;
  }catch(error){receipt.status='failed';receipt.failureCode=error.sandboxCode??'sandbox_prerequisite_refused';if(error.sandboxDiagnostic)receipt.trustRefusal=error.sandboxDiagnostic;preserveSandboxFailure(error,save,summary=>console.error(JSON.stringify(summary)));}

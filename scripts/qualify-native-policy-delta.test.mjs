@@ -86,7 +86,7 @@ test('policy delta names disclose only exact target and kernel mode pairs',()=>{
 
 test('policy delta diagnostic gets one job, stops before post-load execution, and never compiles or installs',()=>{
  const load=(path)=>readFileSync(new URL(path,import.meta.url),'utf8');
- const workflow=load('../.github/workflows/native-linux-build.yml');
+ const workflow=load('./fixtures/native-policy-delta-diagnostic.yml');
  const full=load('./fixtures/native-stage-executor-full.yml');
  assert.equal(createHash('sha256').update(full).digest('hex'),'8f71f789934c76e3e775f6f51ccda8a20cdbfdc7c6776ee39889b17889572368');
  assert(workflow.includes('timeout-minutes: 12'));
