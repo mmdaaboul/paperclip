@@ -326,10 +326,77 @@ async function diagnosePolicyConflict(){
   evidence.finishedAt=new Date().toISOString();save();console.log(JSON.stringify({status:evidence.status,authority:evidence.authority,observedConflict:evidence.observedConflict}));
  }catch(error){evidence.status='diagnostic-stopped';evidence.failureCode=error.sandboxCode??'diagnostic_refused';if(error.sandboxDiagnostic)evidence.refusal=error.sandboxDiagnostic;process.exitCode=1;preserveSandboxFailure(error,()=>{evidence.finishedAt=new Date().toISOString();save();},summary=>console.error(JSON.stringify(summary)));}
 }
+const policyLines=text=>text.trim().split('\n').filter(Boolean);
+function readPolicyAttachmentRows(text){
+ const rows=new Map();
+ for(const line of policyLines(text)){
+  const match=line.match(/^\/sys\/kernel\/security\/apparmor\/policy\/profiles\/(.+)\/(name|attach):(.*)$/);
+  if(!match)return {rows,code:'sandbox_loaded_attachments_unknown'};
+  const [,id,field,value]=match;
+  const row=rows.get(id)??{};
+  if(Object.hasOwn(row,field))return {rows,code:'sandbox_loaded_attachments_duplicate'};
+  row[field]=value;
+  rows.set(id,row);
+ }
+ return {rows,code:null};
+}
+const opaquePolicyValue=value=>({sha256:hash(value),bytes:Buffer.byteLength(value)});
+const targetAttachmentValues=new Set(['/usr/bin/bwrap','unpriv_bwrap','<unknown>','']);
+export function projectLoadedTargetNames(text){
+ const lines=policyLines(text),modes=['enforce','complain','unconfined','kill','prompt'];
+ return PROFILE_CONTRACT.profileNames.map(name=>({
+  name,
+  entries:lines.filter(line=>line.startsWith(name+' ')).slice(0,4).map(line=>
+   modes.some(mode=>line===name+' ('+mode+')')?{text:line}:opaquePolicyValue(line)),
+ }));
+}
+export function inspectLoadedProfileDelta(before,after){
+ const old=policyLines(before.names),now=policyLines(after.names);
+ const oldNames=new Set(old),currentNames=new Set(now);
+ const added=now.filter(name=>!oldNames.has(name)),removed=old.filter(name=>!currentNames.has(name));
+ const targetNames=PROFILE_CONTRACT.profileNames;
+ const targetModesPresent=targetNames.every(name=>added.includes(name+' (enforce)'));
+ const namesAccepted=added.length===2&&targetModesPresent&&removed.length===0;
+ const previous=readPolicyAttachmentRows(before.tree),current=readPolicyAttachmentRows(after.tree);
+ const a=previous.rows,b=current.rows;
+ const extra=[...b].filter(([id])=>!a.has(id)).map(([,row])=>row);
+ const missingRows=[...a.keys()].filter(id=>!b.has(id));
+ const changedRows=[...a].filter(([id,row])=>b.has(id)&&JSON.stringify(b.get(id))!==JSON.stringify(row));
+ const parseComplete=previous.code===null&&current.code===null;
+ const rowCountMatchesNames=b.size===now.length;
+ const rowCountGrewByTwo=b.size===a.size+2;
+ const bwrapAttachment=extra.some(row=>row.name==='bwrap'&&row.attach==='/usr/bin/bwrap');
+ const unprivilegedAttachment=extra.some(row=>row.name==='unpriv_bwrap'&&['','<unknown>','unpriv_bwrap'].includes(row.attach));
+ let branch=null,code=null;
+ if(!namesAccepted){branch='profile-names-delta';code='sandbox_profile_load_unproven';}
+ else if(!parseComplete){branch=previous.code?'before-attachment-parse':'after-attachment-parse';code=previous.code??current.code;}
+ else if(!rowCountGrewByTwo||!rowCountMatchesNames){branch='attachment-row-count';code='sandbox_profile_load_unproven';}
+ else if(missingRows.length||changedRows.length){branch='previous-attachment-rows-changed';code='sandbox_loaded_policy_changed';}
+ else if(!bwrapAttachment||!unprivilegedAttachment){branch='target-attachment';code='sandbox_profile_load_unproven';}
+ const targets=targetNames.map(name=>{
+  const rows=[...b].filter(([,row])=>row.name===name);
+  return {name,oldNames:old.filter(line=>line.startsWith(name+' ')).length,
+   currentEnforcingNames:now.filter(line=>line===name+' (enforce)').length,
+   attachmentRows:rows.length,
+   rows:rows.slice(0,4).map(([id,row])=>({newRow:!a.has(id),attachment:Object.hasOwn(row,'attach')?(targetAttachmentValues.has(row.attach)?{text:row.attach}:opaquePolicyValue(row.attach)):null})),
+  };
+ });
+ return {schema:'paperclip.native-policy-delta-observation.v1',branch,code,accepted:code===null,
+  names:{before:old.length,after:now.length,added:added.length,removed:removed.length,
+   beforeUnique:oldNames.size,afterUnique:currentNames.size,targetModesPresent,
+   changes:{added:added.slice(0,8).map(opaquePolicyValue),removed:removed.slice(0,8).map(opaquePolicyValue)}},
+  attachments:{before:a.size,after:b.size,added:extra.length,removed:missingRows.length,changed:changedRows.length,
+   beforeParseError:previous.code,afterParseError:current.code,parseComplete,rowCountMatchesNames,rowCountGrewByTwo,
+   beforeIncomplete:[...a.values()].filter(row=>!Object.hasOwn(row,'name')||!Object.hasOwn(row,'attach')).length,
+   afterIncomplete:[...b.values()].filter(row=>!Object.hasOwn(row,'name')||!Object.hasOwn(row,'attach')).length,
+   bwrapAttachment,unprivilegedAttachment},
+  targets,
+ };
+}
 export function validateLoadedProfileDelta(before,after){
- const lines=x=>x.trim().split('\n').filter(Boolean),old=lines(before.names).sort(),now=lines(after.names),added=now.filter(x=>!old.includes(x));if(added.length!==2||!PROFILE_CONTRACT.profileNames.every(n=>added.includes(n+' (enforce)'))||old.some(x=>!now.includes(x)))fail('sandbox_profile_load_unproven');
- const parse=text=>{const rows=new Map();for(const line of text.trim().split('\n').filter(Boolean)){const m=line.match(/^\/sys\/kernel\/security\/apparmor\/policy\/profiles\/(.+)\/(name|attach):(.*)$/);if(!m)fail('sandbox_loaded_attachments_unknown');const row=rows.get(m[1])??{};if(Object.hasOwn(row,m[2]))fail('sandbox_loaded_attachments_duplicate');row[m[2]]=m[3];rows.set(m[1],row);}return rows;};
- const a=parse(before.tree),b=parse(after.tree);if(b.size!==a.size+2||b.size!==now.length)fail('sandbox_profile_load_unproven');for(const [id,row]of a)if(JSON.stringify(b.get(id))!==JSON.stringify(row))fail('sandbox_loaded_policy_changed');const extra=[...b].filter(([id])=>!a.has(id)).map(([,row])=>row);if(!extra.some(x=>x.name==='bwrap'&&x.attach==='/usr/bin/bwrap')||!extra.some(x=>x.name==='unpriv_bwrap'&&['','<unknown>','unpriv_bwrap'].includes(x.attach)))fail('sandbox_profile_load_unproven');return true;
+ const observation=inspectLoadedProfileDelta(before,after);
+ if(!observation.accepted)throw Object.assign(Error(observation.code),{sandboxCode:observation.code,sandboxDiagnostic:observation});
+ return true;
 }
 
 function nativeElfDigest(path){
@@ -348,7 +415,7 @@ export function collectHostFacts(run){
  return validateSandboxHost({os:value('ID'),release:value('VERSION_ID'),kernelRelease:/^[A-Za-z0-9_.+\-]{1,128}$/.test(kernelRelease())?kernelRelease():null,uid:process.getuid(),bwrapPresent,bwrapTrusted,bwrapPackageOwned,bwrapSha256,bwrapVersion,bwrapPackageVersion,bwrapMode,bwrapSystemLaunchSupported,apparmor:optional('/sys/module/apparmor/parameters/enabled')==='Y',restrictedUserns:number('/proc/sys/kernel/apparmor_restrict_unprivileged_userns'),maxUserNamespaces:number('/proc/sys/user/max_user_namespaces'),usernsClone:number('/proc/sys/kernel/unprivileged_userns_clone'),seccomp:Number(status.match(/^Seccomp:\s+(\d+)$/m)?.[1]??-1)});
 }
 function hosted(e){if(process.platform!=='linux'||process.arch!=='x64'||e.GITHUB_REPOSITORY!=='mmdaaboul/paperclip'||e.GITHUB_JOB!=='selected_native_source'||e.GITHUB_ACTIONS!=='true'||e.RUNNER_ENVIRONMENT!=='github-hosted')fail('sandbox_disposable_job_only');}
-export async function qualifyNativeSandbox({workspace,root,ambient=process.env,onReceipt=()=>{},postAcquisitionDiagnostic=false}){
+export async function qualifyNativeSandbox({workspace,root,ambient=process.env,onReceipt=()=>{},postAcquisitionDiagnostic=false,policyDeltaDiagnostic=false}){
  hosted(ambient);const deadline=Date.now()+SANDBOX_LIMITS.aggregateMs,run=runner(deadline,root);
  const receipt={schema:'paperclip.native-sandbox-prerequisite.v1',status:'running',normalUser:true,retry:false,productionPolicyChanged:false,globalRestrictionChanged:false,initialProbe:null,postProbe:null,operations:[]};
  const save=()=>{assert(Buffer.byteLength(JSON.stringify(receipt))<=MAX);onReceipt(receipt);};
@@ -358,6 +425,7 @@ export async function qualifyNativeSandbox({workspace,root,ambient=process.env,o
   receipt.initialProbe=receipt.before.bwrapPresent?await probe():{status:'not-run-missing-distro-bwrap'};save();
   const decision=sandboxRepairDecision(receipt.before,receipt.initialProbe.status);receipt.decision=decision;save();
   if(postAcquisitionDiagnostic&&decision==='none'){receipt.status='diagnostic-observed';save();return receipt;}
+  if(policyDeltaDiagnostic&&decision==='none'){receipt.status='diagnostic-inconclusive';save();return receipt;}
   if(decision!=='none'){
    const aptDeadline=Math.min(deadline,Date.now()+SANDBOX_LIMITS.aptMs);
    for(const args of [['update','-qq'],['install','-y','-qq','--no-install-recommends','bubblewrap','apparmor-profiles','apparmor-utils']]){const r=run('/usr/bin/sudo',['-n','/usr/bin/apt-get',...args],Math.max(1,aptDeadline-Date.now()));if(!r.ok)fail('sandbox_distro_acquisition_failed');receipt.operations.push(args[0]==='update'?'signed-distro-index':'named-distro-prerequisites');save();}
@@ -380,8 +448,14 @@ export async function qualifyNativeSandbox({workspace,root,ambient=process.env,o
     const again=readLoadedPolicy(profileRun);if(again.names!==loaded.names||again.tree!==loaded.tree)fail('sandbox_loaded_policy_changed');
     const load=profileRun('/usr/bin/sudo',['-n','/usr/sbin/apparmor_parser',...validateAddOnlyParserArgs(PROFILE_CONTRACT.parserArgs)]);receipt.profile.addOnlyLoad={ok:load.ok,exit:load.exit,signal:load.signal,outputSha256:load.outputSha256,policyAlreadyExists:load.policyAlreadyExists,mode:'add-only-no-fallback'};
     if(!load.ok){const error=Object.assign(Error('sandbox_profile_add_failed'),{sandboxCode:'sandbox_profile_add_failed',sandboxDiagnostic:receipt.profile.addOnlyLoad});preserveSandboxFailure(error,save,summary=>console.error(JSON.stringify(summary)));}receipt.operations.push('packaged-bwrap-profile-loaded');
-    const finalLoaded=readLoadedPolicy(profileRun);receipt.profile.afterAdd={namesSha256:hash(finalLoaded.names),attachmentsSha256:hash(finalLoaded.tree),targetNames:PROFILE_CONTRACT.profileNames.map(n=>({name:n,entries:finalLoaded.names.split('\n').filter(x=>x.startsWith(n+' ')).map(policyText)}))};try{validateLoadedProfileDelta(loaded,finalLoaded);}catch(error){error.sandboxDiagnostic=receipt.profile.afterAdd;preserveSandboxFailure(error,save,summary=>console.error(JSON.stringify(summary)));}receipt.profile.previousPolicyRowsPreserved=true;receipt.profile.addedProfileCount=2;receipt.profile.loadedAfter=true;receipt.profile.loadedNames=[...PROFILE_CONTRACT.profileNames];receipt.profile.cacheDisabled=true;save();
+    const finalLoaded=readLoadedPolicy(profileRun);
+    const delta=inspectLoadedProfileDelta(loaded,finalLoaded);
+    receipt.profile.afterAdd={namesSha256:hash(finalLoaded.names),attachmentsSha256:hash(finalLoaded.tree),targetNames:projectLoadedTargetNames(finalLoaded.names),delta};
+    if(policyDeltaDiagnostic){receipt.status='diagnostic-observed';save();return receipt;}
+    if(!delta.accepted)throw Object.assign(Error(delta.code),{sandboxCode:delta.code,sandboxDiagnostic:delta});
+    receipt.profile.previousPolicyRowsPreserved=true;receipt.profile.addedProfileCount=2;receipt.profile.loadedAfter=true;receipt.profile.loadedNames=[...PROFILE_CONTRACT.profileNames];receipt.profile.cacheDisabled=true;save();
    }
+   if(policyDeltaDiagnostic){receipt.status='diagnostic-inconclusive';save();return receipt;}
    receipt.postProbe=afterDecision==='none'?receipt.afterAcquisitionProbe:await probe();save();if(receipt.postProbe.status!=='passed')fail('sandbox_post_prerequisite_refused');
   }
   receipt.after=collectHostFacts(run);receipt.globalRestrictionChanged=['apparmor','restrictedUserns','maxUserNamespaces','usernsClone','seccomp'].some(k=>receipt.before[k]!==receipt.after[k]);if(receipt.globalRestrictionChanged)fail('sandbox_global_host_policy_changed');receipt.proof=validateProbeReceipt((receipt.postProbe??receipt.initialProbe).proof);if(receipt.after.bwrapSha256!==receipt.proof.bwrapSha256||(receipt.afterAcquisitionDecision==='documented-loopback-profile-prerequisite'&&receipt.after.bwrapSha256!==receipt.afterAcquisition.bwrapSha256))fail('sandbox_bwrap_changed');receipt.status='passed';save();return receipt;

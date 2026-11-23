@@ -66,7 +66,7 @@ export function runSelectedSourceGroup({execute,group,workspace,report,commandFa
   throw original;
  }
 }
-async function qualify(diagnostic=false){
+async function qualify(diagnostic=null){
  validateTarget(process.env);assert(process.platform==='linux'&&process.arch==='x64'&&process.getuid()>0);const e=process.env,workspace=realpathSync(process.cwd()),root=join(realpathSync(e.RUNNER_TEMP),'f10-native-source');assert(!existsSync(root),'fresh_source_root_required');mkdirSync(root,{mode:0o700});const home=join(root,'home'),tmp=join(root,'tmp');mkdirSync(home,{mode:0o700});mkdirSync(tmp,{mode:0o700});mkdirSync(join(tmp,'bin'),{mode:0o700});
  const contractBytes=readFileSync(join(workspace,'scripts/native-selected-source-contract.json')),contract=validateSourceContract(JSON.parse(contractBytes));
  const evidence={schema:'paperclip.native-selected-qualification.v2',sourceRevision:e.SOURCE_SHA,status:'running',phase:'frozen-native-build',retry:false,contractSha256:hash(contractBytes),lockSha256:hash(readFileSync(join(workspace,'pnpm-lock.yaml'))),claudePatchSha256:hash(readFileSync(join(workspace,'patches/@agentclientprotocol__claude-agent-acp@0.73.0.patch'))),groups:[],liveProviderAcceptance:false,optionalSdkKernelCampaign:false,...(diagnostic?{authority:'DIAGNOSTIC_ONLY_NOT_QUALIFICATION'}:{})};
@@ -78,8 +78,13 @@ async function qualify(diagnostic=false){
   evidence.capacity=[nativeCapacity(root,contract.resources.sourceBuild,'before-native-source-build')];save();assert.equal(command('git',['rev-parse','HEAD']).trim(),e.SOURCE_SHA);command('git',['diff','--exit-code','HEAD','--']);
   command('corepack',['enable','pnpm','--install-directory',join(tmp,'bin')]);env.PATH=join(tmp,'bin')+':'+env.PATH;
   command('corepack',['pnpm','install','--frozen-lockfile'],workspace,600000);
-  evidence.phase='native-sandbox-prerequisite';save();await qualifyNativeSandbox({workspace,root,ambient:e,onReceipt:r=>{evidence.sandboxPrerequisite=r;save();},postAcquisitionDiagnostic:diagnostic});
-  if(diagnostic){evidence.phase='native-launch-transport-observed';const receipt=evidence.sandboxPrerequisite;const probe=receipt.afterAcquisitionProbe??receipt.initialProbe;evidence.status=probe?.transport?'diagnostic-completed':'diagnostic-inconclusive';return;}
+  evidence.phase='native-sandbox-prerequisite';save();await qualifyNativeSandbox({workspace,root,ambient:e,onReceipt:r=>{evidence.sandboxPrerequisite=r;save();},postAcquisitionDiagnostic:diagnostic==='launch-transport',policyDeltaDiagnostic:diagnostic==='policy-delta'});
+  if(diagnostic==='launch-transport'){evidence.phase='native-launch-transport-observed';const receipt=evidence.sandboxPrerequisite;const probe=receipt.afterAcquisitionProbe??receipt.initialProbe;evidence.status=probe?.transport?'diagnostic-completed':'diagnostic-inconclusive';return;}
+  if(diagnostic==='policy-delta'){
+   evidence.phase='native-policy-delta-observed';
+   evidence.status=evidence.sandboxPrerequisite.profile?.afterAdd?.delta?'diagnostic-completed':'diagnostic-inconclusive';
+   return;
+  }
   evidence.phase='frozen-native-build';save();
   command('corepack',['pnpm','-r','--workspace-concurrency=1','--filter','@paperclipai/server...','--if-present','run','build'],workspace,1500000,{PAPERCLIP_BUILD_COMMIT:e.SOURCE_SHA,PAPERCLIP_README_ASSET_REF:e.SOURCE_SHA,GH_TOKEN:e.NATIVE_INSTALL_GITHUB_TOKEN});
   command('git',['diff','--exit-code','HEAD','--']);const dependency=readClaudeDependencyFacts(join(workspace,'packages/paperclip-runner/package.json'),workspace);evidence.claudeRuntime={...dependency,frozenPatchedDependency:true};evidence.nativeWorkspaceBuild=true;evidence.capacity.push(nativeCapacity(root,contract.resources.sourceTests,'before-selected-source-tests'));save();const deadline=Date.now()+20*60*1000;
@@ -95,6 +100,7 @@ async function qualify(diagnostic=false){
 if(process.argv[1]&&resolve(process.argv[1])===fileURLToPath(import.meta.url)){
  const mode=process.argv.slice(2);
  if(mode.length===0)await qualify();
- else if(mode.length===1&&mode[0]==='--diagnose-launch-transport')await qualify(true);
+ else if(mode.length===1&&mode[0]==='--diagnose-launch-transport')await qualify('launch-transport');
+ else if(mode.length===1&&mode[0]==='--diagnose-policy-delta')await qualify('policy-delta');
  else throw Error('native_source_command_closed');
 }
