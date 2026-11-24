@@ -907,6 +907,146 @@ describe("actual normal PATCH + native postgres-js + native issue service (injec
     await service.reconcileStrandedAssignedIssues({companyId:f.company.id,issueId:f.issue.id,skipRelatedRecovery:true,skipExternalConversationSettlement:true});
     expect(enqueueWakeup).not.toHaveBeenCalled();expect((await f.ledger()).admissions).toHaveLength(1);
   });
+  it.each(["current", "changed_stage", "changed_workspace", "operator_stop", "active_successor",
+    "different_receipt", "duplicate_receipt", "previous_reviewer_run", "scheduling_suppressed",
+    "paused_reviewer", "builder_cleanup", "cancelled_run_cleanup"] as const)(
+    "resumes only the original deferred native Reviewer after the former Builder releases: %s", async (scenario) => {
+      const f = await seed();
+      for (let cycle = 1; cycle <= 4; cycle++) {
+        const prior = await nativeCandidate(f);
+        await prior.commitNativeStatusDecision(prior.input);
+        const reviewer = await f.run(f.reviewer.id);
+        ok(await patch(await f.agentApp(f.reviewer.id, reviewer.id), f.issue.id, {
+          status: "in_progress", comment: `Request synthetic correction ${cycle}`,
+        }));
+      }
+      const base = await draftFixture(f);
+      const candidate = await nativeCandidate(base);
+      const execution = structuredClone(base.execution);
+      execution.binding.runId = candidate.runId;
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, base.runId));
+      await db.update(heartbeatRuns).set({ status: "running", startedAt: new Date(),
+        responsibleUserId: f.userId, runnerProfileJson: { nativeExecutionInput: execution },
+      }).where(eq(heartbeatRuns.id, candidate.runId));
+      const committed = await candidate.commitNativeStatusDecision(candidate.input);
+      expect(committed.issue).toMatchObject({ status: "in_review", assigneeAgentId: f.reviewer.id });
+      const [intent] = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, f.company.id), eq(agentWakeupRequests.agentId, f.reviewer.id),
+        sql`${agentWakeupRequests.payload}->>'nativeStageAdmissionId' = ${candidate.resultId}`,
+      ));
+      const [older] = await db.insert(agentWakeupRequests).values({ companyId: f.company.id,
+        agentId: f.builder.id, source: "automation", reason: "issue_execution_deferred",
+        status: "deferred_issue_execution", requestedAt: new Date(intent.requestedAt.getTime() - 1000),
+        payload: { issueId: f.issue.id, mutation: "interaction", _paperclipWakeContext: {
+          issueId: f.issue.id, wakeReason: "issue_continuation_needed",
+        } },
+      }).returning();
+      const { heartbeatService } = await import("../services/heartbeat.js");
+      await heartbeatService(db).dispatchPendingNativeStatusWakeups({ companyId: f.company.id, requestId: intent.id });
+      const [dispatch] = await db.select().from(agentWakeupRequests).where(
+        eq(agentWakeupRequests.requestedByActorId, `native-status-wake-dispatch:${intent.id}`));
+      expect(dispatch).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      const [intentAfterDispatch] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, intent.id));
+      expect(intentAfterDispatch).toMatchObject({ status: "coalesced", runId: null });
+
+      const { createHeartbeatQueueTestDependencies } = await import("./helpers/heartbeat-queue.js");
+      const { createHeartbeatQueue, shouldDeferFollowupWakeForSameIssue, shouldQueueFollowupForRunningIssueWake } = await import("../services/heartbeat/queue.js");
+      const { createWakeQueue } = await import("../modules/wake-queue/index.js");
+      const { mergeCoalescedContextSnapshot } = await import("../services/heartbeat/run-preparation.js");
+      const { createHeartbeatRunControl } = await import("../services/heartbeat/run-control.js");
+      const { callbacks: runControlCallbacks } = await import("../services/heartbeat/__tests__/run-control-fixtures.js");
+      const deps = createHeartbeatQueueTestDependencies(db);
+      deps.getAgent.mockImplementation(async id => (await db.select().from(agents).where(eq(agents.id, id)))[0]);
+      const nativeQueue = createWakeQueue(db, {
+        resolveResponsibleUserId: async () => f.userId,
+        getRoutineEnv: async () => ({ routineId: null, env: null, responsibleUserId: null }),
+        resolveSessionBeforeForWakeup: async () => null,
+        wakeAdmissionHelpers: { filterZombieCoalesceTarget: deps.filterZombieCoalesceTarget,
+          mergeCoalescedContextSnapshot, shouldDeferFollowupWakeForSameIssue, shouldQueueFollowupForRunningIssueWake },
+        recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined },
+      });
+      const controlDeps = runControlCallbacks(db);
+      controlDeps.wakeQueue.releaseIssueExecution = nativeQueue.releaseIssueExecution;
+      const control = createHeartbeatRunControl(db, controlDeps);
+      deps.releaseIssueExecutionAndPromote.mockImplementation(control.releaseIssueExecutionAndPromote);
+      const queue = createHeartbeatQueue(db, deps);
+
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, candidate.runId));
+      await db.update(nativeRunFinalizations).set({ phase: "committed" }).where(eq(nativeRunFinalizations.runId, candidate.runId));
+      const released = await nativeQueue.releaseIssueExecution({ companyId: f.company.id,
+        runId: candidate.runId, now: new Date(), suppressImmediateRecovery: true });
+      expect(released.outcome).toMatchObject({ kind: "promoted", run: { wakeupRequestId: older.id, agentId: f.builder.id } });
+      const [formerBuilder] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, older.id));
+      expect(await queue.claimQueuedRun(formerBuilder)).toBeNull();
+      const [cancelled] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, formerBuilder.id));
+      expect(cancelled).toMatchObject({ status: "cancelled", errorCode: "issue_assignee_changed", startedAt: null, nativeIssueId: null });
+
+      const ledger = await f.ledger();
+      expect(ledger.admissions).toHaveLength(5);
+      if (scenario === "changed_stage") await db.update(issues).set({ statusVersion: sql`${issues.statusVersion}+1` }).where(eq(issues.id, f.issue.id));
+      if (scenario === "changed_workspace") await db.update(issues).set({ workspaceBindingRevision: sql`${issues.workspaceBindingRevision}+1` }).where(eq(issues.id, f.issue.id));
+      if (scenario === "operator_stop") await db.update(heartbeatRuns).set({ resultJson: { executionCancellation: { state: "acknowledged" } } }).where(eq(heartbeatRuns.id, cancelled.id));
+      if (scenario === "active_successor") await db.insert(heartbeatRuns).values({ companyId: f.company.id,
+        agentId: f.reviewer.id, status: "queued", issueId: f.issue.id, scopeKind: "issue", contextSnapshot: { issueId: f.issue.id } });
+      if (scenario === "different_receipt") await db.update(agentWakeupRequests).set({ idempotencyKey: "unrelated" }).where(eq(agentWakeupRequests.id, dispatch.id));
+      if (scenario === "duplicate_receipt") await db.insert(agentWakeupRequests).values({ ...dispatch, id: randomUUID() });
+      if (scenario === "previous_reviewer_run") await db.insert(heartbeatRuns).values({ companyId: f.company.id,
+        agentId: f.reviewer.id, status: "failed", startedAt: new Date(), finishedAt: new Date(),
+        // Older than the stray cancellation, so choosing a terminal latest
+        // row alone cannot distinguish an already attempted stage.
+        createdAt: new Date(cancelled.createdAt.getTime() - 1),
+        issueId: f.issue.id, scopeKind: "issue", contextSnapshot: dispatch.payload?._paperclipWakeContext as Record<string, unknown>,
+      });
+      if (scenario === "scheduling_suppressed") deps.getSchedulingSuppression.mockResolvedValue({ suppressed: true, reason: "task_drain" });
+      if (scenario === "paused_reviewer") await db.update(agents).set({ status: "paused" }).where(eq(agents.id, f.reviewer.id));
+      if (scenario === "builder_cleanup" || scenario === "cancelled_run_cleanup") {
+        const runId = scenario === "builder_cleanup" ? candidate.runId : cancelled.id;
+        await db.update(heartbeatRuns).set({ runnerProfileJson:
+          sql`coalesce(${heartbeatRuns.runnerProfileJson}, '{}'::jsonb) || '{"nativeWorkspaceFinalizationOwner": "fixture"}'::jsonb`,
+        }).where(eq(heartbeatRuns.id, runId));
+      }
+
+      const before = await f.read();
+      expect(before.executionRunId).toBeNull();
+      const scope = { companyId: f.company.id, requestId: dispatch.id };
+      const recover = () => Promise.all([queue.resumeDeferredExecutionReceipts(scope), queue.resumeDeferredExecutionReceipts(scope)]);
+      if (scenario === "current") {
+        const { registerDeferredReceiptWork } = await import("../services/heartbeat/deferred-receipt-work.js");
+        const { createDeliveryWorkCoordinator } = await import("../services/delivery-work-coordinator.js");
+        const onError = vi.fn();
+        const coordinator = createDeliveryWorkCoordinator({ owner: db, canRun: () => true, onError });
+        const resume = vi.fn(async (request: { requestId?: string }) => {
+          if (request.requestId === dispatch.id) await recover();
+        });
+        const worker = registerDeferredReceiptWork(db, coordinator, { resume,
+          settleTaskChat: async () => {}, createNativeBatch: () => async () => {}, schedulingSuppressed: async () => false }, () => true);
+        try {
+          await worker.ready;
+          await vi.waitFor(() => expect(resume).toHaveBeenCalledWith(expect.objectContaining(scope)), { timeout: 5000 });
+          expect(onError).not.toHaveBeenCalled();
+        } finally {
+          await worker.stop();
+        }
+      } else {
+        await recover();
+      }
+      await queue.resumeDeferredExecutionReceipts(scope);
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.wakeupRequestId, dispatch.id));
+      if (scenario === "current") {
+        expect(runs).toHaveLength(1);
+        expect(runs[0]).toMatchObject({ agentId: f.reviewer.id, status: "queued", contextSnapshot: {
+          issueId: f.issue.id, nativeStageAdmissionId: candidate.resultId,
+          nativeStageStatusVersion: before.statusVersion, nativeStatusWakeIntentId: intent.id,
+        } });
+        expect(await queue.claimQueuedRun(runs[0])).toMatchObject({ id: runs[0].id, status: "running" });
+      } else {
+        expect(runs).toHaveLength(0);
+      }
+      expect(await f.ledger()).toEqual(ledger);
+      expect((await f.read()).statusVersion).toBe(before.statusVersion);
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, intent.id)))[0]).toEqual(intentAfterDispatch);
+      expect(deps.executeRun).not.toHaveBeenCalled();
+    }, 90000);
   it.each(["current","stale_version","missing_context"] as const)("normal-stage bounded retry revalidates canonical authority under native issue lock: %s",async mode=>{
     const f=await stageFixture();
     const [failed]=await db.update(heartbeatRuns).set({runtimeMode:"legacy",nativeIssueId:null,status:"failed",errorCode:"adapter_failed",error:"Synthetic pre-native admission failure",resultJson:{executionRecovery:{kind:"bootstrap",providerWorkStarted:false}},finishedAt:new Date(),contextSnapshot:mode==="missing_context"?{issueId:f.issue.id}:f.context}).where(eq(heartbeatRuns.id,f.reviewerRun.id)).returning();

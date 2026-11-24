@@ -1,6 +1,6 @@
 import { NativeProviderStateIncompatibleError } from "../../vendor/paperclip-runner/index.js";
 import { z } from "zod";
-import { and, eq } from "drizzle-orm";
+import { and, eq, isNull, ne, sql } from "drizzle-orm";
 import { activityLog, issueExecutionDecisions, agents, agentWakeupRequests, heartbeatRuns, issues, issueReviewCycleBudgets, nativeRunResults, nativeRunFinalizations, statusDecisions, statusDecisionEffects, executionWorkspaces, workAssessments, type Db } from "@paperclipai/db";
 import { issueReviewCycleBudgetSchema } from "@paperclipai/shared";
 import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../issue-execution-policy.js";
@@ -96,6 +96,42 @@ export async function getNativeStageReviewRecoveryContext(db:Db,input:{companyId
   const proof=await getNativeStageReviewAssignment(db,{...input,contextSnapshot:context});
   if(!proof)return null;
   return {...context,nativeStatusWakeIntentId:proof.wake.id,executionStage:proof.wake.payload?.executionStage,forceFreshSession:true};
+}
+
+/** A discovery predicate, never admission authority. Revalidate the receipt
+ * and the current stage under the issue lock before using it. */
+export const deferredNativeStageReviewDispatchSql = and(
+  isNull(agentWakeupRequests.runId),
+  eq(agentWakeupRequests.reason, "issue_execution_deferred"),
+  eq(agentWakeupRequests.requestedByActorType, "system"),
+  sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'execution_review_requested'`,
+  sql`${agentWakeupRequests.requestedByActorId} = 'native-status-wake-dispatch:' ||
+    (${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,nativeStatusWakeIntentId}')`,
+);
+
+export async function readDeferredNativeStageReviewDispatch(db: Db, input: {
+  companyId: string; issueId: string; wakeId: string;
+}) {
+  const [dispatch] = await db.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.id, input.wakeId),
+    eq(agentWakeupRequests.status, "deferred_issue_execution"), deferredNativeStageReviewDispatchSql,
+    sql`${agentWakeupRequests.payload}->>'issueId' = ${input.issueId}`,
+  )).for("update");
+  if (!dispatch) return null;
+  const context = dispatch.payload?._paperclipWakeContext;
+  const stage = stageContextSchema.safeParse(context);
+  if (!stage.success || !stage.data.nativeStatusWakeIntentId || !stageWakeTupleMatches(dispatch, stage.data)) return null;
+  const proof = await getNativeStageReviewAssignment(db, { ...input, agentId: dispatch.agentId, contextSnapshot: context });
+  if (!proof || proof.wake.reason !== "execution_review_requested" || proof.wake.status !== "coalesced" ||
+    proof.wake.runId || proof.wake.idempotencyKey !== dispatch.idempotencyKey) return null;
+  const [other] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.agentId, dispatch.agentId),
+    eq(agentWakeupRequests.requestedByActorType, "system"),
+    eq(agentWakeupRequests.requestedByActorId, `native-status-wake-dispatch:${proof.wake.id}`),
+    ne(agentWakeupRequests.id, dispatch.id),
+  )).limit(1);
+  if (other) return null;
+  return { dispatch, ...proof };
 }
 
 export function nativeStageAssignmentRecord(proof: NonNullable<Awaited<ReturnType<typeof getNativeStageReviewAssignment>>>) {

@@ -15,6 +15,7 @@ import { instanceSettingsService } from "../../../services/instance-settings.js"
 import { currentConversationCommentCondition } from "../../../services/agent-conversations.js";
 import { getExecutionBlocker, hasPendingRunCleanup } from "../../../services/execution-blocker.js";
 import { nativeManualAdmissionHoldsExecution } from "../../../services/native-runtime/native-runner-ownership.js";
+import { readDeferredNativeStageReviewDispatch } from "../../../services/native-runtime/native-stage-review.js";
 import { and, asc, eq, inArray, isNull, notInArray, or, sql } from "drizzle-orm";
 import { readReleaseRun, type ReleaseRun } from "./release-run-read.js";
 import { mutateNativeOperationalIssue, type NativeOperationalTransaction } from "../../../services/native-operational-issue-mutation.js";
@@ -238,7 +239,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         paused: !invokability.invokable && invokability.reason === "paused" };
     },
 
-    async findNextDeferredWake({ companyId, issueId, excludedWakeIds }) {
+    async findNextDeferredWake({ companyId, issueId, excludedWakeIds, wakeId }) {
       while (true) {
         const row = await tx
           .select()
@@ -247,6 +248,7 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
             and(
               eq(agentWakeupRequests.companyId, companyId),
               eq(agentWakeupRequests.status, DEFERRED_WAKE_STATUS),
+              wakeId ? eq(agentWakeupRequests.id, wakeId) : undefined,
               excludedWakeIds?.length ? notInArray(agentWakeupRequests.id, excludedWakeIds) : undefined,
               sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issueId}`,
               interruptQueueId ? eq(agentWakeupRequests.id, interruptQueueId) : undefined,
@@ -1207,6 +1209,38 @@ export function createWakeAdmissionWriter(): WakeAdmissionWriter {
   };
 }
 
+async function canResumeDeferredNativeReview(tx: Db, run: ReleaseRun, issue: IssueRow, wakeId: string) {
+  if (issue.executionRunId || issue.checkoutRunId || issue.hiddenAt || issue.conversationAgentId) return false;
+  const proof = await readDeferredNativeStageReviewDispatch(tx, { companyId: issue.companyId, issueId: issue.id, wakeId });
+  if (!proof || proof.sourceRun.status !== "succeeded" || !proof.sourceRun.finishedAt) return false;
+
+  // The latest queue row can be an obsolete former-owner wake retired at
+  // dispatch, without any runtime or provider activity. Never treat an
+  // operator Stop or an attempted run as that harmless cancellation.
+  if (run.id !== proof.sourceRun.id && (
+    run.agentId !== proof.sourceRun.agentId || run.createdAt < proof.sourceRun.createdAt ||
+    run.status !== "cancelled" || run.errorCode !== "issue_assignee_changed" ||
+    run.runtimeMode !== "legacy" || run.runtimeModeResolvedAt || run.startedAt || run.nativeSessionId ||
+    run.sessionIdAfter || run.processPid || run.processGroupId || run.processStartedAt ||
+    isOperatorStoppedRunRow(run) || run.resultJson?.executionCancellation
+  )) return false;
+
+  const [committed] = await tx.select({ runId: nativeRunFinalizations.runId }).from(nativeRunFinalizations).where(and(
+    eq(nativeRunFinalizations.companyId, issue.companyId), eq(nativeRunFinalizations.issueId, issue.id),
+    eq(nativeRunFinalizations.runId, proof.sourceRun.id), eq(nativeRunFinalizations.phase, "committed"),
+  ));
+  if (!committed || await hasPendingRunCleanup(tx, issue.companyId, proof.sourceRun.id)) return false;
+
+  // Any previous admission of this exact stage owns the result, including a
+  // stopped or failed run. Recovery of that run follows its own policy.
+  const [admitted] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, proof.dispatch.agentId),
+    or(inArray(heartbeatRuns.wakeupRequestId, [wakeId, proof.wake.id]),
+      sql`${heartbeatRuns.contextSnapshot}->>'nativeStageDecisionId' = ${proof.sourceDecision.id}`),
+  )).limit(1);
+  return !admitted;
+}
+
 export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAdapterDeps): IssueLockWriter {
   return {
     async withIssueExecutionLock(input, fn): Promise<ReleaseTransactionResult & { run: RunSnapshot }> {
@@ -1277,6 +1311,12 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
             ),
           )
           .orderBy(asc(issues.id));
+
+        if (input.deferredNativeReviewWakeId && (!input.resumeStrandedQueue || candidateIssues.length !== 1 ||
+          candidateIssues[0]?.id !== contextIssueId ||
+          !await canResumeDeferredNativeReview(tx, run, candidateIssues[0], input.deferredNativeReviewWakeId))) {
+          return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
+        }
 
         for (const issue of candidateIssues) {
           if (issue.executionRunId === run.id || issue.checkoutRunId === run.id) {

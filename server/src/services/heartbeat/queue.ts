@@ -1,4 +1,4 @@
-import { getNativeStageReviewRecoveryContext } from "../native-runtime/native-stage-review.js";
+import { deferredNativeStageReviewDispatchSql, getNativeStageReviewRecoveryContext } from "../native-runtime/native-stage-review.js";
 import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../issue-execution-policy.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
 import { mutateNativeOperationalIssue, nativeOperationalIssueSnapshot } from "../native-operational-issue-mutation.js";
@@ -236,7 +236,7 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
   isRunAdmissionClosed?: () => boolean;
   canStartNewExternalBotWork: (agent: typeof agents.$inferSelect) => Promise<boolean>;
   executeRun: (runId: string) => Promise<void>;
-  releaseIssueExecutionAndPromote: (run: Pick<HeartbeatRun, "id" | "companyId">, options?: { suppressImmediateRecovery?: boolean; resumeStrandedQueue?: boolean; deferredPostCommitEffects?: WakeQueuePostCommitEffect[] }) => Promise<unknown>;
+  releaseIssueExecutionAndPromote: (run: Pick<HeartbeatRun, "id" | "companyId">, options?: { suppressImmediateRecovery?: boolean; resumeStrandedQueue?: boolean; deferredNativeReviewWakeId?: string; deferredPostCommitEffects?: WakeQueuePostCommitEffect[] }) => Promise<unknown>;
   applyWakeQueuePostCommitEffects: (effects: WakeQueuePostCommitEffect[]) => Promise<void>;
   publishRunLifecyclePluginEvent: (run: HeartbeatRun) => void;
   cancelRunInternal: (runId: string, reason?: string,
@@ -1889,7 +1889,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     // A server restart or a message/cleanup race can leave a deferred wake
     // after its owner has released the issue lock. Revisit it through the same
     // release admission, so recovery holds and operator Stops still apply.
-    const strandedQueues = await db.select({ wake: agentWakeupRequests })
+    const strandedQueues = await db.select({ wake: agentWakeupRequests,
+      nativeReviewDispatch: sql<boolean>`coalesce(${deferredNativeStageReviewDispatchSql}, false)`,
+    })
       .from(agentWakeupRequests)
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
         sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
@@ -1904,7 +1906,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
           sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
         ), sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`,
-        dependencyResolvedWakePayloadSql),
+        dependencyResolvedWakePayloadSql, deferredNativeStageReviewDispatchSql),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
         sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs live_issue_run
           WHERE live_issue_run.company_id = ${issues.companyId}
@@ -1914,9 +1916,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
     const releasedNativeSources = new Set<string>();
-    for (const { wake } of strandedQueues) {
+    for (const { wake, nativeReviewDispatch } of strandedQueues) {
       const dependencyWake = isDependencyResolvedWakePayload(wake.payload);
-      if (!dependencyWake && !queuedCommentIdsFromWakePayload(wake.payload).length &&
+      if (!nativeReviewDispatch && !dependencyWake && !queuedCommentIdsFromWakePayload(wake.payload).length &&
           !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
       const [latest] = await db.select({
         id: heartbeatRuns.id,
@@ -1946,8 +1948,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         continue;
       }
       const releaseSource = `${latest.companyId}:${String(wake.payload?.issueId)}:${latest.id}:${latest.sourceVersion}`;
-      if (latest.runtimeMode === "native" && releasedNativeSources.has(releaseSource)) continue;
-      if (latest.runtimeMode === "legacy") {
+      if (!nativeReviewDispatch && latest.runtimeMode === "native" && releasedNativeSources.has(releaseSource)) continue;
+      if (!nativeReviewDispatch && latest.runtimeMode === "legacy") {
         const cancelledAdmission = latest.status === "cancelled" && !latest.startedAt &&
           latest.errorCode === "execution_reconciliation_required";
         if ((latest.status !== "cancelled" || cancelledAdmission) && await getExecutionBlocker(db, wake.companyId, String(wake.payload?.issueId))) {
@@ -1957,8 +1959,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           });
         }
       }
-      await releaseIssueExecutionAndPromote(latest, { suppressImmediateRecovery: true, resumeStrandedQueue: true }).then(() => {
-        if (latest.runtimeMode === "native") releasedNativeSources.add(releaseSource);
+      await releaseIssueExecutionAndPromote(latest, { suppressImmediateRecovery: true, resumeStrandedQueue: true,
+        ...(nativeReviewDispatch ? { deferredNativeReviewWakeId: wake.id } : {}),
+      }).then(() => {
+        if (!nativeReviewDispatch && latest.runtimeMode === "native") releasedNativeSources.add(releaseSource);
       }).catch(err => {
         scope.onError?.(err);
         logger.warn({ err, queueId: wake.id }, "failed to promote stranded comments");

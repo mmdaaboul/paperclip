@@ -121,6 +121,7 @@ export type ReleaseIssueExecutionInput = {
   now: Date;
   suppressImmediateRecovery?: boolean;
   resumeStrandedQueue?: boolean;
+  deferredNativeReviewWakeId?: string;
 };
 
 type PauseHoldFacts = Awaited<ReturnType<WakeQueueTransaction["getPauseHoldFacts"]>>;
@@ -158,6 +159,7 @@ async function runReleaseDrain(
     const candidate = await ports.transaction.findNextDeferredWake({
       companyId: run.companyId, issueId: issue.id,
       ...(preservedWakeIds.length ? { excludedWakeIds: preservedWakeIds } : {}),
+      ...(input.deferredNativeReviewWakeId ? { wakeId: input.deferredNativeReviewWakeId } : {}),
     });
     if (!candidate) break;
     if (processedWakeIds.has(candidate.id)) {
@@ -327,7 +329,7 @@ async function runReleaseDrain(
   }
 
   // A stopped run never plans recovery for itself, including after a handoff.
-  if (locked.handoffAssigneeAgentId) return { outcome: { kind: "released" }, postCommitEffects };
+  if (locked.handoffAssigneeAgentId || input.deferredNativeReviewWakeId) return { outcome: { kind: "released" }, postCommitEffects };
 
   return runReleaseRecoveryTail(issue, run, ports.host, ports.transaction, input, postCommitEffects);
 }
@@ -989,7 +991,8 @@ export function createReleaseIssueExecution(deps: {
   ): Promise<{ outcome: ReleaseOutcome; postCommitEffects: PostCommitEffect[] }> {
     const result = await deps.issueLock.withIssueExecutionLock(
       { companyId: input.companyId, runId: input.runId, now: input.now,
-        ...(input.resumeStrandedQueue ? { resumeStrandedQueue: true } : {}) },
+        ...(input.resumeStrandedQueue ? { resumeStrandedQueue: true } : {}),
+        ...(input.deferredNativeReviewWakeId ? { deferredNativeReviewWakeId: input.deferredNativeReviewWakeId } : {}) },
       (locked, ports) => runReleaseDrain(locked, ports, input),
     );
 
