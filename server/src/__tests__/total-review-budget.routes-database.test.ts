@@ -13,7 +13,7 @@ import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { activityLog, agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns,
-  issueExecutionDecisions, issueReviewCycleBudgets, issues, completionContracts, nativeRunResults, nativeRunFinalizations, workAssessments, statusDecisions, statusDecisionEffects, agentWakeupRequests, issueRecoveryActions, projects, projectWorkspaces, executionWorkspaces, documents, documentRevisions, issueDocuments, issueScopedReviews, issueThreadInteractions, environmentLeases, heartbeatRunEvents, toolInvocations } from "@paperclipai/db";
+  issueExecutionDecisions, issueReviewCycleBudgets, issues, completionContracts, nativeRunResults, nativeRunFinalizations, workAssessments, statusDecisions, statusDecisionEffects, agentWakeupRequests, issueRecoveryActions, projects, projectWorkspaces, executionWorkspaces, documents, documentRevisions, issueDocuments, issueScopedReviews, issueThreadInteractions, environmentLeases, heartbeatRunEvents, toolInvocations, workspaceOperations } from "@paperclipai/db";
 
 // Provider dispatch and executor-stop confirmation are stubbed; native authorization,
 // run rows, task state, ledger, decisions and audit use the real migrated database.
@@ -1118,18 +1118,30 @@ describe("actual normal PATCH + native postgres-js + native issue service (injec
       phase: "retryable_failure", failureCode: "side_effect_planning_failed",
     });
     const { finalizeNativeRun } = await import("../services/native-runtime/native-run-finalizer.js");
+    const { executionProjectionForRun } = await import("../services/execution-projection.js");
     const finalizer = {
       db, runId: f.reviewerRun.id, workspaceFinalizeStatus: "succeeded" as const, projectRunStatus: true,
-      skipExternalConversationSettlement: true, skipExternalAgentSettlement: true, skipNativeRecoveryNotices: true,
+      skipExternalConversationSettlement: true, skipExternalAgentSettlement: true,
     };
     const runsBefore = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
       .where(eq(heartbeatRuns.companyId, f.company.id)).orderBy(heartbeatRuns.id);
     const wakesBefore = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.companyId, f.company.id)).orderBy(agentWakeupRequests.id);
+    const failed = await finalizeNativeRun({ ...finalizer, workspaceFinalizeStatus: "failed" });
+    expect(failed).toMatchObject({ phase: "retryable_failure", resultId });
+    const [workspaceNotice] = await db.select().from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.sourceIssueId, f.issue.id), eq(issueRecoveryActions.cause, "workspace_finalization_failed")));
+    expect(workspaceNotice).toMatchObject({ status: "active" });
+    await db.insert(workspaceOperations).values({ companyId: f.company.id, issueId: f.issue.id,
+      heartbeatRunId: f.reviewerRun.id, phase: "workspace_finalize", status: "succeeded",
+      metadata: { owningService: "native_workspace_finalizer" } });
     const completed = await finalizeNativeRun(finalizer);
     expect(completed).toMatchObject({ phase: "committed", resultId });
     const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.reviewerRun.id));
     expect(run.status).toBe("succeeded");
+    const [settledNotice] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, workspaceNotice.id));
+    expect(settledNotice).toMatchObject({ status: "resolved", outcome: "restored" });
+    expect(await executionProjectionForRun(db, f.company.id, f.reviewerRun.id)).toMatchObject({ phase: "completed" });
     expect(await f.read()).toMatchObject({ statusVersion: f.approved.statusVersion,
       assigneeUserId: f.userId, executionState: { currentStageType: "approval" } });
     expect((await f.ledger()).admissions).toHaveLength(1);

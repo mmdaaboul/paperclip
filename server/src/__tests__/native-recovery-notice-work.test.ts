@@ -13,10 +13,11 @@ import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import { eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { agents, companies, completionContracts, createDb, heartbeatRuns, issues, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { agents, companies, completionContracts, createDb, heartbeatRuns, issues, nativeRunFinalizations, workspaceOperations, type Db } from "@paperclipai/db";
 import { createDeliveryWorkCoordinator } from "../services/delivery-work-coordinator.js";
 import { nativeRecoveryNoticeWork } from "../services/native-runtime/native-recovery-notice-work.js";
-import { resolveCommittedNativeRecoveryNotices } from "../services/native-runtime/native-recovery-notices.js";
+import { pendingNativeRecoveryNotices, resolveCommittedNativeRecoveryNotices } from "../services/native-runtime/native-recovery-notices.js";
+import { executionProjectionForRun } from "../services/execution-projection.js";
 import { notifyNativeFinalizationWork } from "../services/native-finalization-notifications.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { issueRecoveryActions } from "@paperclipai/db";
@@ -114,7 +115,8 @@ describe("committed native recovery notice lifecycle", () => {
   }
   async function barrier(binding: Awaited<ReturnType<typeof seed>>) {
     await workspaceOperationService(db).createRecorder({ companyId, issueId: binding.issueId, heartbeatRunId: binding.runId })
-      .recordOperation({ phase: "workspace_finalize", cwd: root, run: async () => ({ status: "succeeded", exitCode: 0 }) });
+      .recordOperation({ phase: "workspace_finalize", cwd: root, metadata: { owningService: "native_workspace_finalizer" },
+        run: async () => ({ status: "succeeded", exitCode: 0 }) });
   }
   async function state(runId: string) {
     return db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, runId)).then(rows => rows[0]);
@@ -141,6 +143,49 @@ describe("committed native recovery notice lifecycle", () => {
   async function action(id: string) {
     return db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, id)).then(rows => rows[0]);
   }
+  it.each(["finalizer", "worker"] as const)("closes the exact workspace failure notice after saved-result settlement (%s)", async path => {
+    const binding = await seed();
+    await complete(binding, "control_plane");
+    const failed = await finalizeNativeRun({ db, runId: binding.runId, workspaceFinalizeStatus: "failed", projectRunStatus: true });
+    expect(failed.phase).toBe("retryable_failure");
+    const pending = await issueRecoveryActionService(db).getActiveForIssue(companyId, binding.issueId);
+    expect(pending).toMatchObject({ cause: "workspace_finalization_failed", wakePolicy: null, status: "active" });
+    await resolveCommittedNativeRecoveryNotices(db, binding);
+    expect((await action(pending!.id)).status).toBe("active");
+
+    await barrier(binding);
+    const result = await finalizeNativeRun({ db, runId: binding.runId, workspaceFinalizeStatus: "succeeded",
+      projectRunStatus: true, skipNativeRecoveryNotices: path === "worker" });
+    expect(result).toMatchObject({ phase: "committed", resultId: failed.resultId });
+    if (path === "worker") {
+      expect(await pendingNativeRecoveryNotices(db, binding)).toHaveLength(1);
+      await start();
+      await flush();
+    }
+    expect(await action(pending!.id)).toMatchObject({ status: "resolved", outcome: "restored" });
+    expect(await executionProjectionForRun(db, companyId, binding.runId)).toMatchObject({ phase: "completed" });
+    const settled = await action(pending!.id);
+    await resolveCommittedNativeRecoveryNotices(db, binding, true);
+    expect(await action(pending!.id)).toEqual(settled);
+  });
+  it.each(["missing workspace receipt", "unlinked failure decision"] as const)("keeps the notice active with %s", async missing => {
+    const binding = await seed();
+    await complete(binding, "control_plane");
+    await finalizeNativeRun({ db, runId: binding.runId, workspaceFinalizeStatus: "failed", projectRunStatus: true });
+    const pending = (await issueRecoveryActionService(db).getActiveForIssue(companyId, binding.issueId))!;
+    await barrier(binding);
+    await finalizeNativeRun({ db, runId: binding.runId, workspaceFinalizeStatus: "succeeded",
+      projectRunStatus: true, skipNativeRecoveryNotices: true });
+    if (missing === "missing workspace receipt") {
+      await db.update(workspaceOperations).set({ status: "failed" }).where(eq(workspaceOperations.heartbeatRunId, binding.runId));
+    } else {
+      await db.update(issueRecoveryActions).set({ evidence: { ...pending.evidence, decisionId: randomUUID() } })
+        .where(eq(issueRecoveryActions.id, pending.id));
+    }
+    expect(await pendingNativeRecoveryNotices(db, binding)).toHaveLength(0);
+    await resolveCommittedNativeRecoveryNotices(db, binding);
+    expect((await action(pending.id)).status).toBe("active");
+  });
   it("reconstructs pending notices and leaves resolved history quiet across restart", async () => {
     const binding = await committed(); const pending = await notice(binding);
     await start(); await flush(); expect(await action(pending.id)).toMatchObject({ status: "resolved", outcome: "restored" });

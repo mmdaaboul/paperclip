@@ -1,5 +1,6 @@
 import { and, asc, eq, gt, inArray, isNotNull, not, or, sql } from "drizzle-orm";
-import { environmentLeases, heartbeatRuns, issues, issueRecoveryActions, nativeRunFinalizations, nativeRunResults, workspaceOperations, type Db } from "@paperclipai/db";
+import { environmentLeases, heartbeatRuns, issues, issueRecoveryActions, nativeRunFinalizations, nativeRunResults,
+  statusDecisionEffects, statusDecisions, workspaceOperations, type Db } from "@paperclipai/db";
 import { issueRecoveryActionService } from "../issue-recovery-actions.js";
 import type { NativeRecoveryNoticeScope } from "../native-recovery-notice-notifications.js";
 import { nativeRunnerOwnershipNotHeldCondition } from "./native-runner-ownership.js";
@@ -57,6 +58,34 @@ function completedExportRetryNotice(runId: string | typeof nativeRunFinalization
   );
 }
 
+function completedWorkspaceFinalizationNotice(runId: string | typeof nativeRunFinalizations.runId) {
+  return and(
+    eq(issueRecoveryActions.cause, "workspace_finalization_failed"),
+    eq(issueRecoveryActions.ownerType, "agent"),
+    sql`${issueRecoveryActions.wakePolicy} is null`,
+    sql`exists (select 1 from ${heartbeatRuns} settled_run
+      join ${statusDecisions} failure_decision on failure_decision.company_id = settled_run.company_id
+        and failure_decision.issue_id = settled_run.native_issue_id and failure_decision.run_id = settled_run.id
+      join ${statusDecisionEffects} failure_effect on failure_effect.company_id = failure_decision.company_id
+        and failure_effect.issue_id = failure_decision.issue_id and failure_effect.decision_id = failure_decision.id
+      where settled_run.company_id = ${issueRecoveryActions.companyId}
+        and settled_run.native_issue_id = ${issueRecoveryActions.sourceIssueId} and settled_run.id::text = ${runId}::text
+        and settled_run.agent_id = ${issueRecoveryActions.ownerAgentId}
+        and settled_run.status = 'succeeded' and settled_run.native_phase = 'committed'
+        and settled_run.result_json->>'workspaceFinalizeStatus' = 'succeeded'
+        and failure_decision.id::text = ${issueRecoveryActions.evidence}->>'decisionId'
+        and failure_decision.application_state = 'applied'
+        and failure_effect.effect_kind = 'record_finalization_error'
+        and failure_effect.target_type = 'issue_recovery_action'
+        and failure_effect.target_id = ${issueRecoveryActions.id}::text and failure_effect.delivery_state = 'delivered'
+        and failure_effect.payload->>'cause' = ${issueRecoveryActions.cause}
+        and exists (select 1 from ${workspaceOperations} op where op.company_id = settled_run.company_id
+          and op.issue_id = settled_run.native_issue_id and op.heartbeat_run_id = settled_run.id
+          and op.phase = 'workspace_finalize' and op.status = 'succeeded'
+          and op.metadata->>'owningService' = 'native_workspace_finalizer'))`,
+  );
+}
+
 function matchingNotice(runId: string | typeof nativeRunFinalizations.runId) {
   return and(
     eq(issueRecoveryActions.kind, "active_run_watchdog"),
@@ -65,7 +94,7 @@ function matchingNotice(runId: string | typeof nativeRunFinalizations.runId) {
     or(and(not(inArray(issueRecoveryActions.cause, workspaceExportFailureCauses)),
       sql`${issueRecoveryActions.wakePolicy}->>'kind' = 'resume_native_run'`),
       eq(issueRecoveryActions.cause, "native_workspace_finalization_owner_unverified"),
-      recoveredExportNotice(runId), completedExportRetryNotice(runId)),
+      recoveredExportNotice(runId), completedExportRetryNotice(runId), completedWorkspaceFinalizationNotice(runId)),
   );
 }
 
@@ -117,10 +146,11 @@ export async function resolveCommittedNativeRecoveryNotices(db: Db,
       nativeRunnerOwnershipNotHeldCondition())).for("update");
     if (!run) return;
     const actions = await tx.select({ id: issueRecoveryActions.id,
-      exportSettled: sql<boolean>`coalesce(${or(recoveredExportNotice(scope.runId), completedExportRetryNotice(scope.runId))}, false)` }).from(issueRecoveryActions).where(and(
+      workspaceSettled: sql<boolean>`coalesce(${or(recoveredExportNotice(scope.runId),
+        completedExportRetryNotice(scope.runId), completedWorkspaceFinalizationNotice(scope.runId))}, false)` }).from(issueRecoveryActions).where(and(
       eq(issueRecoveryActions.companyId, scope.companyId), eq(issueRecoveryActions.sourceIssueId, scope.issueId),
       matchingNotice(scope.runId))).for("update");
-    if ((onlyWhenSettled || actions.some(action => action.exportSettled)) && !(await pendingNativeRecoveryNotices(tx, scope)).length) return;
+    if ((onlyWhenSettled || actions.some(action => action.workspaceSettled)) && !(await pendingNativeRecoveryNotices(tx, scope)).length) return;
     for (const action of actions) await issueRecoveryActionService(tx).resolveActiveForIssue({
       companyId: scope.companyId, sourceIssueId: scope.issueId, actionId: action.id,
       status: "resolved", outcome: "restored",
