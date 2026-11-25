@@ -181,7 +181,9 @@
         "native terminal-turn accounting > binds retained warm transport usage to the successor run authority",
         "native warm session supervision > warm session identity transitions > keeps warm owners and attachment staging untouched during exact Stop cleanup (invalidated=false)",
         "native warm session supervision > warm session identity transitions > keeps warm owners and attachment staging untouched during exact Stop cleanup (invalidated=true)",
-        "native non-Git tool authority retirement > observes the actual historical authority epoch without treating registration as live work"
+        "native non-Git tool authority retirement > observes the actual historical authority epoch without treating registration as live work",
+        "native warm session supervision > managed directory warm checkpoints > rejects identity rotation over another run's directory reservation (native Runner: false)",
+        "native warm session supervision > managed directory warm checkpoints > rejects identity rotation over another run's directory reservation (native Runner: true)"
       ]
     },
     {

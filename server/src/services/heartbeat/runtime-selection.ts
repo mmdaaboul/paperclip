@@ -356,7 +356,7 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
         ? persistedNativeExecutionInput.binding.executionWorkspaceId
         : persistedExecutionWorkspace?.id ?? run.id;
     const stageContext=readNativeStageReviewContext(context);
-    const nativeStageReview=stageContext?await getNativeStageReviewAssignment(db,{companyId:agent.companyId,issueId:issueRef.id,agentId:agent.id,contextSnapshot:stageContext}):null;
+    const nativeStageReview=stageContext?await getNativeStageReviewAssignment(db,{companyId:agent.companyId,issueId:issueRef.id,agentId:agent.id,claimRunId:run.id,contextSnapshot:stageContext}):null;
     if(stageContext && !nativeStageReview)throw new Error("native_stage_review_assignment_no_longer_available");
     const nativeReviewContext = readNativeReviewAssignmentContext(context);
     const nativeReview = nativeReviewContext ? await measureRunPhase("runtime_selection.review", () => getNativeReviewAssignment(db, {

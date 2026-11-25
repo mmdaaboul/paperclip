@@ -187,8 +187,8 @@ async function nativeCandidate(existing?: Awaited<ReturnType<typeof seed>>, agen
     return {f,runId,contractId,resultId,assessmentId,nativeSha256,resultJson,commitNativeStatusDecision,input};
 }
 
-async function stageFixture() {
-  const base=await draftFixture(),candidate=await nativeCandidate(base),execution=structuredClone(base.execution);
+async function stageFixture(existing?: Awaited<ReturnType<typeof seed>>) {
+  const base=await draftFixture(existing),candidate=await nativeCandidate(base),execution=structuredClone(base.execution);
   execution.binding.runId=candidate.runId;
   await db.update(heartbeatRuns).set({runnerProfileJson:{nativeExecutionInput:execution}}).where(eq(heartbeatRuns.id,candidate.runId));
   await db.update(heartbeatRuns).set({status:"succeeded"}).where(eq(heartbeatRuns.id,base.runId));
@@ -1064,6 +1064,277 @@ describe("actual normal PATCH + native postgres-js + native issue service (injec
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id,failed.id)))[0].contextSnapshot).toEqual(failed.contextSnapshot);
     expect((await f.ledger()).admissions).toHaveLength(1);
   });
+  it.each(["admit", "unrelated version change", "provider started", "owned Stop", "unsettled predecessor",
+    "different candidate", "different workspace", "different Reviewer", "claim configuration changed"] as const)(
+    "keeps the sixth review receipt immutable for %s", async (scenario) => {
+    const base = await seed();
+    const { createReviewCycleBudget, admitReviewCycle, grantReviewCycles } = await import("../services/total-review-budget.js");
+    const timestamp = new Date().toISOString();
+    let budget = createReviewCycleBudget(base.company.id, base.issue.id);
+    for (let cycle = 1; cycle <= 5; cycle++) {
+      const history = await base.run(base.builder.id);
+      budget = admitReviewCycle(budget, {
+        id: randomUUID(), companyId: base.company.id, issueId: base.issue.id,
+        builderAgentId: base.builder.id, builderRunId: history.id,
+        candidateId: "synthetic prior candidate " + cycle, kind: "normal", scopeId: null,
+      }, timestamp).budget;
+    }
+    budget = grantReviewCycles(budget, {
+      id: randomUUID(), additionalCycles: 1, reason: "Synthetic sixth-cycle recovery fixture",
+    }, { userId: base.userId }, true, timestamp);
+    await db.insert(issueReviewCycleBudgets).values({
+      companyId: base.company.id, issueId: base.issue.id, ledger: budget,
+    });
+    await db.update(issues).set({ statusVersion: 20 }).where(eq(issues.id, base.issue.id));
+
+    const f = await stageFixture(base);
+    [f.wake] = await db.update(agentWakeupRequests).set({ status: "coalesced" })
+      .where(eq(agentWakeupRequests.id, f.wake.id)).returning();
+    const stage = await f.read();
+    const savedLedger = await f.ledger();
+    expect(stage).toMatchObject({ status: "in_review", statusVersion: 21, assigneeAgentId: f.reviewer.id });
+    expect(f.context.nativeStageStatusVersion).toBe(21);
+    expect(savedLedger.admissions).toHaveLength(6);
+    expect(savedLedger.allowances).toHaveLength(1);
+    await db.update(heartbeatRuns).set({
+      status: "failed", errorCode: "adapter_failed", error: "native_session_supervisor_busy", finishedAt: new Date(),
+      contextSnapshot: { ...f.context, nativeStatusWakeIntentId: f.wake.id },
+      runnerProfileJson: { nativeExecutionInput: { ...f.execution,
+        binding: { ...f.execution.binding, agentId: f.reviewer.id, runId: f.reviewerRun.id } } },
+    }).where(eq(heartbeatRuns.id, f.reviewerRun.id));
+    await db.update(issues).set({ executionRunId: null, checkoutRunId: null }).where(eq(issues.id, f.issue.id));
+
+    const { getNativeStageReviewAssignment, getNativeStageReviewRecoveryContext } =
+      await import("../services/native-runtime/native-stage-review.js");
+    const scope = { companyId: f.company.id, issueId: f.issue.id, agentId: f.reviewer.id };
+    expect(await getNativeStageReviewRecoveryContext(db, scope)).toMatchObject({
+      nativeStageStatusVersion: 21, nativeStageAdmissionId: savedLedger.admissions.at(-1).id,
+      nativeStatusWakeIntentId: f.wake.id,
+    });
+
+    if (scenario === "unrelated version change") {
+      await db.update(issues).set({ statusVersion: 23 }).where(eq(issues.id, f.issue.id));
+    } else {
+      // Start at the observed terminal-failure projection. The real committer
+      // must advance this same Builder result from blocked v22 to review v23.
+      await db.update(issues).set({ status: "blocked", statusVersion: 22 }).where(eq(issues.id, f.issue.id));
+      await db.insert(nativeRunFinalizations).values({
+        companyId: f.company.id, issueId: f.issue.id, runId: f.reviewerRun.id, phase: "terminal_failure",
+        failureCode: "native_continuation_requires_reconciliation", recoveryState: "blocked",
+      });
+      await db.insert(issueRecoveryActions).values({
+        companyId: f.company.id, sourceIssueId: f.issue.id, kind: "active_run_watchdog", status: "resolved",
+        ownerType: "board", returnOwnerAgentId: f.reviewer.id, cause: "native_continuation_requires_reconciliation",
+        fingerprint: randomUUID(), nextAction: "Inspect retained native startup",
+        evidence: { runId: f.reviewerRun.id, nativeFailureBlock: { runId: f.reviewerRun.id, statusVersion: 22 },
+          automaticRecovery: { replay: "blocked" } },
+      });
+      await db.insert(heartbeatRunEvents).values([
+        ...["native.coordinator.claim", "task.prepare"].map((span, index) => ({
+          companyId: f.company.id, agentId: f.reviewer.id, runId: f.reviewerRun.id, seq: index + 1,
+          eventType: "run.performance.span", stream: "system",
+          payload: { schema: "paperclip.run-performance-span.v1", span, outcome: index ? "failed" : "ok" },
+        })),
+        ...(scenario === "provider started" ? [{
+          companyId: f.company.id, agentId: f.reviewer.id, runId: f.reviewerRun.id, seq: 3,
+          eventType: "native.process_start_requested", stream: "system",
+        }] : []),
+      ]);
+      const [original] = await db.select().from(workAssessments)
+        .where(eq(workAssessments.id, f.candidate.assessmentId));
+      const [assessment] = await db.insert(workAssessments).values({
+        companyId: f.company.id, issueId: f.issue.id, runId: f.candidate.runId,
+        resultId: original.resultId, contractId: original.contractId,
+        triggerKind: "native_reconciliation", triggerActorCompanyId: f.company.id,
+        priorIssueStatus: "blocked", priorStatusVersion: 22, priorDecisionId: f.committed.decision.id,
+        policyVersion: original.policyVersion, assessmentJson: original.assessmentJson,
+        inputDigest: f.candidate.nativeSha256({ previous: original.id, source: "sixth-recovery-fixture" }),
+        supersedesAssessmentId: original.id,
+      }).returning();
+      const reassessed = await f.candidate.commitNativeStatusDecision({
+        ...f.candidate.input,
+        assessmentId: assessment.id,
+        priorStatus: "blocked",
+        priorStatusVersion: 22,
+        priorDecisionId: f.committed.decision.id,
+        supersedesCommittedDecisionId: f.committed.decision.id,
+        decision: { ...f.candidate.input.decision, effects: [{ kind: "append_superseding_assessment" }] },
+      });
+      const [savedProjection] = await db.select().from(statusDecisions)
+        .where(eq(statusDecisions.id, reassessed.decision.id));
+      expect(savedProjection).toMatchObject({
+        fromStatus: "blocked", toStatus: "in_review", reasonCode: "task_total_review_pending",
+        applicationState: "applied", supersedesDecisionId: f.committed.decision.id,
+        decisionJson: { priorStatusVersion: 22, projectedStatusVersion: 23 },
+      });
+      const effects = await db.select().from(statusDecisionEffects)
+        .where(eq(statusDecisionEffects.decisionId, reassessed.decision.id));
+      expect(effects.map(effect => effect.effectKind).sort()).toEqual([
+        "append_superseding_assessment", "issue_status_projection",
+      ]);
+      const [currentOwner] = await db.select().from(nativeRunFinalizations)
+        .where(eq(nativeRunFinalizations.runId, f.candidate.runId));
+      expect(currentOwner).toMatchObject({
+        phase: "committed", resultId: f.candidate.resultId, decisionId: reassessed.decision.id,
+      });
+    }
+    expect(await getNativeStageReviewAssignment(db, { ...scope, contextSnapshot: f.context })).toBeNull();
+    expect(await getNativeStageReviewRecoveryContext(db, scope)).toBeNull();
+
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { enabled: false, maxConcurrentRuns: 1 } } })
+      .where(eq(agents.id, f.reviewer.id));
+    const [occupied] = await db.insert(heartbeatRuns).values({
+      companyId: f.company.id, agentId: f.reviewer.id, status: "running", startedAt: new Date(),
+    }).returning();
+    const body = { idempotencyKey: randomUUID(), observedRunId: f.reviewerRun.id };
+
+    executionFixture.holdTaskRetryNudge = true;
+    try {
+      const response = await request(f.board).post("/api/issues/" + f.issue.id + "/retry").send(body);
+      expect(response.status, JSON.stringify(response.body)).toBe(202);
+      expect(response.body.accepted).toBe(true);
+      if (scenario === "owned Stop") await db.update(heartbeatRuns).set({ resultJson: { operatorInterrupted: true } })
+        .where(eq(heartbeatRuns.id, f.reviewerRun.id));
+      if (scenario === "unsettled predecessor") await db.update(nativeRunFinalizations).set({ leaseOwner: "retained-owner" })
+        .where(eq(nativeRunFinalizations.runId, f.reviewerRun.id));
+      if (scenario === "different workspace") await db.update(issues).set({
+        workspaceBindingRevision: stage.workspaceBindingRevision + 1,
+      }).where(eq(issues.id, f.issue.id));
+      if (scenario === "different Reviewer") await db.update(issues).set({ assigneeAgentId: f.builder.id })
+        .where(eq(issues.id, f.issue.id));
+      if (scenario === "different candidate") await db.update(nativeRunResults).set({ canonicalSha256: "1".repeat(64) })
+        .where(eq(nativeRunResults.id, f.candidate.resultId));
+
+      const heartbeat = await vi.importActual<typeof import("../services/heartbeat.js")>("../services/heartbeat.js");
+      const resume = () => heartbeat.heartbeatService(db).resumeTaskRetry(f.company.id, response.body.requestId);
+      const retries = () => db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, f.company.id),
+        sql`context_snapshot->>'taskRetryRequestId' = ${response.body.requestId}`,
+      ));
+      if (scenario !== "admit" && scenario !== "claim configuration changed") {
+        await expect(resume()).rejects.toMatchObject({ status: 409,
+          details: { code: "native_stage_review_retry_assignment_changed" } });
+        expect(await retries()).toHaveLength(0);
+      } else {
+        await resume();
+        const successors = await retries();
+        expect(successors).toHaveLength(1);
+        const successor = successors[0];
+        expect(successor).toMatchObject({ status: "queued", retryOfRunId: f.reviewerRun.id,
+          wakeupRequestId: response.body.requestId, contextSnapshot: {
+            nativeStageStatusVersion: 23, nativeStageRetryRequestId: response.body.requestId,
+            nativeStatusWakeIntentId: f.wake.id, nativeStageAdmissionId: savedLedger.admissions.at(-1).id,
+          },
+        });
+        const replay = await request(f.board).post("/api/issues/" + f.issue.id + "/retry").send(body);
+        expect(replay.body.requestId).toBe(response.body.requestId);
+        await resume();
+        expect(await retries()).toHaveLength(1);
+        await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() })
+          .where(eq(heartbeatRuns.id, occupied.id));
+        const { createHeartbeatQueueTestDependencies } = await import("./helpers/heartbeat-queue.js");
+        const { createHeartbeatQueue } = await import("../services/heartbeat/queue.js");
+        const { issueService } = await import("../services/issues.js");
+        const deps = createHeartbeatQueueTestDependencies(db), service = issueService(db);
+        deps.getAgent.mockImplementation(async id => (await db.select().from(agents).where(eq(agents.id, id)))[0]);
+        deps.issuesSvc.getDependencyReadiness.mockImplementation(service.getDependencyReadiness);
+        deps.issuesSvc.listDependencyReadiness.mockImplementation(service.listDependencyReadiness);
+        const claim = () => createHeartbeatQueue(db, deps).claimQueuedRun(successor);
+        if (scenario === "claim configuration changed") {
+          await db.update(agents).set({ adapterConfig: { modified: true } }).where(eq(agents.id, f.reviewer.id));
+          await expect(claim()).rejects.toMatchObject({ status: 403,
+            details: { code: "native_stage_review_retry_assignment_changed" } });
+        } else {
+          const claimed = await claim();
+          expect(claimed).toMatchObject({ id: successor.id, status: "running" });
+          expect(deps.executeRun).not.toHaveBeenCalled();
+          const protectedRun = await qualifyProtectedReview({ ...f, reviewerRun: claimed! }, true);
+          try {
+            const assignment = protectedRun.admission.record.assignment;
+            expect(assignment).toMatchObject({ kind: "execution_stage_review", statusVersion: 23 });
+            if (assignment.kind !== "execution_stage_review") throw new Error("Expected native stage");
+            const { decideNativeStageReview } = await import("../services/native-runtime/native-stage-review-decision.js");
+            const { nativeStageReviewOutcome } = await import("../services/native-runtime/native-stage-review.js");
+            const input = { ...scope, runId: successor.id, contextSnapshot: successor.contextSnapshot };
+            const verdict = { id: randomUUID(), stageId: assignment.stageId, admissionId: assignment.admissionId,
+              sourceDecisionId: assignment.sourceDecisionId, expectedStatusVersion: 23,
+              outcome: "approved" as const, body: "Approved exact synthetic sixth candidate" };
+            expect(await decideNativeStageReview(db, { ...input, request: verdict, actor: protectedRun.actor }))
+              .toMatchObject({ replayed: false });
+            expect(await decideNativeStageReview(db, { ...input, request: verdict, actor: protectedRun.actor }))
+              .toMatchObject({ replayed: true });
+            expect(await nativeStageReviewOutcome(db, input)).toBe("resolved");
+            expect(await f.read()).toMatchObject({ status: "in_review", assigneeUserId: f.userId,
+              executionState: { currentStageType: "approval" } });
+          } finally {
+            await protectedRun.close();
+          }
+
+          const approved = await f.read();
+          const { reassessNativeStatusFromSource } = await import("../services/native-runtime/native-status-reassessment.js");
+          const [builderOwner] = await db.select().from(nativeRunFinalizations)
+            .where(eq(nativeRunFinalizations.runId, f.candidate.runId));
+          expect(await reassessNativeStatusFromSource(db, {
+            companyId: f.company.id, issueId: f.issue.id, agentId: f.builder.id, runId: f.candidate.runId,
+            issueStatus: approved.status, issueStatusVersion: approved.statusVersion,
+            issueDecisionId: approved.lastStatusDecisionId, coordinatorPhase: "committed",
+            decisionId: builderOwner.decisionId, assessmentId: builderOwner.assessmentId,
+            nativeStatusWakeIntentId: null,
+          })).toMatchObject({ kind: "committed", result: { reconciliationAction: "prior_status_terminal_preserved" } });
+
+          // Synthetic accepted report after the actual Board and stage flows.
+          // The native finalizer must settle it without creating a new stage.
+          const contractId = randomUUID(), resultId = randomUUID();
+          const contract = { revision: "reassessed-stage-retry", objective: "Deliver the recorded review", criteria: [] };
+          const contractSha = f.candidate.nativeSha256(contract);
+          await db.insert(completionContracts).values({
+            id: contractId, companyId: f.company.id, issueId: f.issue.id, revision: approved.statusVersion + 1,
+            schemaVersion: "paperclip.completion-contract.v1", policyVersion: "phase6-v13",
+            risk: "standard", completionAuthority: "server_arbiter", incompleteCriteriaPolicy: "preserve_non_terminal",
+            contractJson: contract, canonicalSha256: contractSha, createdByActorType: "system",
+            createdByActorId: "reassessed-stage-retry-fixture",
+          });
+          await db.update(heartbeatRuns).set({
+            completionContractId: contractId, completionContractSha256: contractSha, status: "failed",
+            errorCode: "adapter_failed", finishedAt: new Date(), processPid: null, processGroupId: null,
+            processStartedAt: null,
+          }).where(eq(heartbeatRuns.id, successor.id));
+          const resultJson = {
+            result: { reportedWorkDisposition: "done", summary: "Exact sixth verdict recorded", attentionRequests: [] },
+            terminal: { runTerminalState: "succeeded" },
+          };
+          const resultSha = f.candidate.nativeSha256(resultJson);
+          await db.insert(nativeRunResults).values({
+            id: resultId, companyId: f.company.id, issueId: f.issue.id, runId: successor.id,
+            completionContractId: contractId, serverFingerprint: resultSha, schemaStatus: "accepted",
+            canonicalSha256: resultSha, resultJson,
+          });
+          await db.insert(nativeRunFinalizations).values({
+            runId: successor.id, companyId: f.company.id, issueId: f.issue.id, resultId,
+            phase: "retryable_failure", failureCode: "side_effect_planning_failed",
+          });
+          const { finalizeNativeRun } = await import("../services/native-runtime/native-run-finalizer.js");
+          expect(await finalizeNativeRun({
+            db, runId: successor.id, workspaceFinalizeStatus: "succeeded", projectRunStatus: true,
+            skipExternalConversationSettlement: true, skipExternalAgentSettlement: true,
+          })).toMatchObject({ phase: "committed", resultId });
+          const [settled] = await retries();
+          expect(settled.status).toBe("succeeded");
+          expect(await f.read()).toMatchObject({ statusVersion: approved.statusVersion, assigneeUserId: f.userId,
+            executionState: { currentStageType: "approval" } });
+          expect(await db.select().from(issueExecutionDecisions)
+            .where(eq(issueExecutionDecisions.createdByRunId, successor.id))).toHaveLength(1);
+        }
+      }
+    } finally {
+      executionFixture.holdTaskRetryNudge = false;
+    }
+
+    expect(await f.ledger()).toEqual(savedLedger);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, f.wake.id)))[0]).toEqual(f.wake);
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.reviewerRun.id)))[0].status).toBe("failed");
+  });
+
   it("normal-stage owner TaskRetry carries canonical authority from missing-context failure through real queue and protected startup",async()=>{
     const f=await stageFixture();
     const [failed]=await db.update(heartbeatRuns).set({runtimeMode:"legacy",nativeIssueId:null,status:"failed",errorCode:"adapter_failed",error:"Synthetic protected Reviewer startup failure",finishedAt:new Date(),resultJson:{executionRecovery:{kind:"bootstrap",providerWorkStarted:false}},contextSnapshot:{issueId:f.issue.id,taskId:f.issue.id,source:"issue.execution_review_recovery",retryReason:"execution_review_participant_recovery"}}).where(eq(heartbeatRuns.id,f.reviewerRun.id)).returning();

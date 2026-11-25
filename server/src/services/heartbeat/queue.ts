@@ -1,4 +1,4 @@
-import { deferredNativeStageReviewDispatchSql, getNativeStageReviewRecoveryContext } from "../native-runtime/native-stage-review.js";
+import { deferredNativeStageReviewDispatchSql, getNativeStageReviewAssignment, getNativeStageReviewRecoveryContext } from "../native-runtime/native-stage-review.js";
 import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../issue-execution-policy.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
 import { mutateNativeOperationalIssue, nativeOperationalIssueSnapshot } from "../native-operational-issue-mutation.js";
@@ -120,6 +120,7 @@ import {
 } from "@paperclipai/db";
 import {
   conflict,
+  forbidden,
   HttpError,
   notFound,
 } from "../../errors.js";
@@ -1570,6 +1571,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.agentId, run.agentId),
             )).for("update");
             if (!lockedRun || lockedRun.status !== "queued") return null;
+            if (lockedRun.contextSnapshot?.nativeStageRetryRequestId && (!issueId ||
+                !await getNativeStageReviewAssignment(claimTx as unknown as Db, {
+                  companyId: lockedRun.companyId, issueId, agentId: lockedRun.agentId, claimRunId: lockedRun.id,
+                  contextSnapshot: lockedRun.contextSnapshot, verifyRetryPhysical: true,
+                }))) throw forbidden("The saved native Reviewer Retry is no longer eligible to claim.", {
+                  code: "native_stage_review_retry_assignment_changed",
+                });
             await withExternalAdmissionGuard(claimTx, run.companyId, run.agentId, () => assertNoExternalOverlap(claimTx, run.companyId, run.agentId));
             await notifyChatRunMilestones(claimTx, { companyId: run.companyId, runId: run.id, issueId: issueId ?? undefined });
             const claimedRun = await claimTx.update(heartbeatRuns).set(claimValues).where(and(
@@ -3352,6 +3360,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return { kind: "skipped" as const };
           }
 
+          let reassessedStageRetry: { requestId: string; predecessorId: string } | undefined;
           if (taskRetryActorId) {
             await assertTaskRetryConversationAllowed(tx as unknown as Db, issue, taskRetryActorId);
             if (await retireSupersededTaskRetry(tx as unknown as Db, {
@@ -3363,10 +3372,18 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               // A durable user Retry owns this admission, not its failed run's
               // missing/stale hints. Resolve the current native candidate under
               // the same issue lock; all ordinary replay/cleanup gates remain.
-              const stage=await getNativeStageReviewRecoveryContext(tx as unknown as Db,{companyId:issue.companyId,issueId:issue.id,agentId});
+              const stage=await getNativeStageReviewRecoveryContext(tx as unknown as Db,{companyId:issue.companyId,issueId:issue.id,agentId,
+                boardRetryRequestId: durableRequest ? undefined : opts.taskRetryRequestId});
               if(!stage)throw conflict("The native review stage changed before Task Retry admission.",{code:"native_stage_review_retry_assignment_changed"});
-              Object.assign(enrichedContextSnapshot,stage);
-              payload={...payload,...stage,[DEFERRED_WAKE_CONTEXT_KEY]:{...enrichedContextSnapshot}};
+              let stageContext = stage;
+              if ("verifiedRetryPredecessorId" in stage) {
+                const { verifiedRetryPredecessorId, ...receiptContext } = stage;
+                reassessedStageRetry = { requestId: receiptContext.nativeStageRetryRequestId, predecessorId: verifiedRetryPredecessorId };
+                operatorResponsibleUserId = taskRetryActorId;
+                stageContext = receiptContext;
+              }
+              Object.assign(enrichedContextSnapshot, stageContext);
+              payload = { ...payload, ...stageContext, [DEFERRED_WAKE_CONTEXT_KEY]: { ...enrichedContextSnapshot } };
             }
           }
           const issueStateGuard = opts.issueStateGuard;
@@ -3637,6 +3654,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             queuedCommentInterruptId: opts.queuedCommentInterruptId,
             queuedCommentRequestId: opts.queuedCommentRequestId,
             taskRetryRequestId: opts.taskRetryRequestId,
+            verifiedReassessedReviewPredecessorId: reassessedStageRetry?.predecessorId,
             ...(durableRequest?.resumeDeferred && !failedChatRetry ? { durableChatRequest: durableRequest } : {}),
             dryRun: true,
             onBlocked: (reason, message) => { continuationBlocked = true; continuationWait = { reason, message }; },
@@ -4499,9 +4517,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             queuedCommentInterruptId: opts.queuedCommentInterruptId,
             queuedCommentRequestId: opts.queuedCommentRequestId,
             taskRetryRequestId: opts.taskRetryRequestId,
+            verifiedReassessedReviewPredecessorId: reassessedStageRetry?.predecessorId,
             ...(durableRequest?.resumeDeferred && !failedChatRetry ? { durableChatRequest: durableRequest } : {}),
             onBlocked: (reason, message) => { continuationBlocked = true; continuationWait = { reason, message }; },
           });
+          if (reassessedStageRetry && !explicitContinuation) return deferBlockedExecution(continuationHold());
           if (!explicitContinuation && (executionBlocker || (continuationBlocked && !verifiedConversationReset)) && !ownsReconstructionContinuation)
             return deferBlockedExecution(continuationHold());
           if (explicitContinuation) {
@@ -4551,7 +4571,15 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           };
           // A deferred durable chat wake already owns this ID and source.
           // Promote that receipt in the same transaction as its successor.
-          const wakeupRequest = durableRequest && executionWaitRequestId === durableRequest.id
+          const wakeupRequest = reassessedStageRetry
+            ? await tx.update(agentWakeupRequests).set({
+                payload: sql`${agentWakeupRequests.payload} || ${JSON.stringify(payload)}::jsonb`,
+                status: "queued", error: null, finishedAt: null, updatedAt: new Date(),
+              }).where(and(eq(agentWakeupRequests.id, reassessedStageRetry.requestId),
+                eq(agentWakeupRequests.companyId, agent.companyId),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId)))
+                .returning().then(rows => rows[0])
+            : durableRequest && executionWaitRequestId === durableRequest.id
             ? await tx.update(agentWakeupRequests).set({
                 payload, status: "queued", error: null, finishedAt: null, updatedAt: new Date(),
               }).where(and(eq(agentWakeupRequests.id, durableRequest.id),
@@ -4601,7 +4629,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   )
                   .orderBy(asc(agentWakeupRequests.requestedAt))
               : [];
-          const adoptedComments = pendingComments.filter((wake) => {
+          const adoptedComments = reassessedStageRetry ? [] : pendingComments.filter((wake) => {
             if (wake.id === executionWaitRequestId) return true;
             if (wake.id === opts.queuedCommentInterruptId || wake.id === opts.queuedCommentRequestId) return true;
             const deferredPayload = parseObject(wake.payload);
@@ -4628,7 +4656,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               ...queuedCommentIdsFromRunContext(enrichedContextSnapshot),
             ]),
           ];
-          if (opts.queuedCommentRequestId || (opts.taskRetryRequestId && !failedChatRetry) || handoffSource) {
+          if (!reassessedStageRetry && (opts.queuedCommentRequestId || (opts.taskRetryRequestId && !failedChatRetry) || handoffSource)) {
             adoptedCommentIds = await undeliveredLegacyUserCommentIds(tx as unknown as Db,
               agent.companyId, issueId, agentId, adoptedCommentIds);
           }
@@ -4646,9 +4674,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               status: "queued",
               responsibleUserId: await resolveQueuedResponsibleUserId(),
               wakeupRequestId: wakeupRequest.id,
-              retryOfRunId: failedChatRetry
+              retryOfRunId: reassessedStageRetry?.predecessorId ?? (failedChatRetry
                 ? durableRequest!.failedRunRetry!.failedRunId
-                : opts.failedRunId ?? automaticParentRunId,
+                : opts.failedRunId ?? automaticParentRunId),
               contextSnapshot: adoptedComments.length
                 ? withQueuedCommentIdsInRunContext(
                     enrichedContextSnapshot,

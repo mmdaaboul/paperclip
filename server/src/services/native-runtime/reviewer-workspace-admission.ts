@@ -108,7 +108,7 @@ export async function prepareNativeReviewerWorkspaceAdmission(db: Db, input: {
       const [workspace] = await tx.select().from(executionWorkspaces).where(and(eq(executionWorkspaces.id, binding.workspaceId), eq(executionWorkspaces.companyId, binding.companyId))).for("share");
       if (!workspace || workspace.status !== "active" || workspace.projectId !== binding.projectId || workspace.cwd !== input.workspaceDirectory) throw forbidden("Reviewer candidate must be the actual native-owned task workspace");
     }
-    const assignment = await resolveNativeReviewerAssignment(tx as unknown as Db, { ...binding, contextSnapshot: run.contextSnapshot,
+    const assignment = await resolveNativeReviewerAssignment(tx as unknown as Db, { ...binding, contextSnapshot: run.contextSnapshot, claimRunId: run.id,
       ...(run.nativeIssueId ? { actingRunId: run.id } : {}), issueExecutionRunId: issue.executionRunId });
     if (!assignment) throw forbidden("This run has no actual current native completion, scoped or execution-stage Reviewer assignment");
     if (run.contextSnapshot?.sourceRunId !== undefined && run.contextSnapshot.sourceRunId !== assignment.sourceRun.id) throw forbidden("Reviewer source run context does not match the native review");

@@ -11214,18 +11214,32 @@ describe("native warm session supervision", () => {
       expect(nextCopy.collectStopped).not.toHaveBeenCalled();
       await reservation!.release();
     });
-    it("still rejects a session identity rotation over another run's directory reservation", async () => {
+    it.each([false, true])("rejects identity rotation over another run's directory reservation (native Runner: %s)", async (useRunnerd) => {
       const f = await start("managed-identity-foreign");
       const reservation = await f.reserve(async () => true);
       const next = { ...f.current, binding: { ...f.current.binding, runId: "managed-identity-foreign-three" },
         session: { ...f.current.session, normalizedSessionId: "managed-identity-foreign-rotated" } } as NativeExecutionInputV1;
       state.execute.mockClear();
-      await expect(executePaperclipNativeSession({ db: leaseDb(next), execution: next, runnerInstanceId: "foreign",
-        runnerExecutionTarget: f.target, instructionWorkingCopy: { ...f.copy, runId: next.binding.runId } }))
-        .rejects.toThrow("native_session_supervisor_busy");
-      expect(state.execute).not.toHaveBeenCalled();
-      expect(f.close).not.toHaveBeenCalled();
-      await reservation!.release();
+      const onEvent = vi.fn(async (_event: unknown) => undefined);
+      try {
+        await expect(executePaperclipNativeSession({
+          db: leaseDb(next), execution: next, runnerInstanceId: "foreign",
+          runnerExecutionTarget: f.target, instructionWorkingCopy: { ...f.copy, runId: next.binding.runId },
+          useRunnerd, onEvent,
+        })).rejects.toThrow("native_session_supervisor_busy");
+        expect(state.execute).not.toHaveBeenCalled();
+        expect(f.close).not.toHaveBeenCalled();
+        if (useRunnerd) {
+          const spans = onEvent.mock.calls.map(([event]) =>
+            (event as { payload?: { span?: string; outcome?: string } }).payload);
+          expect(spans).toEqual(expect.arrayContaining([
+            expect.objectContaining({ span: "native.coordinator.claim", outcome: "ok" }),
+            expect.objectContaining({ span: "task.prepare", outcome: "failed" }),
+          ]));
+        }
+      } finally {
+        await reservation!.release();
+      }
     });
     it("cannot reuse a provider with a different registered directory", async () => {
       const f = await start("managed-root-replaced");

@@ -138,6 +138,8 @@ export async function admitExplicitNativeContinuation(input: {
   reason: string | null; commentId: string | null; successorRunId: string;
   failedRunId?: string | null;
   taskRetryRequestId?: string;
+  /** Internal queue proof made under the issue lock for this exact Board Retry. */
+  verifiedReassessedReviewPredecessorId?: string;
   queuedCommentInterruptId?: string;
   /** Internal delivery of an unconsumed, user-authored saved queue entry. */
   queuedCommentRequestId?: string;
@@ -255,6 +257,10 @@ export async function admitExplicitNativeContinuation(input: {
   )).for("update");
   const sourceChecks: Array<{ id?: string; cause: string; evidence: Record<string, unknown> }> =
     actions.map(action => ({ id: action.id, cause: action.cause, evidence: action.evidence }));
+  if (input.verifiedReassessedReviewPredecessorId && (sourceChecks.length !== 1 ||
+      sourceChecks[0]?.evidence.runId !== input.verifiedReassessedReviewPredecessorId)) {
+    return blocked("review_retry_source_changed", "This Reviewer Retry no longer owns the exact failure hold.");
+  }
   if (nativeQueuedSend) {
     const [latest] = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, runtimeMode: heartbeatRuns.runtimeMode })
       .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId),
@@ -455,6 +461,8 @@ export async function admitExplicitNativeContinuation(input: {
       return blocked("cancelled_by_operator", "Inspect the stopped run and send a new message to continue.");
     if (cancelledStartup) cancelledStartupIds.add(run.id);
     if (run.runtimeMode !== "native" && !unusedAdmission && !legacyUserTurn && !cancelledStartup) return null;
+    const reassessedReviewPrelaunch = input.reason === "task_retry" && taskRetry?.sourceRunId === run.id &&
+      input.verifiedReassessedReviewPredecessorId === run.id;
     // A provider failure can finish the normal result/assessment commit path.
     // Its accepted failed result is immutable history, not a live controller.
     // Only a new user turn may pass this gate; the process/lease stop proofs
@@ -512,6 +520,7 @@ export async function admitExplicitNativeContinuation(input: {
         if (!run.processPid && !run.processGroupId &&
             !await hasNativeLocalProcessStop(db, companyId, run.id) &&
             !await hasHistoricalSuspendedNativeSession(db, run) &&
+            !reassessedReviewPrelaunch &&
             !await nativeRunRefusedBeforeLaunch(db, run) &&
             !await isUnclaimedScopedReturnPreparation(db, { companyId, issueId, runId: run.id }) &&
             !(run.runtimeMode === "native" &&

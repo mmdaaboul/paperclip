@@ -6,6 +6,7 @@ import { issueReviewCycleBudgetSchema } from "@paperclipai/shared";
 import { normalizeIssueExecutionPolicy, parseIssueExecutionState } from "../issue-execution-policy.js";
 import { parseNativeExecutionInput } from "../../vendor/paperclip-runner/index.js";
 import { nativeSha256 } from "./canonical.js";
+import { readStageRetryLineage, readStageRetryReceipt, stageRetryConfigurationDigest, verifyStageRetryPredecessor } from "./native-stage-review-retry.js";
 
 /** Resolve the native committer's durable intent through its exact effect.
  * The dispatcher creates a SECOND row with the same idempotency key; its
@@ -36,7 +37,16 @@ function stageWakeTupleMatches(wake:typeof agentWakeupRequests.$inferSelect,cont
  * latest task ledger, committed native result/decision and durable stage wake
  * must all name the same candidate, selected independent Reviewer and version.
  */
-export async function getNativeStageReviewAssignment(db:Db,input:{companyId:string;issueId:string;agentId:string;runId?:string;contextSnapshot:unknown}) {
+type StageAssignmentInput = {
+  companyId: string; issueId: string; agentId: string; runId?: string;
+  claimRunId?: string; verifyRetryPhysical?: boolean; contextSnapshot: unknown;
+};
+
+export async function getNativeStageReviewAssignment(db: Db, input: StageAssignmentInput) {
+  return readStageAssignment(db, input);
+}
+
+async function readStageAssignment(db: Db, input: StageAssignmentInput, boardRetryRequestId?: string) {
   const context=readNativeStageReviewContext(input.contextSnapshot);
   if(!context)return null;
   const [issue]=await db.select().from(issues).where(and(eq(issues.id,input.issueId),eq(issues.companyId,input.companyId)));
@@ -54,16 +64,41 @@ export async function getNativeStageReviewAssignment(db:Db,input:{companyId:stri
   const [coordinator]=await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId,admission.builderRunId));
   if(!sourceRun || sourceRun.runtimeMode!=="native" || !result || result.schemaStatus!=="accepted" || admission.candidateId!==`native-result:${result.id}:${result.canonicalSha256}`
     || !sourceDecision || sourceDecision.applicationState!=="applied" || coordinator?.resultId!==result.id || coordinator.decisionId!==sourceDecision.id) return null;
-  const wake=await nativeStageWakeIntent(db,{...input,decisionId:sourceDecision.id,stageId:stage.id,intentId:context.nativeStatusWakeIntentId});
-  if(!wake || ["cancelled","skipped","failed"].includes(wake.status) || !stageWakeTupleMatches(wake,context)) return null;
-  const capturedStage=(wake.payload as {executionStage?:{policySha256?:unknown;workspaceBindingRevision?:unknown;executionWorkspaceId?:unknown}}|null)?.executionStage;
+  const retryRequestId = context.nativeStageRetryRequestId;
+  const retryRunId = input.runId ?? input.claimRunId;
+  const retry = retryRequestId && (retryRunId || retryRequestId === boardRetryRequestId)
+    ? await readStageRetryReceipt(db, input, { requestId: retryRequestId, runId: retryRunId }) : null;
+  if (retryRequestId && !retry) return null;
+  const lineage = retry ? await readStageRetryLineage(db, sourceDecision, result) : null;
+  if (retry && (!lineage || coordinator.phase !== "committed" || coordinator.leaseOwner ||
+      coordinator.assessmentId !== sourceDecision.assessmentId || issue.lastStatusDecisionId !== sourceDecision.id ||
+      sourceDecision.decisionJson.projectedStatusVersion !== issue.statusVersion ||
+      result.completionContractId !== sourceRun.completionContractId)) return null;
+  const origin = lineage ? {
+    ...context, nativeStageDecisionId: lineage.original.id, nativeStageStatusVersion: lineage.wakeVersion,
+  } : context;
+  const wake=await nativeStageWakeIntent(db,{...input,decisionId:origin.nativeStageDecisionId,stageId:stage.id,intentId:context.nativeStatusWakeIntentId});
+  if(!wake || ["cancelled","skipped","failed"].includes(wake.status) || !stageWakeTupleMatches(wake,origin)) return null;
+  const capturedStage=(wake.payload as {executionStage?:{policySha256?:unknown;workspaceBindingRevision?:unknown;executionWorkspaceId?:unknown;reviewRequest?:unknown}}|null)?.executionStage;
   if(capturedStage?.policySha256!==nativeSha256(policy) || capturedStage.workspaceBindingRevision!==issue.workspaceBindingRevision || capturedStage.executionWorkspaceId!==issue.executionWorkspaceId) return null;
+  if (retry && (wake.status !== "coalesced" || wake.reason !== "execution_review_requested" ||
+      nativeSha256(capturedStage.reviewRequest ?? null) !== nativeSha256(state.reviewRequest ?? null))) return null;
   let execution;try {execution=parseNativeExecutionInput(sourceRun.runnerProfileJson?.nativeExecutionInput);}catch{return null;}
   if(execution.binding.companyId!==input.companyId || execution.binding.agentId!==admission.builderAgentId || execution.binding.runId!==sourceRun.id || execution.binding.issueId!==input.issueId || !issue.executionWorkspaceId) return null;
   const [workspace]=await db.select().from(executionWorkspaces).where(and(eq(executionWorkspaces.id,issue.executionWorkspaceId),eq(executionWorkspaces.companyId,input.companyId)));
   if(!workspace || workspace.cwd!==execution.workspace.cwd || workspace.id!==execution.binding.executionWorkspaceId) return null;
   const [agent]=await db.select().from(agents).where(and(eq(agents.id,input.agentId),eq(agents.companyId,input.companyId)));
   if(!agent || agent.adapterType!=="paperclip_runner" || ["paused","terminated"].includes(agent.status)) return null;
+  const retryConfigDigest = retry ? stageRetryConfigurationDigest(agent) : null;
+  if (retry && retryRunId && (context.nativeStageRetryConfigDigest !== retryConfigDigest ||
+      retry.receipt.payload?.nativeStageRetryConfigDigest !== retryConfigDigest || !stageWakeTupleMatches(retry.receipt, context))) return null;
+  if (retry && lineage && (!workspace.cwd || !await verifyStageRetryPredecessor(db, input, {
+    sourceRunId: retry.sourceRunId, wakeId: wake.id, originalDecisionId: lineage.original.id,
+    admissionId: admission.id, wakeVersion: lineage.wakeVersion, blockedVersion: lineage.blockedVersion,
+    workspaceId: workspace.id, workspaceCwd: workspace.cwd, successorRunId: retryRunId,
+    requestId: retry.receipt.id, actorId: retry.actorId,
+    checkPhysical: !retryRunId || input.verifyRetryPhysical === true,
+  }))) return null;
   let actingRun:typeof heartbeatRuns.$inferSelect|undefined;
   if(input.runId) {
     [actingRun]=await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.id,input.runId),eq(heartbeatRuns.companyId,input.companyId),eq(heartbeatRuns.agentId,input.agentId),eq(heartbeatRuns.nativeIssueId,input.issueId)));
@@ -71,10 +106,11 @@ export async function getNativeStageReviewAssignment(db:Db,input:{companyId:stri
     if(!actingRun || actingRun.status!=="running" || actingRun.runtimeMode!=="native" || issue.executionRunId!==actingRun.id || actual?.nativeStageDecisionId!==sourceDecision.id || actual.nativeStageAdmissionId!==admission.id || actual.nativeStageStatusVersion!==issue.statusVersion) return null;
   }
   return {issue,policy,state,stage,admission,sourceRun,sourceDecision,result,execution,workspace,wake,actingRun,
-    policySha256:nativeSha256(policy),executionSha256:nativeSha256(execution)};
+    policySha256:nativeSha256(policy),executionSha256:nativeSha256(execution),retry, retryConfigDigest};
 }
 
-const stageContextSchema=z.object({nativeStageDecisionId:z.string().guid(),nativeStageAdmissionId:z.string().guid(),nativeStageStatusVersion:z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),nativeStatusWakeIntentId:z.string().guid().optional()});
+const stageContextSchema=z.object({nativeStageDecisionId:z.string().guid(),nativeStageAdmissionId:z.string().guid(),nativeStageStatusVersion:z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),nativeStatusWakeIntentId:z.string().guid().optional(),
+  nativeStageRetryRequestId:z.string().guid().optional(),nativeStageRetryConfigDigest:z.string().regex(/^[0-9a-f]{64}$/).optional()});
 export function readNativeStageReviewContext(value:unknown) {
   if(!value || typeof value!=="object" || Array.isArray(value))return null;
   if(!["nativeStageDecisionId","nativeStageAdmissionId","nativeStageStatusVersion"].some(key=>Object.hasOwn(value,key)))return null;
@@ -85,7 +121,7 @@ export function readNativeStageReviewContext(value:unknown) {
 /** Recovery derives fresh authority from the current server-owned ledger and
  * committer, then reuses every normal-stage guard. It never copies authority
  * from a failed run, generic stage hints or caller-supplied recovery text. */
-export async function getNativeStageReviewRecoveryContext(db:Db,input:{companyId:string;issueId:string;agentId:string}) {
+export async function getNativeStageReviewRecoveryContext(db:Db,input:{companyId:string;issueId:string;agentId:string;boardRetryRequestId?:string}) {
   const [issue]=await db.select().from(issues).where(and(eq(issues.companyId,input.companyId),eq(issues.id,input.issueId)));
   const [ledger]=await db.select().from(issueReviewCycleBudgets).where(and(eq(issueReviewCycleBudgets.companyId,input.companyId),eq(issueReviewCycleBudgets.issueId,input.issueId)));
   const admission=ledger?issueReviewCycleBudgetSchema.parse(ledger.ledger).admissions.at(-1):null;
@@ -93,9 +129,15 @@ export async function getNativeStageReviewRecoveryContext(db:Db,input:{companyId
   const [coordinator]=await db.select().from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.companyId,input.companyId),eq(nativeRunFinalizations.issueId,input.issueId),eq(nativeRunFinalizations.runId,admission.builderRunId)));
   if(!coordinator?.decisionId)return null;
   const context={nativeStageDecisionId:coordinator.decisionId,nativeStageAdmissionId:admission.id,nativeStageStatusVersion:issue.statusVersion};
-  const proof=await getNativeStageReviewAssignment(db,{...input,contextSnapshot:context});
-  if(!proof)return null;
-  return {...context,nativeStatusWakeIntentId:proof.wake.id,executionStage:proof.wake.payload?.executionStage,forceFreshSession:true};
+  const ordinary=await getNativeStageReviewAssignment(db,{...input,contextSnapshot:context});
+  if (ordinary) return { ...context, nativeStatusWakeIntentId: ordinary.wake.id,
+    executionStage: ordinary.wake.payload?.executionStage, forceFreshSession: true };
+  if (!input.boardRetryRequestId) return null;
+  const rebound = { ...context, nativeStageRetryRequestId: input.boardRetryRequestId };
+  const proof = await readStageAssignment(db, {...input,contextSnapshot:rebound}, input.boardRetryRequestId);
+  if (!proof?.retry || !proof.retryConfigDigest) return null;
+  return {...rebound,nativeStatusWakeIntentId:proof.wake.id,executionStage:proof.wake.payload?.executionStage,
+    nativeStageRetryConfigDigest:proof.retryConfigDigest,verifiedRetryPredecessorId:proof.retry.sourceRunId,forceFreshSession:true};
 }
 
 /** A discovery predicate, never admission authority. Revalidate the receipt
@@ -224,11 +266,21 @@ async function readHistoricalNativeStageDecision(
   const [sourceDecision]=await db.select().from(statusDecisions).where(and(eq(statusDecisions.id,record.sourceDecisionId),eq(statusDecisions.companyId,input.companyId),eq(statusDecisions.issueId,input.issueId),eq(statusDecisions.runId,record.sourceRunId)));
   const [result]=await db.select().from(nativeRunResults).where(and(eq(nativeRunResults.id,record.admissionId),eq(nativeRunResults.companyId,input.companyId),eq(nativeRunResults.issueId,input.issueId),eq(nativeRunResults.runId,record.sourceRunId)));
   const [coordinator]=await db.select().from(nativeRunFinalizations).where(and(eq(nativeRunFinalizations.runId,record.sourceRunId),eq(nativeRunFinalizations.companyId,input.companyId),eq(nativeRunFinalizations.issueId,input.issueId)));
-  const wake=await nativeStageWakeIntent(db,{...input,decisionId:record.sourceDecisionId,stageId:record.stageId,intentId:context.nativeStatusWakeIntentId});
-  const captured=(wake?.payload as {executionStage?:{policySha256?:unknown;workspaceBindingRevision?:unknown}}|null)?.executionStage;
   if(!sourceRun || sourceRun.runtimeMode!=="native" || !sourceDecision || sourceDecision.applicationState!=="applied" || !result || result.schemaStatus!=="accepted"
     || result.completionContractId!==sourceRun.completionContractId || admission.candidateId!==`native-result:${result.id}:${result.canonicalSha256}`
-    || coordinator?.resultId!==result.id || !wake || !stageWakeTupleMatches(wake,{nativeStageDecisionId:record.sourceDecisionId,nativeStageAdmissionId:record.admissionId,nativeStageStatusVersion:record.statusVersion}) || captured?.policySha256!==record.policySha256 || captured.workspaceBindingRevision!==record.workspaceBindingRevision)return null;
+    || coordinator?.resultId!==result.id) return null;
+  const retry = context.nativeStageRetryRequestId ? await readStageRetryReceipt(db, input, {
+    requestId: context.nativeStageRetryRequestId, runId: run.id, historical: true,
+  }) : null;
+  const lineage = retry ? await readStageRetryLineage(db, sourceDecision, result) : null;
+  if (context.nativeStageRetryRequestId && (!lineage || sourceDecision.decisionJson.projectedStatusVersion !== record.statusVersion ||
+      retry?.receipt.payload?.nativeStageRetryConfigDigest !== context.nativeStageRetryConfigDigest)) return null;
+  const wakeDecisionId = lineage?.original.id ?? record.sourceDecisionId;
+  const wake=await nativeStageWakeIntent(db,{...input,decisionId:wakeDecisionId,stageId:record.stageId,intentId:context.nativeStatusWakeIntentId});
+  const captured=(wake?.payload as {executionStage?:{policySha256?:unknown;workspaceBindingRevision?:unknown}}|null)?.executionStage;
+  if (!wake || !stageWakeTupleMatches(wake,{nativeStageDecisionId:wakeDecisionId,nativeStageAdmissionId:record.admissionId,
+      nativeStageStatusVersion:lineage?.wakeVersion ?? record.statusVersion}) || captured?.policySha256!==record.policySha256 ||
+      captured.workspaceBindingRevision!==record.workspaceBindingRevision) return null;
   let execution;try{execution=parseNativeExecutionInput(sourceRun.runnerProfileJson?.nativeExecutionInput);}catch{return null;}
   if(nativeSha256(execution)!==record.executionSha256)return null;
   if (coordinator.decisionId !== sourceDecision.id && (!allowBuilderPreserveForFinalization
