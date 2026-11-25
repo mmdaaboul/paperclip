@@ -257,10 +257,6 @@ export async function admitExplicitNativeContinuation(input: {
   )).for("update");
   const sourceChecks: Array<{ id?: string; cause: string; evidence: Record<string, unknown> }> =
     actions.map(action => ({ id: action.id, cause: action.cause, evidence: action.evidence }));
-  if (input.verifiedReassessedReviewPredecessorId && (sourceChecks.length !== 1 ||
-      sourceChecks[0]?.evidence.runId !== input.verifiedReassessedReviewPredecessorId)) {
-    return blocked("review_retry_source_changed", "This Reviewer Retry no longer owns the exact failure hold.");
-  }
   if (nativeQueuedSend) {
     const [latest] = await db.select({ id: heartbeatRuns.id, status: heartbeatRuns.status, runtimeMode: heartbeatRuns.runtimeMode })
       .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, agentId),
@@ -306,6 +302,10 @@ export async function admitExplicitNativeContinuation(input: {
       || adapterExecutionControls.has(source.id) ||
       !(await isFailedNativePreparation(db, source, coordinator) || await isPreDispatchExecutionWaitVerified(db, source))) return null;
     sourceChecks.push({ cause: "legacy_execution_requires_reconciliation", evidence: { runId: source.id } });
+  }
+  if (input.verifiedReassessedReviewPredecessorId && (sourceChecks.length !== 1 ||
+      sourceChecks[0]?.evidence.runId !== input.verifiedReassessedReviewPredecessorId)) {
+    return blocked("review_retry_source_changed", "This Reviewer Retry no longer owns the exact failure hold.");
   }
   if (!sourceChecks.length && !nativeQueuedSend) return null;
   if (blocker && blocker.recoveryActionId === null) return null;

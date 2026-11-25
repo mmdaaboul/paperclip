@@ -1065,7 +1065,8 @@ describe("actual normal PATCH + native postgres-js + native issue service (injec
     expect((await f.ledger()).admissions).toHaveLength(1);
   });
   it.each(["admit", "unrelated version change", "provider started", "owned Stop", "unsettled predecessor",
-    "different candidate", "different workspace", "different Reviewer", "claim configuration changed"] as const)(
+    "different candidate", "different workspace", "different Reviewer", "claim configuration changed",
+    "recover claimed startup failure", "refuse failed claimed retry with provider evidence"] as const)(
     "keeps the sixth review receipt immutable for %s", async (scenario) => {
     const base = await seed();
     const { createReviewCycleBudget, admitReviewCycle, grantReviewCycles } = await import("../services/total-review-budget.js");
@@ -1187,6 +1188,8 @@ describe("actual normal PATCH + native postgres-js + native issue service (injec
       companyId: f.company.id, agentId: f.reviewer.id, status: "running", startedAt: new Date(),
     }).returning();
     const body = { idempotencyKey: randomUUID(), observedRunId: f.reviewerRun.id };
+    const failedClaimRecovery = scenario === "recover claimed startup failure" ||
+      scenario === "refuse failed claimed retry with provider evidence";
 
     executionFixture.holdTaskRetryNudge = true;
     try {
@@ -1206,12 +1209,12 @@ describe("actual normal PATCH + native postgres-js + native issue service (injec
         .where(eq(nativeRunResults.id, f.candidate.resultId));
 
       const heartbeat = await vi.importActual<typeof import("../services/heartbeat.js")>("../services/heartbeat.js");
-      const resume = () => heartbeat.heartbeatService(db).resumeTaskRetry(f.company.id, response.body.requestId);
-      const retries = () => db.select().from(heartbeatRuns).where(and(
+      const resume = (id = response.body.requestId) => heartbeat.heartbeatService(db).resumeTaskRetry(f.company.id, id);
+      const retries = (id = response.body.requestId) => db.select().from(heartbeatRuns).where(and(
         eq(heartbeatRuns.companyId, f.company.id),
-        sql`context_snapshot->>'taskRetryRequestId' = ${response.body.requestId}`,
+        sql`context_snapshot->>'taskRetryRequestId' = ${id}`,
       ));
-      if (scenario !== "admit" && scenario !== "claim configuration changed") {
+      if (scenario !== "admit" && scenario !== "claim configuration changed" && !failedClaimRecovery) {
         await expect(resume()).rejects.toMatchObject({ status: 409,
           details: { code: "native_stage_review_retry_assignment_changed" } });
         expect(await retries()).toHaveLength(0);
@@ -1219,7 +1222,7 @@ describe("actual normal PATCH + native postgres-js + native issue service (injec
         await resume();
         const successors = await retries();
         expect(successors).toHaveLength(1);
-        const successor = successors[0];
+        let successor = successors[0];
         expect(successor).toMatchObject({ status: "queued", retryOfRunId: f.reviewerRun.id,
           wakeupRequestId: response.body.requestId, contextSnapshot: {
             nativeStageStatusVersion: 23, nativeStageRetryRequestId: response.body.requestId,
@@ -1237,6 +1240,9 @@ describe("actual normal PATCH + native postgres-js + native issue service (injec
         const { issueService } = await import("../services/issues.js");
         const deps = createHeartbeatQueueTestDependencies(db), service = issueService(db);
         deps.getAgent.mockImplementation(async id => (await db.select().from(agents).where(eq(agents.id, id)))[0]);
+        deps.setWakeupStatus.mockImplementation(async (id, status, patch) => {
+          if (id) await db.update(agentWakeupRequests).set({ ...patch, status }).where(eq(agentWakeupRequests.id, id));
+        });
         deps.issuesSvc.getDependencyReadiness.mockImplementation(service.getDependencyReadiness);
         deps.issuesSvc.listDependencyReadiness.mockImplementation(service.listDependencyReadiness);
         const claim = () => createHeartbeatQueue(db, deps).claimQueuedRun(successor);
@@ -1245,9 +1251,105 @@ describe("actual normal PATCH + native postgres-js + native issue service (injec
           await expect(claim()).rejects.toMatchObject({ status: 403,
             details: { code: "native_stage_review_retry_assignment_changed" } });
         } else {
-          const claimed = await claim();
+          let claimed = await claim();
           expect(claimed).toMatchObject({ id: successor.id, status: "running" });
           expect(deps.executeRun).not.toHaveBeenCalled();
+          let activeRequestId: string = response.body.requestId;
+          if (failedClaimRecovery) {
+            // Reproduce the durable pre-fix failure after the real queue claim.
+            const finishedAt = new Date();
+            const [retainedFailure] = await db.update(heartbeatRuns).set({
+              status: "failed", executionStage: "preparing", errorCode: "setup_failed",
+              error: "continuation_user_authorization_missing", finishedAt, controllerLeaseExpiresAt: null,
+              resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+            }).where(eq(heartbeatRuns.id, successor.id)).returning();
+            const [retainedReceipt] = await db.update(agentWakeupRequests)
+              .set({ status: "failed", finishedAt }).where(eq(agentWakeupRequests.id, activeRequestId)).returning();
+            await db.update(issues).set({ executionRunId: null, checkoutRunId: null }).where(eq(issues.id, f.issue.id));
+            const [originalAuthority] = await db.select().from(issueRecoveryActions).where(and(
+              eq(issueRecoveryActions.sourceIssueId, f.issue.id),
+              sql`evidence#>>'{explicitUserContinuation,runId}' = ${retainedFailure.id}`,
+            ));
+            expect(originalAuthority).toBeDefined();
+            if (scenario === "refuse failed claimed retry with provider evidence") {
+              await db.insert(heartbeatRunEvents).values({
+                companyId: f.company.id, agentId: f.reviewer.id, runId: retainedFailure.id,
+                seq: 1, eventType: "native.process_start_requested", stream: "system",
+              });
+            }
+            const stale = await request(f.board).post("/api/issues/" + f.issue.id + "/retry")
+              .send({ idempotencyKey: randomUUID(), observedRunId: f.reviewerRun.id });
+            expect(stale.body).toMatchObject({ accepted: false, stale: true, observedRunId: retainedFailure.id });
+            // Keep the real dispatcher from contacting a provider while the
+            // test crosses task preparation and protected startup explicitly.
+            const [secondOccupied] = await db.insert(heartbeatRuns).values({
+              companyId: f.company.id, agentId: f.reviewer.id, status: "running", startedAt: new Date(),
+            }).returning();
+            const nextBody = { idempotencyKey: randomUUID(), observedRunId: retainedFailure.id };
+            const next = await request(f.board).post("/api/issues/" + f.issue.id + "/retry").send(nextBody);
+            expect(next.status, JSON.stringify(next.body)).toBe(202);
+            activeRequestId = next.body.requestId;
+            if (scenario === "refuse failed claimed retry with provider evidence") {
+              await expect(resume(activeRequestId)).rejects.toMatchObject({ status: 409,
+                details: { code: "native_stage_review_retry_assignment_changed" } });
+              expect(await retries(activeRequestId)).toHaveLength(0);
+              expect(await f.ledger()).toEqual(savedLedger);
+              return;
+            }
+            await resume(activeRequestId);
+            const resumed = await retries(activeRequestId);
+            expect(resumed).toHaveLength(1);
+            successor = resumed[0];
+            expect(successor).toMatchObject({ status: "queued", retryOfRunId: retainedFailure.id,
+              wakeupRequestId: activeRequestId });
+            const duplicate = await request(f.board).post("/api/issues/" + f.issue.id + "/retry").send(nextBody);
+            expect(duplicate.body.requestId).toBe(activeRequestId);
+            await resume(activeRequestId);
+            expect(await retries(activeRequestId)).toHaveLength(1);
+            await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() })
+              .where(eq(heartbeatRuns.id, secondOccupied.id));
+            claimed = await claim();
+            expect(claimed).toMatchObject({ id: successor.id, status: "running" });
+            expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retainedFailure.id)))[0])
+              .toEqual(retainedFailure);
+            expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, retainedReceipt.id)))[0])
+              .toEqual(retainedReceipt);
+            expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, originalAuthority.id)))[0])
+              .toEqual(originalAuthority);
+          }
+          const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, activeRequestId));
+          expect(receipt).toMatchObject({ status: "claimed", runId: claimed!.id });
+          const { createHeartbeatRunPreparation } = await import("../services/heartbeat/run-preparation.js");
+          const { prepareHeartbeatTaskContext } = await import("../services/heartbeat/task-context.js");
+          const preparation = createHeartbeatRunPreparation(db);
+          const issueContext = await preparation.getIssueExecutionContext(f.company.id, f.issue.id);
+          const [reviewer] = await db.select().from(agents).where(eq(agents.id, f.reviewer.id));
+          const taskContext = {
+            run: claimed!, agent: reviewer,
+            task: { issueRef: issueContext, issueContext, context: structuredClone(claimed!.contextSnapshot!), taskSession: null },
+            policy: { trustPreset: { kind: "low_trust_review" as const }, experimentalInstanceSettings: {} },
+            services: { issuesSvc: service, getPinnedSkillTestContext: preparation.getPinnedSkillTestContext },
+          };
+          await expect(prepareHeartbeatTaskContext(db, taskContext)).resolves.toMatchObject({
+            executionContinuation: { issueId: f.issue.id },
+          });
+          const { readNativeStageReviewContext } = await import("../services/native-runtime/native-stage-review.js");
+          // Use the same parsed projection and legacy-startup run identity as
+          // runtime selection, after the task-context builder has consumed it.
+          await expect(getNativeStageReviewAssignment(db, {
+            ...scope, claimRunId: claimed!.id,
+            contextSnapshot: readNativeStageReviewContext(taskContext.task.context),
+          })).resolves.toMatchObject({ issue: { id: f.issue.id }, retry: {
+            receipt: { id: activeRequestId, status: "claimed", runId: claimed!.id },
+          } });
+          await expect(prepareHeartbeatTaskContext(db, {
+            ...taskContext, run: { id: randomUUID() },
+          })).rejects.toThrow("continuation_user_authorization_missing");
+          await expect(prepareHeartbeatTaskContext(db, {
+            ...taskContext, task: { ...taskContext.task, context: {
+              ...taskContext.task.context, nativeStageRetryConfigDigest: "0".repeat(64),
+            } },
+          })).rejects.toThrow("continuation_user_authorization_missing");
           const protectedRun = await qualifyProtectedReview({ ...f, reviewerRun: claimed! }, true);
           try {
             const assignment = protectedRun.admission.record.assignment;
@@ -1318,7 +1420,7 @@ describe("actual normal PATCH + native postgres-js + native issue service (injec
             db, runId: successor.id, workspaceFinalizeStatus: "succeeded", projectRunStatus: true,
             skipExternalConversationSettlement: true, skipExternalAgentSettlement: true,
           })).toMatchObject({ phase: "committed", resultId });
-          const [settled] = await retries();
+          const [settled] = await retries(activeRequestId);
           expect(settled.status).toBe("succeeded");
           expect(await f.read()).toMatchObject({ statusVersion: approved.statusVersion, assigneeUserId: f.userId,
             executionState: { currentStageType: "approval" } });

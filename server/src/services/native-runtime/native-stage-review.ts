@@ -97,6 +97,7 @@ async function readStageAssignment(db: Db, input: StageAssignmentInput, boardRet
     admissionId: admission.id, wakeVersion: lineage.wakeVersion, blockedVersion: lineage.blockedVersion,
     workspaceId: workspace.id, workspaceCwd: workspace.cwd, successorRunId: retryRunId,
     requestId: retry.receipt.id, actorId: retry.actorId,
+    reassessedDecisionId: sourceDecision.id, configDigest: retryConfigDigest!,
     checkPhysical: !retryRunId || input.verifyRetryPhysical === true,
   }))) return null;
   let actingRun:typeof heartbeatRuns.$inferSelect|undefined;

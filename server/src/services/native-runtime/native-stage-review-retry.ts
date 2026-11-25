@@ -6,6 +6,7 @@ import {
 } from "@paperclipai/db";
 import { parseNativeExecutionInput, nativeSessionCleanupBlock } from "../../vendor/paperclip-runner/index.js";
 import { adapterExecutionControls } from "../adapter-execution-control.js";
+import { isFailedNativePreparation } from "../cancelled-native-startup.js";
 import { hasPendingRunCleanup } from "../execution-blocker.js";
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED } from "../native-local-process-stop.js";
 import { readTaskRetryIntent, taskRetryMutationAllowed } from "../task-retry.js";
@@ -96,9 +97,41 @@ export async function verifyStageRetryPredecessor(db: Db, scope: Scope, input: {
   sourceRunId: string; wakeId: string; originalDecisionId: string; admissionId: string;
   wakeVersion: number; blockedVersion: number; workspaceId: string; workspaceCwd: string;
   requestId: string; actorId: string; successorRunId?: string; checkPhysical: boolean;
+  reassessedDecisionId: string; configDigest: string;
 }) {
-  const [run] = await db.select().from(heartbeatRuns).where(and(
+  const [source] = await db.select().from(heartbeatRuns).where(and(
     eq(heartbeatRuns.id, input.sourceRunId), eq(heartbeatRuns.companyId, scope.companyId),
+    eq(heartbeatRuns.agentId, scope.agentId), eq(heartbeatRuns.issueId, scope.issueId),
+  )).limit(1);
+  const interruptedContext = source?.contextSnapshot;
+  let failedRetry: Awaited<ReturnType<typeof readStageRetryReceipt>> = null;
+  if (source?.runtimeMode === "legacy") {
+    // One pre-provider task-context rejection may retain the original proved
+    // native failure as its parent. The rejected run and receipt stay intact.
+    if (!interruptedContext || source.errorCode !== "setup_failed" ||
+        source.error !== "continuation_user_authorization_missing" || !source.startedAt) return false;
+    const retryRequest = interruptedContext.nativeStageRetryRequestId;
+    const digest = interruptedContext.nativeStageRetryConfigDigest;
+    if (
+        typeof retryRequest !== "string" || source.wakeupRequestId !== retryRequest ||
+        interruptedContext.nativeStageAdmissionId !== input.admissionId ||
+        interruptedContext.nativeStageDecisionId !== input.reassessedDecisionId ||
+        interruptedContext.nativeStageStatusVersion !== input.blockedVersion + 1 ||
+        interruptedContext.nativeStatusWakeIntentId !== input.wakeId ||
+        digest !== input.configDigest || adapterExecutionControls.has(source.id) ||
+        await hasPendingRunCleanup(db, scope.companyId, source.id)) return false;
+    const [coordinator] = await db.select().from(nativeRunFinalizations).where(and(
+      eq(nativeRunFinalizations.companyId, scope.companyId), eq(nativeRunFinalizations.runId, source.id),
+    )).limit(1);
+    if (!await isFailedNativePreparation(db, source, coordinator)) return false;
+    failedRetry = await readStageRetryReceipt(db, scope, { requestId: retryRequest, runId: source.id, historical: true });
+    if (!failedRetry || failedRetry.actorId !== input.actorId || failedRetry.receipt.status !== "failed" ||
+        !failedRetry.receipt.claimedAt || !failedRetry.receipt.finishedAt ||
+        failedRetry.receipt.payload?.nativeStageRetryConfigDigest !== digest) return false;
+  }
+  const originalRunId = failedRetry?.sourceRunId ?? input.sourceRunId;
+  const [run] = await db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.id, originalRunId), eq(heartbeatRuns.companyId, scope.companyId),
     eq(heartbeatRuns.agentId, scope.agentId), eq(heartbeatRuns.nativeIssueId, scope.issueId),
   )).limit(1);
   if (!run || run.status !== "failed" || run.runtimeMode !== "native" || !run.finishedAt ||
@@ -130,7 +163,7 @@ export async function verifyStageRetryPredecessor(db: Db, scope: Scope, input: {
     eq(nativeRunFinalizations.companyId, scope.companyId), eq(nativeRunFinalizations.issueId, scope.issueId),
     eq(nativeRunFinalizations.runId, run.id),
   )).limit(1);
-  if (latest?.id !== run.id || !owner || owner.phase !== "terminal_failure" || owner.failureCode !== REASSESSMENT_RETRY_FAILURE ||
+  if (latest?.id !== input.sourceRunId || !owner || owner.phase !== "terminal_failure" || owner.failureCode !== REASSESSMENT_RETRY_FAILURE ||
       owner.leaseOwner || owner.nextAttemptAt || owner.resultId || owner.failureDetail?.successorRunId) return false;
   const blocks = await db.select().from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, scope.companyId), eq(issueRecoveryActions.sourceIssueId, scope.issueId),
@@ -146,9 +179,11 @@ export async function verifyStageRetryPredecessor(db: Db, scope: Scope, input: {
       block.evidence.workspaceOwnerStop || block.evidence.providerSessionEstablished === true) return false;
   const replay = (block.evidence.automaticRecovery as { replay?: string } | undefined)?.replay;
   const continuation = block.evidence.explicitUserContinuation as Record<string, unknown> | undefined;
-  if (input.successorRunId
-    ? replay !== "explicit_user_continuation" || continuation?.runId !== input.successorRunId ||
-      continuation.previousRunId !== run.id || continuation.taskRetryRequestId !== input.requestId ||
+  const authorizedSuccessor = failedRetry ? input.sourceRunId : input.successorRunId;
+  const authorizedRequest = failedRetry?.receipt.id ?? input.requestId;
+  if (authorizedSuccessor
+    ? replay !== "explicit_user_continuation" || continuation?.runId !== authorizedSuccessor ||
+      continuation.previousRunId !== run.id || continuation.taskRetryRequestId !== authorizedRequest ||
       continuation.actorId !== input.actorId
     : replay !== "blocked" || continuation) return false;
 

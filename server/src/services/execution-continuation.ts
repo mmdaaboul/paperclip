@@ -453,13 +453,28 @@ export async function buildExecutionContinuation(input: {
       eq(agentWakeupRequests.runId, input.runId), sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
     )) : [];
     const taskRetryId = string(explicitContinuation.taskRetryRequestId);
-    const [taskRetryWake] = taskRetryId && z.string().guid().safeParse(taskRetryId).success
+    const directStageRetry = taskRetryId !== null && input.context.nativeStageRetryRequestId === taskRetryId;
+    let claimedRetry: typeof agentWakeupRequests.$inferSelect | undefined;
+    if (directStageRetry && input.runId && issue.executionRunId === input.runId) {
+      // A reassessed review uses the canonical receipt as its own wake. At
+      // task preparation it is claimed, before the run is converted to native.
+      const { getNativeStageReviewAssignment } = await import("./native-runtime/native-stage-review.js");
+      const stage = await getNativeStageReviewAssignment(db, {
+        companyId, issueId, agentId: input.agentId, claimRunId: input.runId, contextSnapshot: input.context,
+      });
+      if (stage?.retry?.receipt.status === "claimed" && stage.retry.receipt.claimedAt &&
+          stage.retry.sourceRunId === explicitUserSource) {
+        claimedRetry = stage.retry.receipt;
+      }
+    }
+    const [coalescedRetry] = !directStageRetry && taskRetryId && z.string().guid().safeParse(taskRetryId).success
       ? await db.select().from(agentWakeupRequests).where(and(
         eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, taskRetryId),
         eq(agentWakeupRequests.agentId, input.agentId), eq(agentWakeupRequests.reason, "task_retry"),
         eq(agentWakeupRequests.requestedByActorType, "user"), eq(agentWakeupRequests.status, "coalesced"),
         sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
       )) : [];
+    const taskRetryWake = claimedRetry ?? coalescedRetry;
     const taskRetry = readTaskRetryIntent(taskRetryWake?.payload);
     const retryAuthorization = taskRetry && taskRetry.generationId === taskRetryWake?.id
       && taskRetry.actorId === taskRetryWake.requestedByActorId
