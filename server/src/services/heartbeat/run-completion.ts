@@ -7,6 +7,10 @@ import { settledResponsePublicationSql } from "../native-runtime/native-response
 import { notifyChatRunMilestones } from "../chat-run-milestone-notifications.js";
 import { measureRunPhase } from "../execution-preparation-timing.js";
 import { PROJECT_ACCESS_DENIED, ProjectAccessDeniedError } from "../project-access-denial.js";
+import { PaperclipRunnerProviderProfileError } from "../native-runtime/provider-profile.js";
+import { NativeRuntimeEligibilityError } from "../native-runtime/runtime-mode.js";
+import { isDotBindingUnavailableReason } from "../dot-runner-broker.js";
+import { McpOAuthError } from "../public-mcp/oauth.js";
 import { pendingCaseHandoffForRun } from "./case-handoff-lifecycle.js";
 import { NON_RETRYABLE_PREFLIGHT_FAILURE_CODES, isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
 import { ChatControlRecoveryUnresolvedError } from "./queue.js";
@@ -304,6 +308,41 @@ function isConfigurationIncompleteFailure(
   error: unknown,
 ): error is ConfigurationIncompleteFailure {
   return error instanceof ConfigurationIncompleteFailure;
+}
+
+type DotConfigurationIncompleteReason =
+  | "dot_subscription_expired"
+  | "dot_pairing_required"
+  | "dot_disabled"
+  | "dot_config_invalid";
+
+function dotConfigIncompleteFailure(
+  error: unknown,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "companyId" | "agentId">,
+): ConfigurationIncompleteFailure | null {
+  let reason: DotConfigurationIncompleteReason | null = null;
+  if (error instanceof McpOAuthError && isDotBindingUnavailableReason(error.reason)) {
+    reason = error.reason;
+  } else if (error instanceof PaperclipRunnerProviderProfileError || error instanceof NativeRuntimeEligibilityError) {
+    if (error.code === "paperclip_runner_dot_disabled") {
+      reason = "dot_disabled";
+    } else if (error.code === "paperclip_runner_dot_config_invalid") {
+      reason = error.detailReason === "dot_pairing_required" ? "dot_pairing_required" : "dot_config_invalid";
+    }
+  }
+  if (!reason) return null;
+  const actionUrl = reason === "dot_disabled"
+    ? "/instance/settings/experimental"
+    : `/agents/${run.agentId}/configuration`;
+  return new ConfigurationIncompleteFailure(error instanceof Error ? error.message : "Dot configuration is incomplete.", {
+    configurationIncomplete: {
+      reason,
+      companyId: run.companyId,
+      agentId: run.agentId,
+      actionUrl,
+      fingerprint: `${reason}:${run.agentId}`,
+    },
+  });
 }
 
 export function isConfigurationIncompleteFailedRun(
@@ -1103,7 +1142,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       err,
     )
       ? err
-      : null;
+      : dotConfigIncompleteFailure(err, run);
     const recordedResponsibleUserDenialCode =
       normalizeResponsibleUserDenialCode(
         (await getRun(run.id).catch(() => null))?.errorCode,
@@ -1376,7 +1415,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       ? outerErr
       : null;
     const configurationIncompleteSetupFailure =
-      isConfigurationIncompleteFailure(outerErr) ? outerErr : null;
+      isConfigurationIncompleteFailure(outerErr)
+        ? outerErr
+        : dotConfigIncompleteFailure(outerErr, run);
     const unresolvedBaseRefSetupFailure = isUnresolvedWorkspaceBaseRefError(
       outerErr,
     )
