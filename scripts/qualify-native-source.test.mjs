@@ -1,4 +1,5 @@
 import test from 'node:test';
+import {createHash} from 'node:crypto';
 import assert from 'node:assert/strict';
 import {readFileSync,mkdtempSync,mkdirSync,writeFileSync,rmSync,symlinkSync,linkSync,truncateSync,chmodSync} from 'node:fs';
 import {spawnSync} from 'node:child_process';
@@ -9,7 +10,25 @@ import {projectSelectedGroupFailure,classifySelectedFailureText,FAILURE_REPORT_M
 const contract=JSON.parse(readFileSync(new URL('./native-selected-source-contract.json',import.meta.url)));
 const root='/owned/checkout',g={project:'root',path:'server/src/example.test.ts',selection:'whole-file'};
 const report=(cases=[{fullName:'actual assertion',status:'passed'}])=>({success:true,numFailedTests:0,numFailedTestSuites:0,testResults:[{name:resolve(root,g.path),status:'passed',assertionResults:cases.map(x=>({ancestorTitles:[],title:x.fullName,...x}))}]});
-test('current native source contract selects exact owned files and deliberate filtered names without SDK campaign',()=>{validateSourceContract(contract);assert.equal(contract.groups.length,48);assert.equal(contract.groups.filter(g=>g.selection==='exact-full-names').length,5);assert.equal(contract.optionalSdkKernelCampaign,false);assert(contract.groups.some(g=>g.path==='packages/paperclip-runner/src/drivers/codex/reviewer-candidate-inspection.test.ts'&&g.project==='runner'&&g.selection==='whole-file'));for(const group of contract.groups)assert(readFileSync(new URL('../'+group.path,import.meta.url)).length>0);});
+test('current native source contract selects exact owned files and deliberate filtered names without SDK campaign',()=>{validateSourceContract(contract);assert.equal(contract.groups.length,57);assert.equal(contract.groups.filter(g=>g.selection==='exact-full-names').length,5);assert.equal(contract.optionalSdkKernelCampaign,false);assert(contract.groups.some(g=>g.path==='packages/paperclip-runner/src/drivers/codex/reviewer-candidate-inspection.test.ts'&&g.project==='runner'&&g.selection==='whole-file'));for(const group of contract.groups)assert(readFileSync(new URL('../'+group.path,import.meta.url)).length>0);});
+
+const preDotGroupsSha256 = '30893e8b3e1bb6d04565ba097ce43a3da0e0202c4d7c0b9ddd32b4a4a74c2899';
+const dotUiFiles = [
+  "ui/src/dot-entry-lifecycle.test.tsx",
+  "ui/src/dot-entry.test.tsx",
+  "ui/src/hooks/useResilientFetch.test.tsx",
+  "ui/src/lib/connectivity.test.ts",
+  "ui/src/lib/dot-pairing-runtime.test.ts",
+  "ui/src/lib/react-root.test.ts",
+  "ui/src/lib/tenant-session-recovery.test.ts",
+  "ui/src/lib/ui-entry.test.ts",
+  "ui/src/pages/McpConnect.test.tsx"
+];
+test('Dot coverage preserves all prior native groups and uses exact root-project UI selections',()=>{
+ assert.equal(createHash('sha256').update(JSON.stringify(contract.groups.slice(0,48))).digest('hex'),preDotGroupsSha256);
+ assert.deepEqual(contract.groups.slice(48),dotUiFiles.map(path=>({project:'root',path,selection:'whole-file'})));
+ for(const group of contract.groups.slice(48)){const command=sourceTestCommand(group,root,'/private/dot-report.json');assert.equal(command.cwd,root);assert.equal(command.args[1],group.path);assert(command.args.includes('--retry=0'));assert(command.args.includes('--maxWorkers=1'));assert(!command.args.includes('--testNamePattern'));}
+});
 test('source environment has no ambient auth, DB, Mac override, loader or provider credential',()=>{const env=sourceEnvironment({PATH:'/bin',USER:'runner',GH_TOKEN:'private',GITHUB_TOKEN:'private',NATIVE_INSTALL_GITHUB_TOKEN:'private',DATABASE_URL:'old',PGHOST:'/old',PAPERCLIP_TEST_POSTGRES_ADMIN_URL:'old',PAPERCLIP_CLAUDE_TEST_PACKAGE_DIR:'/old',PAPERCLIP_TEST_CODEX_BINARY:'/old',NODE_OPTIONS:'--import private',NODE_PATH:'/private',OPENAI_API_KEY:'private',PAPERCLIP_CONFIG:'/old'},'/new/home','/new/tmp');for(const key of ['GH_TOKEN','GITHUB_TOKEN','NATIVE_INSTALL_GITHUB_TOKEN','DATABASE_URL','PGHOST','PAPERCLIP_TEST_POSTGRES_ADMIN_URL','PAPERCLIP_CLAUDE_TEST_PACKAGE_DIR','PAPERCLIP_TEST_CODEX_BINARY','NODE_OPTIONS','NODE_PATH','OPENAI_API_KEY','PAPERCLIP_CONFIG'])assert.equal(env[key],undefined);assert.equal(env.PAPERCLIP_VITEST_RETRY,'0');assert.equal(env.HOME,'/new/home');});
 test('whole-file native report requires every discovered assertion to pass',()=>{assert.equal(inspectVitestReport(report(),g,root).passed,1);for(const status of ['failed','pending','skipped','todo'])assert.throws(()=>inspectVitestReport(report([{fullName:'actual assertion',status}]),g,root));assert.throws(()=>inspectVitestReport(report([]),g,root));});
 test('a filtered native group records other methods as unselected, never successful',()=>{const selected={...g,selection:'exact-full-names',fullNames:['closed Stop']};const data=report([{fullName:'closed Stop',status:'passed'},{fullName:'unrelated kernel',status:'pending'}]);assert.deepEqual(inspectVitestReport(data,selected,root),{selected:1,passed:1,failed:0,skipped:0,unselected:1});data.testResults[0].assertionResults[0].status='pending';assert.throws(()=>inspectVitestReport(data,selected,root));});
