@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": { "types": ["node", "vite/client"] },
+  "include": [
+    "src/vite-env.d.ts", "src/dot-entry.tsx", "src/dot-entry.test.tsx",
+    "src/dot-entry-lifecycle.test.tsx", "src/pages/McpConnectRequest.tsx",
+    "src/lib/dot-pairing-runtime.ts", "src/lib/dot-pairing-runtime.test.ts",
+    "src/lib/ui-entry.ts", "src/lib/ui-entry.test.ts"
+  ]
+}
