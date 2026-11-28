@@ -271,6 +271,26 @@
       ]
     },
     {
+      "project": "root",
+      "path": "ui/src/components/DotRunnerConnection.test.tsx",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/__tests__/dot-oauth-onboarding.test.ts",
+      "selection": "whole-file"
+    },
+    {
+      "project": "root",
+      "path": "server/src/__tests__/dot-runner.test.ts",
+      "selection": "exact-full-names",
+      "fullNames": [
+        "durable Dot Runner integration > names an expired event subscription and recovers by subscribing again without pairing",
+        "durable Dot Runner integration > marks expired or unpaired Dot runs as non-retryable configuration_incomplete instead of looping",
+        "durable Dot Runner integration > uses merged client metadata and scoped browser consent with a distinct Dot issuer"
+      ]
+    },
+    {
       "project": "runner",
       "path": "packages/paperclip-runner/src/drivers/codex/reviewer-candidate-inspection.test.ts",
       "selection": "whole-file"
