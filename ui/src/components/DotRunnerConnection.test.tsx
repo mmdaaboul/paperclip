@@ -117,6 +117,9 @@ it("copies the complete Dot setup with its server URL, one-use code and event in
   expect(prompt).toContain("One-use pairing code:\nfresh-one-use-pairing-code");
   expect(prompt).toContain(expiresAt);
   expect(prompt).toContain("paperclip.dot.mailbox_updated");
+  expect(prompt).toContain("refreshBefore");
+  expect(prompt).toContain("Subscribe again with the same arguments before then");
+  expect(prompt).toContain("without a new pairing");
   expect(prompt).toContain("paperclip_dot_inbox");
   expect(prompt).toContain("paperclip_dot_confirm_event");
   expect(prompt).toContain("Paperclip will send a test event automatically");
@@ -152,4 +155,16 @@ it("removes the copy action and open preview when the pairing code expires", asy
     expect(container.textContent).toContain("generate a fresh setup prompt");
     expect(copyTextToClipboard).toHaveBeenCalledTimes(1);
   } finally { vi.useRealTimers(); }
+});
+
+it("tells the operator to resubscribe when a ready Dot's subscription expires", async () => {
+  api.get.mockResolvedValue({
+    enabled: true,
+    resourceUrl: "https://paperclip.example/mcp/runner",
+    binding: { ...binding, status: "ready", subscriptionVerified: false, subscriptionExpired: true },
+  });
+  await render();
+  expect(container.textContent).toContain("Event subscription: expired");
+  expect(container.textContent).toContain("Ask the Dot to subscribe again");
+  expect(container.textContent).toContain("You do not need to pair it again");
 });

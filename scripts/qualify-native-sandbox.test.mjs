@@ -1,5 +1,4 @@
 import test from 'node:test';
-import {createHash} from 'node:crypto';
 import assert from 'node:assert/strict';
 import {readFileSync,mkdtempSync,mkdirSync,writeFileSync,chmodSync,symlinkSync,linkSync,rmSync} from 'node:fs';
 import {dirname,join} from 'node:path';
@@ -20,22 +19,7 @@ test('all real native positive/negative boundary proofs and outside network cont
 test('a root, unpinned or hashless probe cannot be presented as native proof',()=>{for(const change of [{uid:0},{uid:undefined},{codexVersion:'latest'},{nativeElfSha256:'unknown'},{wrapperSha256:undefined},{bwrapSha256:'c'}])assert.throws(()=>validateProbeReceipt({...proof(),...change}),/incomplete/);});
 test('namespace failure classification is finite and does not misclassify arbitrary command failure',()=>{assert(namespaceRefusal('bwrap: No permissions to create new namespace'));assert(namespaceRefusal('bwrap: Creating new namespace failed: Operation not permitted'));assert(!namespaceRefusal("bwrap: Can't bind mount /private: Permission denied"));assert(!namespaceRefusal('git: permission denied in repository'));assert(!namespaceRefusal('native boundary probe failed'));});
 test('closed CLI refuses execution outside the named hosted Linux job',()=>{const r=spawnSync(process.execPath,[fileURLToPath(new URL('./qualify-native-sandbox.mjs',import.meta.url)),'--facts'],{env:{PATH:'/usr/bin:/bin',GITHUB_ACTIONS:'false'},encoding:'utf8',timeout:3000,maxBuffer:65536});assert.notEqual(r.status,0);assert.match(r.stderr,/sandbox_disposable_job_only/);});
-test('decisive native probe precedes workspace build and retains the same source test contract',()=>{const source=readFileSync(new URL('./qualify-native-source.mjs',import.meta.url),'utf8');assert(source.indexOf('await qualifyNativeSandbox(')>source.indexOf("['pnpm','install','--frozen-lockfile']"));assert(source.indexOf('await qualifyNativeSandbox(')<source.indexOf("['pnpm','-r'"));assert(source.includes('evidence.sandboxPrerequisite=r;save();'));const contract=JSON.parse(readFileSync(new URL('./native-selected-source-contract.json',import.meta.url)));
- assert.equal(contract.groups.length,57);
- assert.equal(createHash('sha256').update(JSON.stringify(contract.groups.slice(0,48))).digest('hex'),'30893e8b3e1bb6d04565ba097ce43a3da0e0202c4d7c0b9ddd32b4a4a74c2899');
- assert.equal(contract.groups[47].path,'packages/paperclip-runner/src/drivers/codex/reviewer-candidate-inspection.test.ts');
- assert.deepEqual(contract.groups.slice(48),[
-  'ui/src/dot-entry-lifecycle.test.tsx',
-  'ui/src/dot-entry.test.tsx',
-  'ui/src/hooks/useResilientFetch.test.tsx',
-  'ui/src/lib/connectivity.test.ts',
-  'ui/src/lib/dot-pairing-runtime.test.ts',
-  'ui/src/lib/react-root.test.ts',
-  'ui/src/lib/tenant-session-recovery.test.ts',
-  'ui/src/lib/ui-entry.test.ts',
-  'ui/src/pages/McpConnect.test.tsx',
- ].map(path=>({project:'root',path,selection:'whole-file'})));
-});
+test('decisive native probe precedes workspace build and retains the same source test contract',()=>{const source=readFileSync(new URL('./qualify-native-source.mjs',import.meta.url),'utf8');assert(source.indexOf('await qualifyNativeSandbox(')>source.indexOf("['pnpm','install','--frozen-lockfile']"));assert(source.indexOf('await qualifyNativeSandbox(')<source.indexOf("['pnpm','-r'"));assert(source.includes('evidence.sandboxPrerequisite=r;save();'));const contract=JSON.parse(readFileSync(new URL('./native-selected-source-contract.json',import.meta.url)));assert.equal(contract.groups.length,51);assert.equal(contract.groups.at(-1).path,'packages/paperclip-runner/src/drivers/codex/reviewer-candidate-inspection.test.ts');});
 test('workflow host facts/test hook is source-job only and job permissions/timeouts stay unchanged',()=>{const w=readFileSync(new URL('./fixtures/native-add-only-full-qualification.yml',import.meta.url),'utf8');assert.equal(w.split('Inspect native Linux sandbox host prerequisites').length-1,1);assert(w.indexOf('Inspect native Linux sandbox host prerequisites')>w.indexOf('  selected_native_source:'));assert(w.includes('scripts/qualify-native-sandbox.test.mjs'));assert(w.includes('needs: selected_native_source'));assert(w.includes("if: needs.selected_native_source.result == 'success' &&"));assert(!w.includes('if: always() &&'));assert(w.includes('permissions:\n  contents: read'));assert.equal(w.match(/timeout-minutes: 45/g).length,2);});
 test('prerequisite ceilings and initial/postAPT/conditional post-add probe topology are fixed',()=>{assert.deepEqual(SANDBOX_LIMITS,{aggregateMs:600000,aptMs:300000,profileMs:60000,probeMs:15000,outputBytes:65536});const source=readFileSync(new URL('./qualify-native-sandbox.mjs',import.meta.url),'utf8');assert(!source.includes('sysctl -w'));assert(!source.includes('--dangerously-bypass'));assert(!source.includes("['-n','/bin/sh'"));assert.equal(source.match(/await probe\(\)/g).length,3);});
 

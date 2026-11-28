@@ -441,22 +441,6 @@ The first managed version does not expose Paperclip workspace tools, even when t
 
 The Cloud front door must forward the dedicated `/mcp/runner` protocol endpoints, OAuth discovery/authorization/token routes, and `/dot-connect/:requestId` pairing page without requiring a browser stack session. The page uses `/api/dot-mcp/requests/:requestId` for read and one-use pairing preview/approval. These aliases reject personal assistant request IDs. Regular `/mcp-connect` consent and assistant connection management retain normal sign-in. Deploy the corresponding Cloud ingress change with the tenant app; upgrading only the UI is insufficient.
 
-The canonical Dot pairing document has an isolated browser entry: it does not
-start board session/company providers, board query persistence, live events or
-service-worker registration. Its connection recovery probes the same Dot
-request endpoint rather than the protected board health endpoint. Expired or
-denied requests remain terminal errors. Leaving this entry loads a new document,
-and returning from the browser's back/forward cache reloads it to discard stale
-pairing previews and re-check expiry. Server-side OAuth and one-use pairing
-validation remain authoritative.
-
-For deployments with a separate edge login protecting the board, qualify the
-exact shipped pairing asset dependencies and the Dot request routes while
-keeping board APIs protected. The local public-entry fixtures in
-`ui/tests/DOT-PAIRING.md` are narrower than complete-build, real-browser and live
-OAuth acceptance; they must not be used as evidence that production pairing is
-ready.
-
 Remote startup checks `externalProviderCapabilities` for `openai_dot_mcp`, verifies the artifact digest, and uses the existing authenticated Runner transport. Before dispatch, it also requires the sandbox process marker and Linux boot/start fingerprint; a connected transport alone is insufficient. A pre-Dot artifact is rejected before dispatch. Linux controllers use their packaged Linux artifact; a development controller on another platform must set `PAPERCLIP_RUNNER_REMOTE_BINARY_PATH` to a current binary built for the sandbox platform.
 
 Recovery reads the checkpoint from the owning execution target and validates run/session/turn authority before retaining a controller copy. Missing state after dispatch fails closed for reconciliation. It never creates a replacement OpenAI Dot thread. See [the cloud Runner plan](plans/2026-10-08-cloud-dot-runner-and-external-invitations.md).

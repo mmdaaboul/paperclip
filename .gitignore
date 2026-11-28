@@ -104,6 +104,3 @@ test-results/
 
 # Content-addressed CI task results
 .turbo/
-
-# Opt-in public Dot pairing fixture build (not a production board build).
-/ui/dist-dot-pairing/
